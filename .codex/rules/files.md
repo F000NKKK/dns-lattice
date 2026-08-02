@@ -23,6 +23,11 @@
   architecture, and contribution docs. Also inspect relevant extensionless
   project files such as `Cargo.toml`, `SECURITY`, `SUPPORT`, `.gitignore`, CI
   YAML, and scripts when the change affects packaging, workflow, or policy.
+- User-facing project documents (`README*`, `ARCHITECTURE*`, `ROADMAP*`,
+  crate docs) must not reference `.ai/`, `.codex/`, or `.claude/` — those
+  are internal agent workflow directories, and `.ai/` is not published or
+  even pushed. Only `AGENTS.md`, `CLAUDE.md`, and the rule/agent files
+  inside `.codex/`/`.claude/` themselves may reference these paths.
 - Documentation review is complete only when no stale version, roadmap,
   feature, API, package-metadata, or support statement remains in the affected
   files.

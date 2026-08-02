@@ -20,6 +20,24 @@ roadmap stage. Task-specific plans, evidence, and decisions live under
 6. Let the primary agent reconcile every handoff with the plan and record the
    result in the active task workspace.
 
+`config.toml` currently sets no `approval_policy` or `sandbox_mode`, so
+nothing in `rules/git.md` (no `reset --hard`, no force-push, no
+amend/rebase) is mechanically enforced for Codex the way the equivalent
+Claude Code rules are via `permissions.deny` in `.claude/settings.json` —
+these remain instructions the agent must follow deliberately, not a tool-
+level block. Tightening this would mean setting `approval_policy`/
+`sandbox_mode`, which changes how much Codex can do without asking; that is
+a deliberate behavior change and should be a separate, explicit decision
+rather than bundled into a rules-loading fix.
+
+## Relationship to `.claude/`
+
+`.claude/` is the equivalent workflow for Claude Code sessions, entered via
+root `CLAUDE.md`. The two directories are independent at runtime — Codex
+reads only `.codex/` and never `.claude/` — but they are kept in sync by
+convention: when a rule or role changes in one, mirror the change into the
+other so both agents follow the same policy.
+
 ## Contents
 
 - `config.toml` — minimal repository-local Codex discovery settings.
