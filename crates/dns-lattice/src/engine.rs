@@ -2,15 +2,91 @@
 //! query, and route it via static split-DNS matching (stage 0.1's
 //! [`SplitDnsPolicy`]) to an upstream group.
 //!
-//! Stage 0.2 delivers routing only — no answer cache and no real network
-//! transport yet (see `ARCHITECTURE.md`'s stage sequencing). The upstream
-//! backend seam (`UpstreamBackend`) is crate-private and intentionally
-//! minimal; it is not a preview of the stage 0.3 public `upstream` trait.
+//! Stage 0.2 also adds an in-memory, TTL-respecting answer cache including
+//! negative caching (RFC 2308) — no real network transport yet (see
+//! `ARCHITECTURE.md`'s stage sequencing). The upstream backend seam
+//! (`UpstreamBackend`) is crate-private and intentionally minimal; it is not
+//! a preview of the stage 0.3 public `upstream` trait.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
-use dns_lattice_model::{Message, SplitDnsPolicy, UpstreamGroupId};
+use dns_lattice_model::{
+    Class, Message, Name, RData, Rcode, RecordType, SplitDnsPolicy, UpstreamGroupId,
+};
+
+/// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
+/// response carries no SOA record in its authority section to derive a
+/// `minimum` from. Not user-configurable in this stage (ADR-0010 point 4).
+const NEGATIVE_CACHE_FLOOR: Duration = Duration::from_secs(60);
+
+/// A source of the current time, abstracted so tests can advance it
+/// deterministically instead of relying on real `sleep` (ADR-0010 point 5).
+///
+/// Crate-private: no external caller needs to inject a clock in this stage;
+/// [`Resolver::builder`] always defaults to [`SystemClock`].
+pub(crate) trait Clock {
+    /// Returns the current instant.
+    fn now(&self) -> Instant;
+}
+
+/// Production [`Clock`] delegating to [`Instant::now`].
+pub(crate) struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// A manually-advanced [`Clock`] for deterministic tests.
+///
+/// Interior-mutable and cheaply cloneable (shares the same underlying cell
+/// via [`std::rc::Rc`]) so a test can keep a handle to advance the clock
+/// after handing an owned copy to [`ResolverBuilder::clock`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FakeClock(std::rc::Rc<Cell<Instant>>);
+
+#[cfg(test)]
+impl FakeClock {
+    /// Starts the clock at the current real instant (only used as an
+    /// arbitrary, non-real-time-dependent base point).
+    pub(crate) fn new() -> Self {
+        FakeClock(std::rc::Rc::new(Cell::new(Instant::now())))
+    }
+
+    /// Advances the clock by `duration`.
+    pub(crate) fn advance(&self, duration: Duration) {
+        self.0.set(self.0.get() + duration);
+    }
+}
+
+#[cfg(test)]
+impl Clock for FakeClock {
+    fn now(&self) -> Instant {
+        self.0.get()
+    }
+}
+
+/// Cache key: the fields that identify a question's matching intent,
+/// equivalent to a [`dns_lattice_model::Question`]'s name/type/class but
+/// independent of that struct's exact field set (ADR-0010 point 1).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    name: Name,
+    rtype: RecordType,
+    class: Class,
+}
+
+/// A cached answer plus its absolute expiry instant, computed at insert
+/// time (ADR-0010 point 2).
+struct CacheEntry {
+    answer: Message,
+    expires_at: Instant,
+}
 
 /// A synchronous, single-query seam between "which upstream group did
 /// routing select" and "get an answer [`Message`] back".
@@ -48,6 +124,8 @@ where
 pub struct Resolver {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Box<dyn UpstreamBackend + Send + Sync>>,
+    clock: Box<dyn Clock + Send + Sync>,
+    cache: RefCell<HashMap<CacheKey, CacheEntry>>,
 }
 
 impl Resolver {
@@ -56,30 +134,96 @@ impl Resolver {
         ResolverBuilder {
             policy,
             backends: HashMap::new(),
+            clock: Box::new(SystemClock),
         }
     }
 
     /// Resolves one query.
     ///
-    /// Extracts the queried name from `query`'s first question, routes it
-    /// through the configured [`SplitDnsPolicy`] to select an upstream
-    /// group, and forwards the query to that group's backend.
+    /// Extracts the queried name from `query`'s first question, checks the
+    /// in-memory answer cache, and on a miss routes the query through the
+    /// configured [`SplitDnsPolicy`] to select an upstream group and
+    /// forwards it to that group's backend. Successful (positive or
+    /// negative) answers are cached with a TTL-derived expiry; a cache hit
+    /// never calls the backend again.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NoRoute`] when no split-DNS rule matches the
     /// queried name and no default upstream group is configured, or when no
     /// question is present in `query`. Returns whatever error the selected
-    /// backend produces, propagated as-is.
+    /// backend produces, propagated as-is (not cached).
     pub fn resolve(&self, query: &Message) -> Result<Message> {
         let question = query.questions.first().ok_or(Error::NoRoute)?;
+        let key = CacheKey {
+            name: question.name.clone(),
+            rtype: question.qtype,
+            class: question.qclass,
+        };
+
+        let now = self.clock.now();
+        if let Some(entry) = self.cache.borrow().get(&key) {
+            if entry.expires_at > now {
+                return Ok(entry.answer.clone());
+            }
+        }
+
         let group = self
             .policy
             .resolve_group(&question.name)
             .ok_or(Error::NoRoute)?;
         let backend = self.backends.get(group).ok_or(Error::NoRoute)?;
-        backend.resolve(query)
+        let answer = backend.resolve(query)?;
+
+        if let Some(ttl) = cacheable_ttl(&answer) {
+            self.cache.borrow_mut().insert(
+                key,
+                CacheEntry {
+                    answer: answer.clone(),
+                    expires_at: now + ttl,
+                },
+            );
+        }
+
+        Ok(answer)
     }
+}
+
+/// Determines the [`Duration`] an `answer` should be cached for, or `None`
+/// if it should not be cached at all.
+///
+/// Positive answers (`NoError` with at least one answer record) use the
+/// minimum `ttl` across their answer records (ADR-0010 point 3). Negative
+/// answers (`NxDomain`, or `NoError` with an empty answer section) use the
+/// `minimum` field of an SOA record in the authority section when present
+/// (RFC 2308 §5), else [`NEGATIVE_CACHE_FLOOR`] (ADR-0010 point 4).
+fn cacheable_ttl(answer: &Message) -> Option<Duration> {
+    let is_negative = matches!(answer.header.rcode, Rcode::NxDomain)
+        || (matches!(answer.header.rcode, Rcode::NoError) && answer.answers.is_empty());
+
+    if is_negative {
+        let ttl = answer
+            .authorities
+            .iter()
+            .find_map(|rr| match &rr.rdata {
+                RData::Soa { minimum, .. } => Some(*minimum),
+                _ => None,
+            })
+            .map(|minimum| Duration::from_secs(u64::from(minimum)))
+            .unwrap_or(NEGATIVE_CACHE_FLOOR);
+        return Some(ttl);
+    }
+
+    if answer.answers.is_empty() {
+        return None;
+    }
+
+    answer
+        .answers
+        .iter()
+        .map(|rr| rr.ttl)
+        .min()
+        .map(|ttl| Duration::from_secs(u64::from(ttl)))
 }
 
 /// Builds a [`Resolver`] from a split-DNS policy and one upstream backend
@@ -87,6 +231,7 @@ impl Resolver {
 pub struct ResolverBuilder {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Box<dyn UpstreamBackend + Send + Sync>>,
+    clock: Box<dyn Clock + Send + Sync>,
 }
 
 impl ResolverBuilder {
@@ -106,11 +251,22 @@ impl ResolverBuilder {
         self
     }
 
+    /// Substitutes the clock used to compute and check cache expiry.
+    /// Crate-private: no public API for clock injection in this stage
+    /// (ADR-0010 point 5).
+    #[cfg(test)]
+    pub(crate) fn clock(mut self, clock: impl Clock + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
     /// Builds the resolver.
     pub fn build(self) -> Resolver {
         Resolver {
             policy: self.policy,
             backends: self.backends,
+            clock: self.clock,
+            cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -294,5 +450,281 @@ mod tests {
             .resolve(&query_for("host.corp.internal"))
             .expect_err("backend failure propagates");
         assert_eq!(err, Error::NameTooLong);
+    }
+
+    // --- Dedicated fake upstream backend + cache test suite (deferred from
+    // the routing slice, ADR-0009/ADR-0010) -------------------------------
+
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use dns_lattice_model::{RData, ResourceRecord};
+
+    /// A configurable fake in-process [`UpstreamBackend`] that returns a
+    /// fixed answer and counts how many times it was called, so cache-hit
+    /// tests can assert the backend is *not* called again on a hit.
+    struct CountingBackend {
+        answer: Message,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamBackend for CountingBackend {
+        fn resolve(&self, _query: &Message) -> Result<Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer.clone())
+        }
+    }
+
+    fn a_answer(name: &str, ttl: u32) -> Message {
+        let mut msg = query_for(name);
+        msg.header.qr = true;
+        msg.answers.push(ResourceRecord {
+            name: n(name),
+            rtype: RecordType::A,
+            class: Class::In,
+            ttl,
+            rdata: RData::A(Ipv4Addr::new(203, 0, 113, 1)),
+        });
+        msg
+    }
+
+    fn nxdomain_answer(name: &str, soa_minimum: Option<u32>) -> Message {
+        let mut msg = query_for(name);
+        msg.header.qr = true;
+        msg.header.rcode = Rcode::NxDomain;
+        if let Some(minimum) = soa_minimum {
+            msg.authorities.push(ResourceRecord {
+                name: n("example.com"),
+                rtype: RecordType::Soa,
+                class: Class::In,
+                ttl: 3600,
+                rdata: RData::Soa {
+                    mname: n("ns1.example.com"),
+                    rname: n("hostmaster.example.com"),
+                    serial: 1,
+                    refresh: 3600,
+                    retry: 600,
+                    expire: 604_800,
+                    minimum,
+                },
+            });
+        }
+        msg
+    }
+
+    fn nodata_answer(name: &str) -> Message {
+        // NoError, empty answer section: NODATA per RFC 2308.
+        query_for_response(name)
+    }
+
+    fn query_for_response(name: &str) -> Message {
+        let mut msg = query_for(name);
+        msg.header.qr = true;
+        msg
+    }
+
+    fn resolver_with_counting_backend(
+        policy: SplitDnsPolicy,
+        group: &str,
+        answer: Message,
+        clock: FakeClock,
+    ) -> (Resolver, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            answer,
+            calls: calls.clone(),
+        };
+        let resolver = Resolver::builder(policy)
+            .clock(clock)
+            .backend(UpstreamGroupId::new(group), move |query: &Message| {
+                backend.resolve(query)
+            })
+            .build();
+        (resolver, calls)
+    }
+
+    #[test]
+    fn cache_hit_does_not_call_backend_again() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            a_answer("example.com", 300),
+            FakeClock::new(),
+        );
+
+        let first = resolver
+            .resolve(&query_for("example.com"))
+            .expect("first resolve populates cache");
+        let second = resolver
+            .resolve(&query_for("example.com"))
+            .expect("second resolve served from cache");
+
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "backend called only once");
+    }
+
+    #[test]
+    fn cache_entry_expires_after_ttl_and_backend_is_called_again() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let clock = FakeClock::new();
+        let calls_counter;
+        let resolver;
+        {
+            let (r, c) = resolver_with_counting_backend(
+                policy,
+                "g",
+                a_answer("example.com", 300),
+                FakeClock::new(),
+            );
+            resolver = r;
+            calls_counter = c;
+        }
+        let _ = clock; // unused placeholder clock above superseded by resolver's own clock
+
+        // Rebuild using the same clock instance the resolver owns is not
+        // possible from outside; instead build directly here with a shared
+        // clock we can advance.
+        let shared_clock = FakeClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            answer: a_answer("example.com", 300),
+            calls: calls.clone(),
+        };
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let resolver = Resolver::builder(policy)
+            .clock(shared_clock)
+            .backend(UpstreamGroupId::new("g"), move |query: &Message| {
+                backend.resolve(query)
+            })
+            .build();
+        let _ = calls_counter;
+
+        resolver
+            .resolve(&query_for("example.com"))
+            .expect("first resolve populates cache");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        resolver
+            .resolve(&query_for("example.com"))
+            .expect("still cached before ttl elapses");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cache hit before expiry");
+    }
+
+    #[test]
+    fn negative_answer_is_cached_with_soa_minimum_ttl() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            nxdomain_answer("missing.example.com", Some(300)),
+            FakeClock::new(),
+        );
+
+        let first = resolver
+            .resolve(&query_for("missing.example.com"))
+            .expect("nxdomain is Ok(Message), not Err");
+        assert_eq!(first.header.rcode, Rcode::NxDomain);
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .expect("served from negative cache");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "negative answer cached");
+    }
+
+    #[test]
+    fn negative_answer_without_soa_uses_fixed_floor_ttl() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            nxdomain_answer("missing.example.com", None),
+            FakeClock::new(),
+        );
+
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .expect("nxdomain without soa still Ok");
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .expect("served from cache using the fixed floor ttl");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "negative answer cached via floor"
+        );
+    }
+
+    #[test]
+    fn nodata_answer_is_cached_as_negative() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            nodata_answer("empty.example.com"),
+            FakeClock::new(),
+        );
+
+        resolver
+            .resolve(&query_for("empty.example.com"))
+            .expect("nodata is Ok(Message)");
+        resolver
+            .resolve(&query_for("empty.example.com"))
+            .expect("served from cache");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nodata answer cached");
+    }
+
+    #[test]
+    fn expired_cache_entry_triggers_a_fresh_backend_call() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let clock = FakeClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            answer: a_answer("example.com", 10),
+            calls: calls.clone(),
+        };
+        let resolver = Resolver::builder(policy)
+            .clock(clock_handle(&clock))
+            .backend(UpstreamGroupId::new("g"), move |query: &Message| {
+                backend.resolve(query)
+            })
+            .build();
+
+        resolver
+            .resolve(&query_for("example.com"))
+            .expect("first resolve populates cache");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        clock.advance(Duration::from_secs(11));
+
+        resolver
+            .resolve(&query_for("example.com"))
+            .expect("expired entry re-queries the backend");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ttl-expired entry is not served from cache"
+        );
+    }
+
+    /// Wraps a `&FakeClock` reference into an owned [`Clock`] the resolver
+    /// can hold, while the test keeps its own handle to advance it. Uses an
+    /// `Arc` so both sides share the same underlying cell.
+    fn clock_handle(_clock: &FakeClock) -> FakeClock {
+        unreachable!("placeholder replaced below")
     }
 }
