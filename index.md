@@ -17,6 +17,7 @@ dns-lattice/
 ├── .ai/<task-name>/            Ignored task plans, audits, and ADRs
 ├── .github/workflows/          CI
 ├── .codex/                     Reusable Codex rules, roles, and templates
+├── .claude/                    Reusable Claude Code rules, roles, and templates
 ├── ARCHITECTURE.md             Target architecture (English)
 ├── ARCHITECTURE.ru.md          Target architecture (Russian)
 ├── ROADMAP.md                  Stage sequencing (English)
@@ -27,7 +28,8 @@ dns-lattice/
 ├── SECURITY.md                 Vulnerability reporting policy
 ├── SUPPORT.md                  Support and project status
 ├── CONTRIBUTING.md             Contribution workflow
-├── AGENTS.md                   Repository agent entry point
+├── AGENTS.md                   Repository agent entry point (Codex)
+├── CLAUDE.md                   Repository agent entry point (Claude Code)
 └── index.md                    This project map
 ```
 
