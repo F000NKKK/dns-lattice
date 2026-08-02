@@ -6,5 +6,7 @@
 pub mod message;
 pub mod record;
 
+pub use matcher::{DomainMatcher, DomainPattern};
 pub use message::{Header, Message, Name, Opcode, Question, Rcode, ResourceRecord};
+pub use policy::{SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId};
 pub use record::{Class, RData, RecordType};
