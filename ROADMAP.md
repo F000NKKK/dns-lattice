@@ -2,7 +2,7 @@
 
 This roadmap sequences the design in `ARCHITECTURE.md`. It is the source of
 current stage facts referenced by `index.md`, `AGENTS.md`, and the
-`.codex/agents/*` role profiles. Update this file whenever a stage starts,
+repository's agent role profiles. Update this file whenever a stage starts,
 completes, or changes scope, and keep it consistent with `ROADMAP.ru.md`.
 
 Each stage below is broken down into one or more bounded implementation
@@ -13,8 +13,7 @@ individual slices.
 
 - `planned` — scoped here, work not yet started.
 - `active` — work is in progress.
-- `done` — verification gates in `.codex/templates/plan.md` all passed and
-  merged.
+- `done` — the task's verification gates all passed and the work merged.
 
 ## Stage 0.0 — Audit, roadmap, architecture baseline
 
@@ -49,8 +48,8 @@ Status: planned
 - Static split-DNS routing: match a query to an upstream group via the
   stage 0.1 matcher.
 - In-memory answer cache respecting TTL, including negative caching.
-- Fake in-process upstream backend for deterministic tests (no real
-  network in ordinary tests, per `.codex/rules/ci.md`).
+- Fake in-process upstream backend for deterministic tests (ordinary tests
+  use no real network, per repository CI policy).
 - Non-goal: no real network transport yet, no dynamic hooks, no inbound
   server listener (the resolver is exercised in-process only at this
   stage).
