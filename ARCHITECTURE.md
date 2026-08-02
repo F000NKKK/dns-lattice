@@ -114,7 +114,7 @@ yet split into their own crate remains:
 ```text
 dns-lattice (facade crate)
 ├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ
-├── engine         Resolver: query pipeline, cache, split-DNS routing
+├── engine         Resolver: query pipeline, cache, split-DNS routing (implemented, stage 0.2)
 ├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
 ├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations
 └── hooks          Dynamic routing hook trait(s) consumed by callers

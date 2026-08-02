@@ -42,7 +42,7 @@ Status: done
 
 ## Stage 0.2 — Resolver engine and static split DNS
 
-Status: planned
+Status: done
 
 - Resolver entry point: construct from config, resolve one query, shut down.
 - Static split-DNS routing: match a query to an upstream group via the
