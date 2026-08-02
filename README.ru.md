@@ -124,6 +124,7 @@ DNS Lattice — один из крейтов более широкого сем�
 |---|---|---|
 | Разрешение split-DNS политики | [`split_dns_policy`](crates/dns-lattice/examples/split_dns_policy.rs) | `SplitDnsPolicy`, `DomainPattern`, приоритет exact/suffix/wildcard, fallback на группу по умолчанию |
 | Wire-round-trip сообщения | [`message_round_trip`](crates/dns-lattice/examples/message_round_trip.rs) | `Message::encode`, `Message::decode`, `Header`, `Question`, `ResourceRecord`, `RData::A` |
+| Resolver со split-DNS и кэшем | [`resolver`](crates/dns-lattice/examples/resolver.rs) | `Resolver`, `ResolverBuilder`, in-process fake upstream backends, TTL-кэш ответов, `Error::NoRoute` |
 
 Запустите пример командой `cargo run -p dns-lattice --example <name>`.
 

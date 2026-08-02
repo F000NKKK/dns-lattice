@@ -121,6 +121,7 @@ model surface available today:
 |---|---|---|
 | Split-DNS policy resolution | [`split_dns_policy`](crates/dns-lattice/examples/split_dns_policy.rs) | `SplitDnsPolicy`, `DomainPattern`, exact/suffix/wildcard precedence, default group fallback |
 | Message wire round-trip | [`message_round_trip`](crates/dns-lattice/examples/message_round_trip.rs) | `Message::encode`, `Message::decode`, `Header`, `Question`, `ResourceRecord`, `RData::A` |
+| Resolver with split-DNS + cache | [`resolver`](crates/dns-lattice/examples/resolver.rs) | `Resolver`, `ResolverBuilder`, in-process fake upstream backends, TTL answer cache, `Error::NoRoute` |
 
 Run an example with `cargo run -p dns-lattice --example <name>`.
 
