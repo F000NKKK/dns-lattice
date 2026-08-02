@@ -4,11 +4,12 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
 
 ## Status
 
-**Bootstrap stage.** This repository currently contains repository workflow,
-policies, and packaging scaffolding ported from
-[net-lattice](https://github.com/F000NKKK/net-lattice), the first crate in the
-Lattice networking ecosystem. No implementation code has landed yet and no
-version has been published.
+**Pre-release.** Repository workflow, policies, and packaging scaffolding
+were ported from [net-lattice](https://github.com/F000NKKK/net-lattice),
+the first crate in the Lattice networking ecosystem. Stage 0.1 (core
+model) has landed the DNS message, zone/domain matcher, and split-DNS
+policy model. No public API is stable yet and no version has been
+published.
 
 ## The Lattice ecosystem
 
