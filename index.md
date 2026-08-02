@@ -55,9 +55,10 @@ implementation starts.
 ## Current status
 
 No release has been published yet. `ROADMAP.md` tracks stage 0.0 (audit,
-roadmap, architecture baseline) and stage 0.1 (core model) as done; stage
-0.2 (resolver engine and static split DNS) is next. See `CONTRIBUTING.md`
-and `SUPPORT.md` for current project status language.
+roadmap, architecture baseline), stage 0.1 (core model), and stage 0.2
+(resolver engine and static split DNS) as done; stage 0.3 (upstream
+transport backends and server listener) is next. See `CONTRIBUTING.md` and
+`SUPPORT.md` for current project status language.
 
 ## Useful commands
 
