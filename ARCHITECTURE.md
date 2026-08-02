@@ -1,10 +1,10 @@
 # DNS Lattice architecture
 
-Status: draft, stage 0.0 (audit and design baseline). No implementation code
-exists yet; this document defines the target shape that later stages
-implement incrementally. Update it whenever an implementation slice changes
-a public contract; internal design-decision records are tracked separately
-and are not part of this document.
+Status: draft. Stage 0.1 (core model) has landed the `dns-lattice-core` and
+`dns-lattice-model` crates below; later stages implement the rest of the
+target shape incrementally. Update this document whenever an implementation
+slice changes a public contract; internal design-decision records are
+tracked separately and are not part of this document.
 
 ## Scope and role in the Lattice ecosystem
 
@@ -95,15 +95,29 @@ crate's core and is invoked by the composing application, typically through
 
 ## Target module layout
 
+DNS Lattice is a multi-crate workspace, mirroring `net-lattice`'s crate
+topology: shared foundational types and the domain model each get their own
+crate, and `dns-lattice` itself is the public-facing **facade crate** that
+re-exports them and assembles the stable surface applications depend on —
+it does not itself hold implementation modules beyond that re-export layer.
+
 ```text
-dns-lattice
-├── model          DNS message types, zones/domain matchers, policy types
+dns-lattice-core     Error/Result shared across the workspace (implemented, stage 0.1)
+dns-lattice-model    DNS message types, zones/domain matchers, policy types (implemented, stage 0.1)
+dns-lattice-platform Cross-platform provider trait(s), once a stage needs OS-facing behavior (target, not yet implemented)
+dns-lattice          Facade crate: re-exports model/core (and later server/engine/upstream/fakeip/hooks) as the crate's stable public surface
+```
+
+Within `dns-lattice` itself, the target module layout for capabilities not
+yet split into their own crate remains:
+
+```text
+dns-lattice (facade crate)
 ├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ
 ├── engine         Resolver: query pipeline, cache, split-DNS routing
 ├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
 ├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations
-├── hooks          Dynamic routing hook trait(s) consumed by callers
-└── facade         Public re-exports assembling the crate's stable surface
+└── hooks          Dynamic routing hook trait(s) consumed by callers
 ```
 
 `server` and `upstream` both speak UDP/TCP/DoT/DoH/DoQ but face opposite
@@ -111,9 +125,13 @@ directions: `server` accepts queries from clients, `upstream` sends queries
 to resolvers. They may share transport plumbing internally, but the public
 listener and backend traits stay distinct.
 
-Module names above are a target shape, not committed public paths; the
-architect role confirms or revises them per bounded slice before
-implementation, and any public path is recorded in an ADR.
+Module and crate names above are a target shape, not committed public
+paths; the architect role confirms or revises them per bounded slice before
+implementation, and any public path is recorded in an ADR. `dns-lattice-core`
+and `dns-lattice-model` are the only crate splits made so far
+(`ADR-0004`, stage 0.1); further splits (e.g. a dedicated crate per
+remaining module, or `dns-lattice-platform`) happen only when a stage
+actually needs them.
 
 ## Core data flow
 
@@ -154,10 +172,15 @@ implemented, not in this document.
 
 ## Public API surface (facade)
 
-The `facade` module is the only place external crates import from. It
+The `dns-lattice` crate is the only place external crates import from. It
 re-exports, at minimum:
 
-- `model`: query/answer types, zone matcher, policy configuration.
+- `dns-lattice-model`: query/answer types, zone matcher, policy
+  configuration (`Message`, `Header`, `Question`, `ResourceRecord`,
+  `RecordType`, `Class`, `RData`, `DomainPattern`, `DomainMatcher`,
+  `SplitDnsPolicy`, `UpstreamGroupId`) — implemented, stage 0.1.
+- `dns-lattice-core`: the shared `Error`/`Result` pair — implemented,
+  stage 0.1.
 - `server`: the listener entry point (construct, bind, serve, shutdown) for
   embedding a full inbound DNS server.
 - `engine`: the resolver entry point (construct, resolve, shutdown), usable

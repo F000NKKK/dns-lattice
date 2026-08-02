@@ -126,7 +126,7 @@ impl<T> DomainMatcher<T> {
             .filter(|(pattern, _)| pattern.matches(name))
             .map(|(pattern, value)| (pattern.specificity(), value))
             .collect();
-        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        matches.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         matches.into_iter().map(|(_, value)| value).collect()
     }
 }
