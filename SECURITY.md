@@ -2,9 +2,14 @@
 
 ## Supported Versions
 
-DNS Lattice has not published a release yet. There is no supported version line;
-security fixes will target the latest development state on `main` until a
-first release ships.
+DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
+publish `0.1.x` to reserve their names on crates.io and to land stage 0.1
+(core model); no public API is stable yet. Security fixes target the latest
+`0.1.x` release and the development state on `main`.
+
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | ✅ |
 
 ## Reporting a Vulnerability
 
@@ -27,6 +32,19 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-DNS Lattice is in the bootstrap stage and has no implementation code yet, so there
-is no functional scope to report against. This file will be updated once the
-first release defines a supported surface.
+The latest published release, stage 0.1 of DNS Lattice's
+[architecture](ARCHITECTURE.md), provides a hand-rolled DNS message model
+(`dns-lattice-model`'s `message`/`record` modules: header, question, and
+resource-record wire encode/decode, including name decompression on
+decode), a deterministic zone/domain matcher (`matcher`), and static
+split-DNS policy types (`policy`) — all pure, in-memory, no network I/O.
+`dns-lattice-core` provides the shared `Error`/`Result` pair.
+
+Reports involving a decode panic, an infinite loop or excessive resource
+consumption on malformed wire input (e.g. a crafted name-compression
+pointer loop), incorrect matcher precedence that could cause a query to be
+misrouted, or memory-safety issues anywhere in this crate are in scope. No
+network I/O, upstream transport, server listener, cache, or Fake IP exist
+yet (see [ROADMAP.md](ROADMAP.md)'s stage 0.1 non-goals); reports against
+functionality that does not exist yet are out of scope until the stage
+that implements it ships.
