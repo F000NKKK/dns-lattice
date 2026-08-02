@@ -17,7 +17,7 @@ individual slices.
 
 ## Stage 0.0 — Audit, roadmap, architecture baseline
 
-Status: active (this document and `ARCHITECTURE.md` are its output)
+Status: done (this document and `ARCHITECTURE.md` are its output)
 
 - Inventory the repository's current bootstrap state (this stage's audit).
 - Record dependency direction and API boundaries against the other Lattice

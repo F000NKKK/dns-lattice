@@ -52,8 +52,8 @@ implementation starts.
 ## Current status
 
 No release has been published yet. `ROADMAP.md` tracks stage 0.0 (audit,
-roadmap, architecture baseline) as active; see `CONTRIBUTING.md` and
-`SUPPORT.md` for current project status language.
+roadmap, architecture baseline) as done; stage 0.1 (core model) is next.
+See `CONTRIBUTING.md` and `SUPPORT.md` for current project status language.
 
 ## Useful commands
 
