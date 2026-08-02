@@ -67,7 +67,10 @@ impl fmt::Display for Error {
                 write!(f, "header section count does not match parsed records")
             }
             Error::RDataLengthMismatch { declared } => {
-                write!(f, "rdlength {declared} does not match available rdata bytes")
+                write!(
+                    f,
+                    "rdlength {declared} does not match available rdata bytes"
+                )
             }
             Error::InvalidClass(class) => write!(f, "invalid class value {class}"),
             Error::MessageTooLong => write!(f, "encoded message would exceed 65535 bytes"),
@@ -87,7 +90,10 @@ mod tests {
     #[test]
     fn every_variant_has_a_stable_non_empty_display_message() {
         let cases = [
-            (Error::Truncated { len: 3 }, "message truncated: 3 bytes available"),
+            (
+                Error::Truncated { len: 3 },
+                "message truncated: 3 bytes available",
+            ),
             (
                 Error::BadNamePointer { offset: 12 },
                 "invalid name compression pointer at offset 12",
