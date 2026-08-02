@@ -28,7 +28,7 @@ Status: done (this document and `ARCHITECTURE.md` are its output)
 
 ## Stage 0.1 — Core model
 
-Status: planned
+Status: done
 
 - DNS message model: query, answer, record types needed by the engine
   (evaluate reuse of an existing DNS protocol crate vs. hand-rolled types;
