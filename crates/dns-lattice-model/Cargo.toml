@@ -1,0 +1,16 @@
+[package]
+name = "dns-lattice-model"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "The DNS message, zone/domain matcher, and policy model for DNS Lattice. No networking I/O, no OS dependency."
+readme = "README.md"
+
+[dependencies]
+dns-lattice-core = { workspace = true }
