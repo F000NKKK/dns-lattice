@@ -2,18 +2,21 @@
 
 Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks.
 
-This repository is in the bootstrap stage: base repository workflow,
-policies, and packaging are in place, but the crate(s) below are placeholders
-with no implementation yet. `ARCHITECTURE.md` / `ARCHITECTURE.ru.md` record
-the target design and `ROADMAP.md` / `ROADMAP.ru.md` sequence the stages
-that implement it; read both before starting or continuing any stage.
+This repository is past its bootstrap stage: base repository workflow,
+policies, and packaging are in place, and stage 0.1 has landed the crate's
+first real implementation (the DNS message/matcher/policy model).
+`ARCHITECTURE.md` / `ARCHITECTURE.ru.md` record the target design and
+`ROADMAP.md` / `ROADMAP.ru.md` sequence the stages that implement it; read
+both before starting or continuing any stage.
 
 ## Workspace map
 
 ```text
 dns-lattice/
 ├── crates/
-│   └── dns-lattice/                Placeholder crate, no implementation yet
+│   ├── dns-lattice/                Facade crate: re-exports the public surface
+│   ├── dns-lattice-core/           Shared Error/Result (no OS or networking types)
+│   └── dns-lattice-model/          DNS message, matcher, and policy model
 ├── .ai/<task-name>/            Ignored task plans, audits, and ADRs
 ├── .github/workflows/          CI
 ├── .codex/                     Reusable Codex rules, roles, and templates
