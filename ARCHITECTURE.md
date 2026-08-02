@@ -2,9 +2,9 @@
 
 Status: draft, stage 0.0 (audit and design baseline). No implementation code
 exists yet; this document defines the target shape that later stages
-implement incrementally. Update it whenever a plan checkbox changes a public
-contract, and record the decision as an ADR under the active
-`.ai/<task-name>/adr/` workspace.
+implement incrementally. Update it whenever an implementation slice changes
+a public contract; internal design-decision records are tracked separately
+and are not part of this document.
 
 ## Scope and role in the Lattice ecosystem
 
@@ -91,8 +91,7 @@ crate's core and is invoked by the composing application, typically through
   crate provides the full server *engine* — listening, serving, and
   answering queries is in scope, as an embeddable library API — but turning
   that engine into an installable daemon/binary belongs to `sdk-lattice` or
-  a separate application. See ADR-0002 for why this differs from treating
-  "DNS server" itself as out of scope.
+  a separate application.
 
 ## Target module layout
 
