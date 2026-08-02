@@ -13,8 +13,9 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** Stage 0.1 (core model) has landed the DNS message model,
-> zone/domain matcher, and split-DNS policy types across three crates —
+> **Status:** Stages 0.1-0.2 have landed the DNS message model,
+> zone/domain matcher, split-DNS policy types, and an in-process resolver
+> (routing plus a TTL/negative-caching answer cache) across three crates —
 > `dns-lattice-core`, `dns-lattice-model`, and the `dns-lattice` facade.
 > `0.1.0` versions were published to reserve the crate names on crates.io;
 > no public API is stable yet. See Current Status below.
@@ -62,16 +63,16 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (stage 0.1):
+Implemented (stage 0.1-0.2):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
 - Zone/domain matcher with deterministic exact/suffix/wildcard precedence
 - Static split-DNS policy types (`SplitDnsPolicy`) built on the matcher
+- In-process `Resolver`: construct from a `SplitDnsPolicy`, route one query to an upstream group, and resolve it through a registered backend, with an in-memory TTL-respecting answer cache including RFC 2308 negative caching
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
-- Resolver engine, in-memory answer cache, static split-DNS routing (stage 0.2)
 - UDP/TCP/DoT/DoH/DoQ upstream backends and the inbound server listener (stage 0.3)
 - Fake IP address pool with reverse lookup (stage 0.4)
 - Dynamic routing hooks for caller-driven policy (stage 0.5)
@@ -86,18 +87,18 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 
 ## Current Status
 
-Stage 0.1 implementation of the [architecture](ARCHITECTURE.md)'s module
-layout is covered by 37 deterministic unit/doc tests, `clippy -D warnings`,
-and verified `cargo package` listings for all three crates:
+Stages 0.1-0.2 implementation of the [architecture](ARCHITECTURE.md)'s
+module layout is covered by deterministic unit/doc tests, `clippy -D
+warnings`, and verified `cargo package` listings for all three crates:
 
 - `dns-lattice-core`'s `Error`/`Result` pair, hand-rolled `Display`/`std::error::Error`
 - `dns-lattice-model`'s `message` (`Message`, `Header`, `Question`, `ResourceRecord`), `record` (`RecordType`, `Class`, `RData`), `matcher` (`DomainPattern`, `DomainMatcher<T>`), and `policy` (`SplitDnsPolicy`) modules
-- the `dns-lattice` facade, re-exporting all of the above
+- the `dns-lattice` facade's `engine` module (`Resolver`, `ResolverBuilder`): in-process construct/resolve, static split-DNS routing, and an in-memory TTL-respecting/negative-caching answer cache — no real network transport yet
 
-This gives a complete, tested DNS message model and a deterministic
-zone/domain matcher usable standalone today, ahead of any transport or
-server code. No network I/O, cache, or Fake IP exist yet — see Non-Goals
-for stage 0.1 in [ROADMAP.md](ROADMAP.md).
+This gives a complete, tested DNS message model, a deterministic
+zone/domain matcher, and an in-process resolver usable standalone today,
+ahead of any real transport or server code. No real network I/O or Fake IP
+exist yet — see Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 
 | Capability | Status |
 |---|:---:|
@@ -105,7 +106,7 @@ for stage 0.1 in [ROADMAP.md](ROADMAP.md).
 | Name (de)compression on decode | ✅ |
 | Zone/domain matcher (exact/suffix/wildcard) | ✅ |
 | Static split-DNS policy types | ✅ |
-| Resolver engine / answer cache | planned (0.2) |
+| Resolver engine / answer cache | ✅ |
 | UDP/TCP/DoT/DoH/DoQ upstream + server listener | planned (0.3) |
 | Fake IP pool | planned (0.4) |
 | Dynamic routing hooks | planned (0.5) |
@@ -127,7 +128,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 
 1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
-3. **Stage 0.2: Resolver engine and static split DNS** — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
+3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
 4. **Stage 0.3: Upstream transport backends and server listener** — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind Cargo features, fallback/failover across upstreams, inbound UDP/TCP/DoT/DoH/DoQ server listener.
 5. **Stage 0.4: Fake IP pool** — deterministic synthetic address allocation, reverse lookup, LRU eviction, documented `tunnel-lattice` integration contract.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
