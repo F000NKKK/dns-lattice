@@ -5,14 +5,14 @@ current stage facts referenced by `index.md`, `AGENTS.md`, and the
 `.codex/agents/*` role profiles. Update this file whenever a stage starts,
 completes, or changes scope, and keep it consistent with `ROADMAP.ru.md`.
 
-Each stage below should map to one or more `.ai/<task-name>/plan.md`
-checklists when work starts; this file tracks stage-level status only, not
-individual checkboxes.
+Each stage below is broken down into one or more bounded implementation
+slices when work starts; this file tracks stage-level status only, not
+individual slices.
 
 ## Stage status legend
 
-- `planned` — scoped here, no task workspace opened yet.
-- `active` — a `.ai/<task-name>/` workspace exists and work is in progress.
+- `planned` — scoped here, work not yet started.
+- `active` — work is in progress.
 - `done` — verification gates in `.codex/templates/plan.md` all passed and
   merged.
 
