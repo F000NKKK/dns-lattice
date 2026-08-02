@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo check *)",
+      "Bash(cargo doc *)",
+      "Bash(git status *)",
+      "Bash(git log *)"
+    ],
+    "deny": [
+      "Bash(git reset --hard*)",
+      "Bash(git clean*)",
+      "Bash(git checkout .*)",
+      "Bash(git checkout -- *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git commit --amend*)",
+      "Bash(git rebase*)",
+      "Bash(git add -f*)",
+      "Bash(git add --force*)"
+    ]
+  }
+}
