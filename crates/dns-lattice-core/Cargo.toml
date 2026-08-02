@@ -1,5 +1,5 @@
 [package]
-name = "dns-lattice"
+name = "dns-lattice-core"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,7 @@ homepage.workspace = true
 documentation.workspace = true
 categories.workspace = true
 keywords.workspace = true
-description = "Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks."
+description = "Foundational error and result types shared across the DNS Lattice workspace. No networking-specific types, no OS dependency."
 readme = "README.md"
 
 [dependencies]
-dns-lattice-core = { workspace = true }

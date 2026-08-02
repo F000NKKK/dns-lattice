@@ -12,3 +12,6 @@ documentation = "https://docs.rs/dns-lattice"
 authors = ["DNS Lattice Contributors", "F000NK"]
 categories = ["network-programming", "os"]
 keywords = ["cross-platform","rust","networking","dns","systems"]
+
+[workspace.dependencies]
+dns-lattice-core = { path = "crates/dns-lattice-core", version = "0.0.0" }
