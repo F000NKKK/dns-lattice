@@ -8,3 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Repository bootstrap: workflow, policies, and packaging scaffolding.
+- Stage 0.1 (core model): `dns-lattice-core` (shared `Error`/`Result`) and
+  `dns-lattice-model` (DNS message, zone/domain matcher, split-DNS policy
+  types) crates, with `dns-lattice` as the facade crate re-exporting them.

@@ -4,10 +4,11 @@ Thank you for your interest in contributing to DNS Lattice.
 
 ## Project Status
 
-DNS Lattice is in the bootstrap stage: repository workflow, policies, and
-packaging scaffolding are in place, ported from
-[net-lattice](https://github.com/F000NKKK/net-lattice). No implementation code
-or public API exists yet. The most valuable contributions right now are:
+DNS Lattice is pre-release: repository workflow, policies, and packaging
+scaffolding are in place, ported from
+[net-lattice](https://github.com/F000NKKK/net-lattice), and the DNS
+message/matcher/policy model (stage 0.1) has landed. No public API is
+stable yet. The most valuable contributions right now are:
 
 - Feedback on the project's vision, scope, and roadmap (see [README.md](README.md))
 - Discussion of API design and architecture for the first implementation stage
