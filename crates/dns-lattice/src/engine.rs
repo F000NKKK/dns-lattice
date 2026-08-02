@@ -44,30 +44,32 @@ impl Clock for SystemClock {
 /// A manually-advanced [`Clock`] for deterministic tests.
 ///
 /// Interior-mutable and cheaply cloneable (shares the same underlying cell
-/// via [`std::rc::Rc`]) so a test can keep a handle to advance the clock
-/// after handing an owned copy to [`ResolverBuilder::clock`].
+/// via `Arc<Mutex<_>>`, kept `Send + Sync` so it satisfies
+/// [`ResolverBuilder::clock`]'s bound) so a test can keep a handle to
+/// advance the clock after handing an owned copy to the resolver.
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct FakeClock(std::rc::Rc<Cell<Instant>>);
+pub(crate) struct FakeClock(std::sync::Arc<std::sync::Mutex<Instant>>);
 
 #[cfg(test)]
 impl FakeClock {
     /// Starts the clock at the current real instant (only used as an
     /// arbitrary, non-real-time-dependent base point).
     pub(crate) fn new() -> Self {
-        FakeClock(std::rc::Rc::new(Cell::new(Instant::now())))
+        FakeClock(std::sync::Arc::new(std::sync::Mutex::new(Instant::now())))
     }
 
     /// Advances the clock by `duration`.
     pub(crate) fn advance(&self, duration: Duration) {
-        self.0.set(self.0.get() + duration);
+        let mut guard = self.0.lock().expect("fake clock mutex poisoned");
+        *guard += duration;
     }
 }
 
 #[cfg(test)]
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
-        self.0.get()
+        *self.0.lock().expect("fake clock mutex poisoned")
     }
 }
 
