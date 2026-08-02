@@ -182,7 +182,7 @@ recorded as ADRs before the first 0.x release stabilizes them.
   through `upstream`'s transport implementations.
 - **Testing**: ordinary tests are deterministic and use in-process fake
   upstream backends; tests requiring real network or elevated privilege are
-  `#[ignore]`d per `.codex/rules/ci.md`.
+  `#[ignore]`d and run only in dedicated privileged CI jobs.
 
 ## Relationship to `index.md` and `AGENTS.md`
 
