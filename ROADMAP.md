@@ -51,21 +51,28 @@ Status: planned
 - In-memory answer cache respecting TTL, including negative caching.
 - Fake in-process upstream backend for deterministic tests (no real
   network in ordinary tests, per `.codex/rules/ci.md`).
-- Non-goal: no real network transport yet, no dynamic hooks.
+- Non-goal: no real network transport yet, no dynamic hooks, no inbound
+  server listener (the resolver is exercised in-process only at this
+  stage).
 
-## Stage 0.3 — Upstream transport backends
+## Stage 0.3 — Upstream transport backends and server listener
 
 Status: planned
 
 - `upstream` backend trait stabilized (from `ARCHITECTURE.md`).
-- UDP and TCP backends (baseline, no TLS/QUIC dependency).
-- DoT and DoH backends behind explicit Cargo features.
-- DoQ backend behind an explicit Cargo feature, if a maintained QUIC/HTTP-3
-  dependency is available for all target platforms; otherwise record the gap
-  as an ADR and defer.
+- UDP and TCP upstream backends (baseline, no TLS/QUIC dependency).
+- DoT and DoH upstream backends behind explicit Cargo features.
+- DoQ upstream backend behind an explicit Cargo feature, if a maintained
+  QUIC/HTTP-3 dependency is available for all target platforms; otherwise
+  record the gap as an ADR and defer.
 - Fallback/failover across upstreams within a group (see the failure-flow
   diagram in `ARCHITECTURE.md`).
-- Non-goal: no platform-specific privileged transport (e.g. raw sockets).
+- `server` inbound listener: UDP and TCP first, matching the crate's
+  Kestrel-style embeddable-server goal from `ARCHITECTURE.md`; DoT/DoH/DoQ
+  listeners behind the same Cargo features as their upstream counterparts.
+- Non-goal: no platform-specific privileged transport (e.g. raw sockets,
+  binding privileged ports) — that stays the composing application's
+  responsibility, typically via `net-lattice`.
 
 ## Stage 0.4 — Fake IP pool
 

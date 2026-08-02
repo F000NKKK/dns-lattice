@@ -8,8 +8,12 @@ contract, and record the decision as an ADR under the active
 
 ## Scope and role in the Lattice ecosystem
 
-DNS Lattice is the **protocol and policy plane for DNS**, not an OS
-integration layer and not a policy compiler:
+DNS Lattice is an **embeddable DNS server engine** — the DNS equivalent of
+what Kestrel is for HTTP in ASP.NET Core: a full, modern, hostable server
+core that any application embeds to gain a complete DNS server (inbound
+listening, split DNS, Fake IP, caching, DoT/DoH/DoQ, dynamic routing) without
+building one from scratch. It is the protocol/server plane for DNS, not an
+OS integration layer and not a policy compiler:
 
 ```text
 net-lattice      OS networking inspection/configuration (routes, DNS, interfaces)
@@ -31,16 +35,31 @@ sdk-lattice      Application-facing SDK composing the crates above
 - `sdk-lattice` wires the crates above together for an application. It is the
   only crate expected to depend on all of them simultaneously.
 
-`dns-lattice` therefore exposes a library API consumed by `sdk-lattice` (and
-directly by advanced users). It intentionally has **no required OS privilege
-and no required OS-specific code path** in its core: DNS message handling,
-routing decisions, caching, and Fake IP allocation are pure, portable logic.
-Where a capability is inherently platform-specific (e.g. a system resolver
-override), that responsibility stays in `net-lattice` and is invoked by the
-composing application, not by this crate.
+`dns-lattice` therefore exposes a library API consumed directly by
+applications today, and by `flow-lattice` and `sdk-lattice` once those
+crates are ready to build on it: `sdk-lattice` composes it with the other
+Lattice crates into a full application, and `flow-lattice` is expected to
+drive it through the dynamic routing hooks below once policy compilation
+exists. Embedding the server core does not itself require OS privilege or
+an OS-specific code path: DNS message handling, inbound query serving,
+routing decisions, caching, and Fake IP allocation are pure, portable logic
+that binds to a UDP/TCP socket like any other network server. Only a
+capability that is inherently platform-specific (e.g. a system resolver
+override, binding to a privileged port on some platforms) stays out of this
+crate's core and is invoked by the composing application, typically through
+`net-lattice`.
 
 ## Design goals
 
+- **Embeddable server core, not just a resolver client.** The crate serves
+  inbound DNS queries (UDP/TCP/DoT/DoH/DoQ listeners) end to end, the same
+  way Kestrel serves inbound HTTP: construct, bind, serve, shut down. A host
+  application gets a complete, modern DNS server by embedding this crate,
+  not by wrapping a separate daemon.
+- **Full modern feature parity.** Split DNS, Fake IP, caching, encrypted
+  upstream transport, and programmable routing are first-class, built-in
+  capabilities of the engine, not optional add-ons bolted on by a consumer
+  crate.
 - **Programmable, not configuration-only.** Routing and resolution decisions
   are expressed as Rust types and traits (policies, matchers, hooks), so a
   host application can implement custom logic without forking the crate.
@@ -67,20 +86,31 @@ composing application, not by this crate.
 - Compiling user-facing rule syntax into policy (`flow-lattice`'s job); this
   crate consumes an already-structured policy/hook, not raw rule text.
 - Managing the TUN/TAP device or packet forwarding (`tunnel-lattice`'s job).
-- Acting as a standalone DNS server binary. The crate is a library; a binary
-  wrapper, if any, belongs to `sdk-lattice` or a separate application.
+- Shipping a standalone DNS server **product** (CLI entry point, config
+  file format, process supervision, packaging as a system service). The
+  crate provides the full server *engine* — listening, serving, and
+  answering queries is in scope, as an embeddable library API — but turning
+  that engine into an installable daemon/binary belongs to `sdk-lattice` or
+  a separate application. See ADR-0002 for why this differs from treating
+  "DNS server" itself as out of scope.
 
 ## Target module layout
 
 ```text
 dns-lattice
 ├── model          DNS message types, zones/domain matchers, policy types
+├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ
 ├── engine         Resolver: query pipeline, cache, split-DNS routing
 ├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
 ├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations
 ├── hooks          Dynamic routing hook trait(s) consumed by callers
 └── facade         Public re-exports assembling the crate's stable surface
 ```
+
+`server` and `upstream` both speak UDP/TCP/DoT/DoH/DoQ but face opposite
+directions: `server` accepts queries from clients, `upstream` sends queries
+to resolvers. They may share transport plumbing internally, but the public
+listener and backend traits stay distinct.
 
 Module names above are a target shape, not committed public paths; the
 architect role confirms or revises them per bounded slice before
@@ -90,7 +120,9 @@ implementation, and any public path is recorded in an ADR.
 
 ```mermaid
 flowchart LR
-    Query[Incoming query] --> Match[Zone / policy matcher]
+    Client[Client] --> Listener[Server listener: UDP/TCP/DoT/DoH/DoQ]
+    Listener --> Query[Incoming query]
+    Query --> Match[Zone / policy matcher]
     Match -->|hook decision| Hook[Dynamic routing hook]
     Match -->|static split rule| Route[Upstream group selection]
     Hook --> Route
@@ -101,6 +133,8 @@ flowchart LR
     Cache --> Answer
     Answer -->|Fake IP domain| FakeIP[Fake IP pool: allocate/reuse]
     FakeIP --> Answer
+    Answer --> Listener
+    Listener --> Client
 ```
 
 ## Failure and compensation flow
@@ -125,7 +159,11 @@ The `facade` module is the only place external crates import from. It
 re-exports, at minimum:
 
 - `model`: query/answer types, zone matcher, policy configuration.
-- `engine`: the resolver entry point (construct, resolve, shutdown).
+- `server`: the listener entry point (construct, bind, serve, shutdown) for
+  embedding a full inbound DNS server.
+- `engine`: the resolver entry point (construct, resolve, shutdown), usable
+  standalone (no listener) for applications that only need programmatic
+  resolution.
 - `fakeip`: pool configuration and lookup/reverse-lookup types.
 - `upstream`: the backend trait, so callers can implement custom transports.
 - `hooks`: the dynamic routing hook trait.
