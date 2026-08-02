@@ -75,6 +75,24 @@ impl Name {
             .map(|label| label.to_ascii_lowercase())
             .collect()
     }
+
+    /// The number of labels in this name (0 for the root name).
+    pub(crate) fn label_count(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether this name's rightmost labels equal `suffix` (case-insensitive).
+    /// A name is always its own suffix.
+    pub(crate) fn ends_with(&self, suffix: &Name) -> bool {
+        if suffix.0.len() > self.0.len() {
+            return false;
+        }
+        let offset = self.0.len() - suffix.0.len();
+        self.0[offset..]
+            .iter()
+            .zip(suffix.0.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
 }
 
 impl PartialEq for Name {
