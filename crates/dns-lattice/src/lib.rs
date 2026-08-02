@@ -23,9 +23,9 @@
 //! `dns-lattice-model`, and the shared `Error`/`Result` pair from
 //! `dns-lattice-core`. Stage 0.1 implemented the `model` layer; stage 0.2
 //! adds the [`engine`] module's [`Resolver`] (construct/resolve, static
-//! split-DNS routing). Later stages add `server`, `upstream`, `fakeip`, and
-//! `hooks` behind this same facade. See `ARCHITECTURE.md` for the full
-//! module layout.
+//! split-DNS routing, and an in-memory TTL/negative-caching answer cache).
+//! Later stages add `server`, `upstream`, `fakeip`, and `hooks` behind this
+//! same facade. See `ARCHITECTURE.md` for the full module layout.
 
 pub mod engine;
 
