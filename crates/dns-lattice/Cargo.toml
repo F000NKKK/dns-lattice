@@ -14,3 +14,4 @@ readme = "README.md"
 
 [dependencies]
 dns-lattice-core = { workspace = true }
+dns-lattice-model = { workspace = true }
