@@ -8,7 +8,7 @@
 //! (`UpstreamBackend`) is crate-private and intentionally minimal; it is not
 //! a preview of the stage 0.3 public `upstream` trait.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -164,10 +164,10 @@ impl Resolver {
         };
 
         let now = self.clock.now();
-        if let Some(entry) = self.cache.borrow().get(&key) {
-            if entry.expires_at > now {
-                return Ok(entry.answer.clone());
-            }
+        if let Some(entry) = self.cache.borrow().get(&key)
+            && entry.expires_at > now
+        {
+            return Ok(entry.answer.clone());
         }
 
         let group = self
@@ -570,49 +570,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_entry_expires_after_ttl_and_backend_is_called_again() {
+    fn cache_entry_still_hit_just_before_ttl_elapses() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
         let clock = FakeClock::new();
-        let calls_counter;
-        let resolver;
-        {
-            let (r, c) = resolver_with_counting_backend(
-                policy,
-                "g",
-                a_answer("example.com", 300),
-                FakeClock::new(),
-            );
-            resolver = r;
-            calls_counter = c;
-        }
-        let _ = clock; // unused placeholder clock above superseded by resolver's own clock
-
-        // Rebuild using the same clock instance the resolver owns is not
-        // possible from outside; instead build directly here with a shared
-        // clock we can advance.
-        let shared_clock = FakeClock::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let backend = CountingBackend {
-            answer: a_answer("example.com", 300),
-            calls: calls.clone(),
-        };
-        let policy = SplitDnsPolicy::builder()
-            .default_group(UpstreamGroupId::new("g"))
-            .build();
-        let resolver = Resolver::builder(policy)
-            .clock(shared_clock)
-            .backend(UpstreamGroupId::new("g"), move |query: &Message| {
-                backend.resolve(query)
-            })
-            .build();
-        let _ = calls_counter;
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            a_answer("example.com", 300),
+            clock.clone(),
+        );
 
         resolver
             .resolve(&query_for("example.com"))
             .expect("first resolve populates cache");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        clock.advance(Duration::from_secs(299));
 
         resolver
             .resolve(&query_for("example.com"))
@@ -694,17 +669,8 @@ mod tests {
             .default_group(UpstreamGroupId::new("g"))
             .build();
         let clock = FakeClock::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let backend = CountingBackend {
-            answer: a_answer("example.com", 10),
-            calls: calls.clone(),
-        };
-        let resolver = Resolver::builder(policy)
-            .clock(clock_handle(&clock))
-            .backend(UpstreamGroupId::new("g"), move |query: &Message| {
-                backend.resolve(query)
-            })
-            .build();
+        let (resolver, calls) =
+            resolver_with_counting_backend(policy, "g", a_answer("example.com", 10), clock.clone());
 
         resolver
             .resolve(&query_for("example.com"))
@@ -721,12 +687,5 @@ mod tests {
             2,
             "ttl-expired entry is not served from cache"
         );
-    }
-
-    /// Wraps a `&FakeClock` reference into an owned [`Clock`] the resolver
-    /// can hold, while the test keeps its own handle to advance it. Uses an
-    /// `Arc` so both sides share the same underlying cell.
-    fn clock_handle(_clock: &FakeClock) -> FakeClock {
-        unreachable!("placeholder replaced below")
     }
 }
