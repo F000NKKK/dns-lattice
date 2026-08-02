@@ -1,0 +1,24 @@
+version = 1
+SPDX-PackageName = "dns-lattice"
+SPDX-PackageSupplier = "DNS Lattice Contributors"
+SPDX-PackageDownloadLocation = "https://github.com/F000NKKK/dns-lattice"
+
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "DNS Lattice Contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = "LICENSE"
+SPDX-FileCopyrightText = "DNS Lattice Contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = [
+    "CHANGELOG.md",
+    "**.gitignore",
+    "**.gitattributes",
+    "**.editorconfig",
+]
+SPDX-FileCopyrightText = "DNS Lattice Contributors"
+SPDX-License-Identifier = "CC0-1.0"

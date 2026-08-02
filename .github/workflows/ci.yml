@@ -1,0 +1,51 @@
+name: CI
+
+# Bootstrap-stage CI: this repository has no platform-specific backend
+# code yet, so this runs plain fmt/clippy/check/test/doc across the three
+# platforms the DNS Lattice ecosystem targets. Widen this workflow (coverage,
+# privileged jobs, per-crate matrices) once real platform code lands —
+# see net-lattice's .github/workflows/ci.yml for the pattern to grow into.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features
+
+      - name: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features
+
+      - name: cargo doc --no-deps --workspace --all-features
+        run: cargo doc --no-deps --workspace --all-features
