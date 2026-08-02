@@ -10,9 +10,11 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   through this facade crate.
 - `dns-lattice-core`'s `Error`/`Result` pair.
 - An in-process resolver entry point (`Resolver`, `ResolverBuilder`): route
-  one query through a `SplitDnsPolicy` to an upstream group, then forward it
-  to that group's backend. No in-memory answer cache and no real network
-  transport yet — those land in a later slice of stage 0.2 / stage 0.3.
+  one query through a `SplitDnsPolicy` to an upstream group, forward it to
+  that group's backend, and cache the answer in memory (TTL-respecting,
+  with RFC 2308 negative caching) so a repeated query is served without
+  re-querying the backend. No real network transport yet — that lands in
+  stage 0.3.
 
 Server, upstream transports, Fake IP, and hook capabilities are planned for
 later stages; see `ROADMAP.md` in the repository root.
@@ -36,8 +38,8 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 ## Status
 
 Pre-0.1 stage: this crate has no stable API yet. Stage 0.1 (core model)
-landed the DNS message/matcher/policy model above; stage 0.2 is landing
-incrementally, starting with the resolver's construct/resolve lifecycle and
-static split-DNS routing (no cache yet). Server, real upstream transports,
-Fake IP, and dynamic routing hooks are not implemented yet. Types may change
-without notice until the first stable release.
+landed the DNS message/matcher/policy model above; stage 0.2 landed the
+resolver's construct/resolve lifecycle, static split-DNS routing, and its
+in-memory TTL/negative-caching answer cache. Server, real upstream
+transports, Fake IP, and dynamic routing hooks are not implemented yet.
+Types may change without notice until the first stable release.
