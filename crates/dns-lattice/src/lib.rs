@@ -21,12 +21,17 @@
 //!
 //! Re-exports the DNS message, matcher, and policy types from
 //! `dns-lattice-model`, and the shared `Error`/`Result` pair from
-//! `dns-lattice-core`. Stage 0.1 only implements the `model` layer; later
-//! stages add `server`, `engine`, `upstream`, `fakeip`, and `hooks` behind
-//! this same facade. See `ARCHITECTURE.md` for the full module layout.
+//! `dns-lattice-core`. Stage 0.1 implemented the `model` layer; stage 0.2
+//! adds the [`engine`] module's [`Resolver`] (construct/resolve, static
+//! split-DNS routing). Later stages add `server`, `upstream`, `fakeip`, and
+//! `hooks` behind this same facade. See `ARCHITECTURE.md` for the full
+//! module layout.
+
+pub mod engine;
 
 pub use dns_lattice_core::{Error, Result};
 pub use dns_lattice_model::{
     Class, DomainMatcher, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode,
     RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
 };
+pub use engine::{Resolver, ResolverBuilder};

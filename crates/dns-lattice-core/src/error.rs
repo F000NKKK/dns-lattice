@@ -49,6 +49,9 @@ pub enum Error {
     /// A domain pattern's wildcard label (`*`) appeared somewhere other
     /// than the leftmost position.
     WildcardPosition,
+    /// No split-DNS rule matched the queried name and no default upstream
+    /// group is configured.
+    NoRoute,
 }
 
 impl fmt::Display for Error {
@@ -77,6 +80,10 @@ impl fmt::Display for Error {
             Error::WildcardPosition => {
                 write!(f, "wildcard label may only appear as the leftmost label")
             }
+            Error::NoRoute => write!(
+                f,
+                "no split-dns rule matched and no default upstream group is configured"
+            ),
         }
     }
 }
@@ -120,6 +127,10 @@ mod tests {
             (
                 Error::WildcardPosition,
                 "wildcard label may only appear as the leftmost label",
+            ),
+            (
+                Error::NoRoute,
+                "no split-dns rule matched and no default upstream group is configured",
             ),
         ];
         for (error, expected) in cases {
