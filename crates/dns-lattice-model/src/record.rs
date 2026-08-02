@@ -4,8 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use dns_lattice_core::{Error, Result};
 
-use super::message::{decode_name, encode_name, read_u16, read_u32, write_u16, write_u32};
 use super::Name;
+use super::message::{decode_name, encode_name, read_u16, read_u32, write_u16, write_u32};
 
 /// A DNS resource record type (RFC 1035 §3.2.2 and later RFCs).
 ///
@@ -204,7 +204,12 @@ impl RData {
         Ok(())
     }
 
-    pub(crate) fn decode(buf: &[u8], pos: &mut usize, rtype: RecordType, rdlength: usize) -> Result<Self> {
+    pub(crate) fn decode(
+        buf: &[u8],
+        pos: &mut usize,
+        rtype: RecordType,
+        rdlength: usize,
+    ) -> Result<Self> {
         let start = *pos;
         let end = start
             .checked_add(rdlength)
@@ -218,7 +223,8 @@ impl RData {
                         declared: rdlength as u16,
                     });
                 }
-                let addr = Ipv4Addr::new(buf[start], buf[start + 1], buf[start + 2], buf[start + 3]);
+                let addr =
+                    Ipv4Addr::new(buf[start], buf[start + 1], buf[start + 2], buf[start + 3]);
                 *pos += 4;
                 RData::A(addr)
             }

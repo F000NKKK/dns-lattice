@@ -3,7 +3,9 @@
 //! No network I/O, no operating-system dependency — see `ARCHITECTURE.md`
 //! for the crate's non-goals at this stage.
 
+pub mod matcher;
 pub mod message;
+pub mod policy;
 pub mod record;
 
 pub use matcher::{DomainMatcher, DomainPattern};

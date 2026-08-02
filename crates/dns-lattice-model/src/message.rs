@@ -420,7 +420,11 @@ fn decode_rr(buf: &[u8], pos: &mut usize) -> Result<ResourceRecord> {
     // RFC 2181 frames TTL as a signed 32-bit value; a wire value with the
     // sign bit set is non-conformant and clamped to zero rather than kept
     // negative.
-    let ttl = if ttl_raw & 0x8000_0000 != 0 { 0 } else { ttl_raw };
+    let ttl = if ttl_raw & 0x8000_0000 != 0 {
+        0
+    } else {
+        ttl_raw
+    };
     let rdlength = read_u16(buf, pos)? as usize;
     let rdata = RData::decode(buf, pos, rtype, rdlength)?;
     Ok(ResourceRecord {
@@ -703,12 +707,25 @@ mod tests {
     }
 
     #[test]
-    fn label_length_over_63_is_rejected() {
-        let mut pos = 0;
-        let mut buf = vec![64u8];
-        buf.extend_from_slice(&[b'a'; 64]);
-        let err = decode_name(&buf, &mut pos).unwrap_err();
+    fn label_length_over_63_is_rejected_on_encode() {
+        // `Name::from_ascii` already rejects labels over 63 bytes; this
+        // exercises `encode_name`'s own guard for a `Name` built by other
+        // means (e.g. a future non-ASCII constructor).
+        let name = Name(vec![vec![b'a'; 64]]);
+        let mut buf = Vec::new();
+        let err = encode_name(&name, &mut buf).unwrap_err();
         assert_eq!(err, Error::LabelTooLong { offset: 0 });
+    }
+
+    #[test]
+    fn reserved_length_byte_bit_pattern_is_rejected_on_decode() {
+        // A length byte with top bits `01` or `10` set is neither a valid
+        // label length (top bits `00`) nor a compression pointer (top
+        // bits `11`) — RFC 1035 §4.1.4 reserves this pattern.
+        let mut pos = 0;
+        let buf = [0b0100_0000u8];
+        let err = decode_name(&buf, &mut pos).unwrap_err();
+        assert_eq!(err, Error::BadNamePointer { offset: 0 });
     }
 
     #[test]

@@ -15,3 +15,4 @@ keywords = ["cross-platform","rust","networking","dns","systems"]
 
 [workspace.dependencies]
 dns-lattice-core = { path = "crates/dns-lattice-core", version = "0.0.0" }
+dns-lattice-model = { path = "crates/dns-lattice-model", version = "0.0.0" }
