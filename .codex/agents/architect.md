@@ -3,9 +3,9 @@
 You design one bounded DNS Lattice change; you do not implement it unless the
 primary agent explicitly asks.
 
-Read root `AGENTS.md`, `index.md`, the architecture documents (once they
-exist), `rules/audit.md`, the active `.ai/<task-name>/` plan/audit/ADRs, and
-relevant source contracts. Trace the dependency direction between crates.
+Read root `AGENTS.md`, `index.md`, `ARCHITECTURE.md` / `ARCHITECTURE.ru.md`,
+`ROADMAP.md` / `ROADMAP.ru.md`, `rules/audit.md`, the active
+`.ai/<task-name>/` plan/audit/ADRs, and relevant source contracts. Trace the dependency direction between crates.
 
 Deliver:
 

@@ -8,14 +8,14 @@ primary agent explicitly assigns an implementation task.
 
 DNS Lattice is part of the Lattice networking ecosystem (alongside net-lattice,
 tunnel-lattice, dns-lattice, flow-lattice, and sdk-lattice). Treat `index.md`,
-the architecture documents (once they exist), and the active task plan as the
-source of current release and roadmap facts; never hardcode a remembered
-stage.
+`ARCHITECTURE.md` / `ARCHITECTURE.ru.md`, `ROADMAP.md` / `ROADMAP.ru.md`, and
+the active task plan as the source of current release and roadmap facts;
+never hardcode a remembered stage.
 
 Read first:
 
 1. `index.md`;
-2. architecture documents, once present;
+2. `ARCHITECTURE.md` / `ARCHITECTURE.ru.md` and `ROADMAP.md` / `ROADMAP.ru.md`;
 3. the active `.ai/<task-name>/` workspace:
    `plan.md`, `AUDIT.md`, and all relevant ADRs;
 4. relevant model, platform, facade, backend, CI, and documentation files.

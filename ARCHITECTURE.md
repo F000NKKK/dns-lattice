@@ -1,0 +1,154 @@
+# DNS Lattice architecture
+
+Status: draft, stage 0.0 (audit and design baseline). No implementation code
+exists yet; this document defines the target shape that later stages
+implement incrementally. Update it whenever a plan checkbox changes a public
+contract, and record the decision as an ADR under the active
+`.ai/<task-name>/adr/` workspace.
+
+## Scope and role in the Lattice ecosystem
+
+DNS Lattice is the **protocol and policy plane for DNS**, not an OS
+integration layer and not a policy compiler:
+
+```text
+net-lattice      OS networking inspection/configuration (routes, DNS, interfaces)
+tunnel-lattice   TUN/TAP tunnel interfaces
+dns-lattice      Programmable DNS control plane            <- this crate
+flow-lattice     Policy compiler: rules -> platform-neutral network plans
+sdk-lattice      Application-facing SDK composing the crates above
+```
+
+- `net-lattice` reads and writes OS-level DNS configuration (e.g. system
+  resolver settings, `/etc/resolv.conf`-equivalents). It does not resolve
+  queries or hold routing policy.
+- `flow-lattice` compiles user/operator rules into platform-neutral plans. It
+  may produce the routing policy that `dns-lattice` executes, but it does not
+  execute DNS lookups itself.
+- `tunnel-lattice` provides the TUN/TAP data path that Fake IP responses are
+  ultimately routed through; `dns-lattice` only allocates and resolves the
+  Fake IP mapping, it does not own the tunnel.
+- `sdk-lattice` wires the crates above together for an application. It is the
+  only crate expected to depend on all of them simultaneously.
+
+`dns-lattice` therefore exposes a library API consumed by `sdk-lattice` (and
+directly by advanced users). It intentionally has **no required OS privilege
+and no required OS-specific code path** in its core: DNS message handling,
+routing decisions, caching, and Fake IP allocation are pure, portable logic.
+Where a capability is inherently platform-specific (e.g. a system resolver
+override), that responsibility stays in `net-lattice` and is invoked by the
+composing application, not by this crate.
+
+## Design goals
+
+- **Programmable, not configuration-only.** Routing and resolution decisions
+  are expressed as Rust types and traits (policies, matchers, hooks), so a
+  host application can implement custom logic without forking the crate.
+- **Split DNS.** Queries route to different upstream groups based on
+  domain/zone matchers, source context, or a caller-supplied hook, rather
+  than a single fixed upstream.
+- **Fake IP.** Deterministic, reversible allocation of synthetic addresses
+  per domain, for transparent proxying in combination with `tunnel-lattice`.
+- **Dynamic routing hooks.** A stable extension point so `flow-lattice`
+  (or any caller) can influence per-query resolution without a compile-time
+  dependency from `dns-lattice` on `flow-lattice`.
+- **Backend-agnostic transport.** UDP/TCP/DoT/DoH/DoQ are interchangeable
+  implementations of one upstream trait; the core never assumes a transport.
+- **No hidden global state.** All engine state is owned by a value the caller
+  constructs and holds; no process-wide singletons, no ambient I/O.
+- **Cross-platform first.** The core crate must build and pass tests on
+  Linux, Windows, and macOS with no `cfg`-gated core logic. Only backend I/O
+  (sockets, TLS/QUIC stacks) may vary by platform capability, and never by
+  platform *behavior*.
+
+## Non-goals (for this crate)
+
+- Owning or mutating OS-level DNS configuration (`net-lattice`'s job).
+- Compiling user-facing rule syntax into policy (`flow-lattice`'s job); this
+  crate consumes an already-structured policy/hook, not raw rule text.
+- Managing the TUN/TAP device or packet forwarding (`tunnel-lattice`'s job).
+- Acting as a standalone DNS server binary. The crate is a library; a binary
+  wrapper, if any, belongs to `sdk-lattice` or a separate application.
+
+## Target module layout
+
+```text
+dns-lattice
+├── model          DNS message types, zones/domain matchers, policy types
+├── engine         Resolver: query pipeline, cache, split-DNS routing
+├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
+├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations
+├── hooks          Dynamic routing hook trait(s) consumed by callers
+└── facade         Public re-exports assembling the crate's stable surface
+```
+
+Module names above are a target shape, not committed public paths; the
+architect role confirms or revises them per bounded slice before
+implementation, and any public path is recorded in an ADR.
+
+## Core data flow
+
+```mermaid
+flowchart LR
+    Query[Incoming query] --> Match[Zone / policy matcher]
+    Match -->|hook decision| Hook[Dynamic routing hook]
+    Match -->|static split rule| Route[Upstream group selection]
+    Hook --> Route
+    Route --> Cache{Cache hit?}
+    Cache -->|yes| Answer[Answer]
+    Cache -->|no| Upstream[Upstream backend: UDP/TCP/DoT/DoH/DoQ]
+    Upstream --> Cache
+    Cache --> Answer
+    Answer -->|Fake IP domain| FakeIP[Fake IP pool: allocate/reuse]
+    FakeIP --> Answer
+```
+
+## Failure and compensation flow
+
+```mermaid
+flowchart LR
+    Upstream[Upstream backend] -->|timeout/error| Fallback[Next upstream in group]
+    Fallback -->|all exhausted| Negative[Negative/failure answer]
+    Negative --> Cache[Negative-cache with bounded TTL]
+    FakeIPAlloc[Fake IP allocation] -->|pool exhausted| Evict[LRU eviction of oldest mapping]
+    FakeIPAlloc -->|reverse lookup miss| NotFound[Explicit not-found, no panic]
+```
+
+Every fallible path returns a typed error; the engine never panics on
+network failure, malformed upstream responses, or pool exhaustion. Exact
+error types are defined when the `model` and `engine` slices are
+implemented, not in this document.
+
+## Public API surface (facade)
+
+The `facade` module is the only place external crates import from. It
+re-exports, at minimum:
+
+- `model`: query/answer types, zone matcher, policy configuration.
+- `engine`: the resolver entry point (construct, resolve, shutdown).
+- `fakeip`: pool configuration and lookup/reverse-lookup types.
+- `upstream`: the backend trait, so callers can implement custom transports.
+- `hooks`: the dynamic routing hook trait.
+
+Concrete type and trait names are decided per implementation slice and
+recorded as ADRs before the first 0.x release stabilizes them.
+
+## Cross-cutting concerns
+
+- **Observability**: the engine emits structured events (query received,
+  cache hit/miss, upstream selected, Fake IP allocated, failure) through a
+  caller-supplied sink trait, not a hardcoded logging framework.
+- **Concurrency**: the engine is safe to call concurrently; no interior
+  mutability without synchronization is exposed in the public API.
+- **Privilege**: none required by this crate's core. Any privileged
+  operation belongs to `net-lattice` or the host OS network stack invoked
+  through `upstream`'s transport implementations.
+- **Testing**: ordinary tests are deterministic and use in-process fake
+  upstream backends; tests requiring real network or elevated privilege are
+  `#[ignore]`d per `.codex/rules/ci.md`.
+
+## Relationship to `index.md` and `AGENTS.md`
+
+This document is the architecture reference that `AGENTS.md` and `index.md`
+point to. `ROADMAP.md` sequences the stages that implement it; it does not
+duplicate this design. Update both together when a stage changes scope.

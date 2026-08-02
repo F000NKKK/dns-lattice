@@ -4,9 +4,9 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
 
 This repository is in the bootstrap stage: base repository workflow,
 policies, and packaging are in place, but the crate(s) below are placeholders
-with no implementation yet. Architecture and roadmap documents
-(`ARCHITECTURE.md` / `ARCHITECTURE.ru.md`) will be added in a future session
-once the design is decided; do not assume any roadmap stage from this file.
+with no implementation yet. `ARCHITECTURE.md` / `ARCHITECTURE.ru.md` record
+the target design and `ROADMAP.md` / `ROADMAP.ru.md` sequence the stages
+that implement it; read both before starting or continuing any stage.
 
 ## Workspace map
 
@@ -17,6 +17,10 @@ dns-lattice/
 ├── .ai/<task-name>/            Ignored task plans, audits, and ADRs
 ├── .github/workflows/          CI
 ├── .codex/                     Reusable Codex rules, roles, and templates
+├── ARCHITECTURE.md             Target architecture (English)
+├── ARCHITECTURE.ru.md          Target architecture (Russian)
+├── ROADMAP.md                  Stage sequencing (English)
+├── ROADMAP.ru.md                Stage sequencing (Russian)
 ├── README.md                   English user documentation
 ├── README.ru.md                Russian user documentation
 ├── CHANGELOG.md                Release history
@@ -39,14 +43,15 @@ flow-lattice     Policy compiler: rules -> platform-neutral network plans
 sdk-lattice      Application-facing SDK composing the crates above
 ```
 
-Cross-crate dependency direction and API boundaries have not been decided yet
-and will be recorded in this repository's architecture documents and ADRs
-once that design work happens.
+Cross-crate dependency direction and API boundaries are recorded in
+`ARCHITECTURE.md`; cross-crate decisions are further tracked as ADRs once
+implementation starts.
 
 ## Current status
 
-No release has been published yet. There is no roadmap stage to report here;
-see `CONTRIBUTING.md` and `SUPPORT.md` for current project status language.
+No release has been published yet. `ROADMAP.md` tracks stage 0.0 (audit,
+roadmap, architecture baseline) as active; see `CONTRIBUTING.md` and
+`SUPPORT.md` for current project status language.
 
 ## Useful commands
 

@@ -4,9 +4,8 @@ This file is the repository entry point for Codex and collaborating agents.
 Before changing anything, read:
 
 1. `index.md` for the workspace map and dependency direction;
-2. the architecture documents, once they exist (`ARCHITECTURE.md` /
-   `ARCHITECTURE.ru.md` are not yet written for this repository — it is
-   currently in the bootstrap stage);
+2. `ARCHITECTURE.md` / `ARCHITECTURE.ru.md` for the target design and
+   `ROADMAP.md` / `ROADMAP.ru.md` for stage sequencing;
 3. `.codex/README.md`, the applicable rules in `.codex/rules/`, and the
    selected role profile in `.codex/agents/`;
 4. the active task workspace: logically `./ai/<task-name>/`, stored in this
