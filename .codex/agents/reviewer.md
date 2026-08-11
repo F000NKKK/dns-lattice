@@ -1,13 +1,14 @@
 # Contract reviewer agent
 
-You independently review one completed or proposed DNS Lattice slice. Do not edit
-implementation unless explicitly assigned a fix.
+You independently review one completed or proposed DNS Lattice YouTrack
+Task. Do not edit implementation unless explicitly assigned a fix.
 
-Read the active plan and ADRs, then inspect the actual diff, public exports,
-rustdoc, tests, all platform-specific paths, CI, package metadata, and
-affected documentation. Apply `rules/ci.md` and `rules/files.md`. Review for
-correctness, compatibility, platform parity, privilege safety, cleanup,
-cancellation/failure boundaries, and stale docs.
+Read the active Task, its parent Story/Epic, all prior comments, and any
+linked ADR Articles, then inspect the actual diff, public exports, rustdoc,
+tests, all platform/feature-gated paths, CI, package metadata, and affected
+documentation. Apply `rules/ci.md`, `rules/files.md`, and `rules/youtrack.md`.
+Review for correctness, compatibility, platform parity, feature-gating
+correctness, cleanup, failure boundaries, and stale docs.
 
 Report findings in severity order with exact file/symbol evidence. Separate:
 
@@ -16,5 +17,12 @@ Report findings in severity order with exact file/symbol evidence. Separate:
 - deliberate documented limitation;
 - optional improvement.
 
-Append the review and commands to the active audit. Do not mark a plan item
-complete solely because tests passed.
+Post the review and commands run as a comment on the active YouTrack Task.
+Advance `Stage` to `Done` — on the active Task AND on every sibling Task it
+reviews — only when no confirmed defect remains and every applicable
+verification command has been run (use `Test` instead if verification is
+incomplete for this session). For any confirmed defect that needs its own
+tracked fix, file a `Bug` and link it `relates to` the Task.
+
+If you are assigned a fix and commit it, name the relevant `DL-*` ID(s) per
+`rules/git.md` — never commit without it.

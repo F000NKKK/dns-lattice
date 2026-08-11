@@ -3,11 +3,16 @@
 Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks.
 
 This repository is past its bootstrap stage: base repository workflow,
-policies, and packaging are in place, and stage 0.1 has landed the crate's
-first real implementation (the DNS message/matcher/policy model).
-`ARCHITECTURE.md` / `ARCHITECTURE.ru.md` record the target design and
-`ROADMAP.md` / `ROADMAP.ru.md` sequence the stages that implement it; read
-both before starting or continuing any stage.
+policies, and packaging are in place, and stages 0.1/0.2 have landed the
+crate's first real implementation (the DNS message/matcher/policy model and
+the resolver engine with static split DNS). `ARCHITECTURE.md` /
+`ARCHITECTURE.ru.md` record the target design and `ROADMAP.md` /
+`ROADMAP.ru.md` sequence the stages that implement it; read both before
+starting or continuing any stage. Task-specific plans, evidence, and
+decisions live in the YouTrack project `DL`
+(https://hush.youtrack.cloud/projects/DL), reached via the `mcp__youtrack__*`
+tools (Claude Code) or the YouTrack REST API (Codex) — this replaced the
+former file-based `.ai/<task-name>/` workspace on 2026-08-11.
 
 ## Workspace map
 
@@ -17,7 +22,6 @@ dns-lattice/
 │   ├── dns-lattice/                Facade crate: re-exports the public surface
 │   ├── dns-lattice-core/           Shared Error/Result (no OS or networking types)
 │   └── dns-lattice-model/          DNS message, matcher, and policy model
-├── .ai/<task-name>/            Ignored task plans, audits, and ADRs
 ├── .github/workflows/          CI
 ├── .codex/                     Reusable Codex rules, roles, and templates
 ├── .claude/                    Reusable Claude Code rules, roles, and templates
@@ -57,8 +61,9 @@ implementation starts.
 No release has been published yet. `ROADMAP.md` tracks stage 0.0 (audit,
 roadmap, architecture baseline), stage 0.1 (core model), and stage 0.2
 (resolver engine and static split DNS) as done; stage 0.3 (upstream
-transport backends and server listener) is next. See `CONTRIBUTING.md` and
-`SUPPORT.md` for current project status language.
+transport backends and server listener) is next, tracked as an Epic in the
+YouTrack `DL` project. See `CONTRIBUTING.md` and `SUPPORT.md` for current
+project status language.
 
 ## Useful commands
 
