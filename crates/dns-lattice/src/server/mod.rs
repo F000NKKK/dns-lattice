@@ -4,9 +4,9 @@
 //! named in `ARCHITECTURE.md`.
 //!
 //! Per ADR-0015, the UDP/TCP baseline landed first; per ADR-0016, the DoT
-//! listener ([`ServerBuilder::dot_addr`]), DoQ
-//! listener ([`ServerBuilder::doq_addr`]), and DoH listener
-//! ([`ServerBuilder::doh_addr`]) extend the same `ServerBuilder`/`Server`
+//! listener (`ServerBuilder::dot_addr`), DoQ
+//! listener (`ServerBuilder::doq_addr`), and DoH listener
+//! (`ServerBuilder::doh_addr`) extend the same `ServerBuilder`/`Server`
 //! types behind the `dot`/`doq`/`doh` Cargo features, closing out Track E
 //! and Stage 0.3 entirely. DoT reuses the baseline TCP
 //! per-connection loop unchanged once the TLS handshake completes; DoQ (RFC
