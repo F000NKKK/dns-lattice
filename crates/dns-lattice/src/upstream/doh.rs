@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doh_backend_transport_error_on_connect_failure() {
+    async fn doh_backend_connection_failure_is_transport_or_timeout() {
         let (_server_config, client_config) = self_signed_fixture();
 
         let (_reserved, addr) = reserve_closed_tcp_port().await;
@@ -457,7 +457,10 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("connecting to a closed port fails");
-        assert!(matches!(err, Error::Transport(_)));
+            .expect_err("a listenerless loopback port cannot establish HTTPS");
+        // The UDP-backed reservation is a TCP refusal on some platforms,
+        // while Windows can let it consume the whole request budget. This
+        // must never be classified as a TLS failure.
+        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
     }
 }

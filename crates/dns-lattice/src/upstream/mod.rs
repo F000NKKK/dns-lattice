@@ -529,15 +529,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_backend_transport_error_on_connect_failure() {
+    async fn tcp_backend_connection_failure_is_transport_or_timeout() {
         // Reserve a loopback port via a UDP socket that is never a TCP
-        // listener, so a TCP `connect()` to it fails immediately and
-        // deterministically on every platform. Binding then dropping a
-        // *TCP* listener is not reliable for this across platforms: on
-        // Windows, a `connect()` racing the just-closed listener's
-        // teardown can transiently succeed instead of failing immediately
-        // (see the identical fix applied to `upstream::dot`/`upstream::doh`
-        // tests, which is exactly this Windows CI failure mode).
+        // listener. A TCP connect to it is an immediate refusal on some
+        // platforms, but Windows may instead blackhole the TCP packets
+        // until the configured connect budget expires. Both outcomes are
+        // non-TLS connection failures; the dedicated timeout test above
+        // covers the latter boundary independently.
         let reserved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = reserved.local_addr().unwrap();
 
@@ -550,7 +548,7 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("connecting to a closed port fails");
-        assert!(matches!(err, Error::Transport(_)));
+            .expect_err("a listenerless loopback port cannot resolve a query");
+        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
     }
 }

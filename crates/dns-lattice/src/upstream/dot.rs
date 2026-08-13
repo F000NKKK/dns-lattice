@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dot_backend_transport_error_on_connect_failure() {
+    async fn dot_backend_connection_failure_is_transport_or_timeout() {
         let (_server_config, client_config, server_name) = self_signed_fixture();
 
         let (_reserved, addr) = reserve_closed_tcp_port().await;
@@ -294,8 +294,11 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("connecting to a closed port fails before tls");
-        assert!(matches!(err, Error::Transport(_)));
+            .expect_err("a listenerless loopback port cannot start TLS");
+        // The UDP-backed reservation is a TCP refusal on some platforms,
+        // while Windows can let it consume the connect budget. Neither
+        // outcome reached the TLS handshake, so `Error::Tls` is invalid.
+        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
     }
 
     #[tokio::test]
