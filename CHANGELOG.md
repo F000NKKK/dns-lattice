@@ -11,15 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   IPv4 and/or IPv6 ranges, deterministically allocates or reuses one
   synthetic address per DNS name, and reverse-resolves active mappings.
   Each family uses a family-salted FNV-1a candidate, circular probing, and
-  independent LRU eviction when full. It is a synchronous, concurrent,
-  data-only pool: DNS answer/PTR synthesis and resolver/server integration
-  remain out of scope. Mappings have a required whole-second TTL and callers
-  may snapshot live mappings (including remaining lifetime and LRU order) and
-  restore them in memory; serialization and durable persistence are not part
-  of the crate.
+  independent LRU eviction when full. `FakeIpPolicy` and
+  `ResolverBuilder::fake_ip` explicitly enable local synthesis: matching IN
+  A/AAAA queries receive synthetic records and canonical in-range IN PTR
+  queries receive the live name or NXDOMAIN. Local answers bypass ordinary
+  cache/upstream resolution and use no more than the mapping's remaining
+  lifetime as their DNS TTL. Mappings have a required whole-second TTL and
+  callers may snapshot live mappings (including remaining lifetime and LRU
+  order) and restore them as process-local in-memory state; serialization and
+  durable persistence are not part of the crate.
 - New typed `dns_lattice_core::Error` variants for invalid/unconfigured Fake
-  IP pool configuration, invalid snapshots, and allocation in a disabled
-  family.
+  IP pool configuration, invalid snapshots, allocation in a disabled family,
+  and Fake IP lifetimes that cannot be represented safely in a DNS TTL
+  (`FakeIpTtlOutOfRange`).
 
 ## [0.3.0] - 2026-08-13
 
@@ -44,11 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stage 0.3 Track A (upstream transport, part 1): new public, async
   `dns_lattice::upstream` module — `UpstreamBackend` trait (replacing
-  stage 0.2's crate-private, synchronous `engine::UpstreamBackend`,
-  ADR-0009) plus baseline `UdpBackend`/`TcpBackend` implementations over
+  stage 0.2's crate-private, synchronous `engine::UpstreamBackend`) plus
+  baseline `UdpBackend`/`TcpBackend` implementations over
   `tokio`. No EDNS0/OPT support yet; `UdpBackend` falls back to a TCP query
-  when a response's `TC` bit is set. See ADR-0011 (`DL-A-12`) for the full
-  design rationale.
+  when a response's `TC` bit is set.
 - **Breaking:** `Resolver::resolve` is now `async fn` and must be called
   from inside a `tokio` runtime; `ResolverBuilder::backend` now stores an
   ordered list of backends per upstream group (only the first is used this
@@ -64,7 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero TLS/HTTP dependency weight unless explicitly opted into. New
   `dns_lattice_core::Error::Tls(String)` variant for TLS handshake/
   certificate/hostname-verification failures, distinct from `Transport`.
-  See ADR-0012 (`DL-A-13`) for the full design rationale.
 - Stage 0.3 Track C (upstream transport, part 3): new default-off `doq`
   Cargo feature on `dns-lattice` adding `DoqBackend`/`DoqBackendConfig`
   (DNS-over-QUIC, RFC 9250) over `quinn` (TLS 1.3 embedded in QUIC via
@@ -72,8 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dot`/`doh`). Independent of `dot`/`doh`; opens a fresh QUIC connection
   per query in this stage (no pooling/reuse), one bidirectional stream per
   query, no 0-RTT. No new `dns_lattice_core::Error` variant — reuses
-  `Tls`/`Transport` on the same boundary as `dot`/`doh`. See ADR-0013
-  (`DL-A-14`) for the full design rationale.
+  `Tls`/`Transport` on the same boundary as `dot`/`doh`.
 - Stage 0.3 Track D (fallback/failover across upstreams within a group):
   `Resolver::resolve` now tries every backend registered for a matched
   upstream group in registration order instead of only the first — a
@@ -83,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has failed, the last attempted backend's error is propagated as-is (no
   new `Error` variant, no synthesized answer, not cached) — this is a
   purely internal behavioral change, `Resolver::resolve`'s signature is
-  unchanged. See ADR-0014 (`DL-A-15`) for the full design rationale.
+  unchanged.
 - Stage 0.3 Track E (inbound server listener, UDP/TCP baseline): new public
   `dns_lattice::server` module — `Server`/`ServerBuilder`, an embeddable
   DNS server engine built on `engine::Resolver`. `ServerBuilder::new` takes
@@ -106,7 +107,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "embeddable DNS server engine" goal named in the architecture doc;
   DoT/DoH/DoQ inbound listeners are deferred to follow-up work behind the
   same `dot`/`doh`/`doq` Cargo features their `upstream` counterparts use.
-  See ADR-0015 (`DL-A-16`) for the full design rationale.
 - Stage 0.3 Track E (inbound server listener, DoT): new
   `ServerBuilder::dot_addr(SocketAddr, Arc<rustls::ServerConfig>)` method,
   behind the existing default-off `dot` Cargo feature, additive to the
@@ -119,8 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection without a response, matching the existing undecodable-message
   policy. `Resolver::resolve` errors are still answered with a synthesized
   `Rcode::ServFail`, unchanged from the baseline. No existing `ServerBuilder`/
-  `Server` public method signature changes. See ADR-0016 (`DL-A-17`) for the
-  full design rationale (also covers deferred DoH/DoQ listener design).
+  `Server` public method signature changes.
 - Stage 0.3 Track E (inbound server listener, DoQ): new
   `ServerBuilder::doq_addr(SocketAddr, quinn::ServerConfig)` method, behind
   the existing default-off `doq` Cargo feature, additive to the UDP/TCP/DoT
@@ -130,8 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DoqBackend` already uses on the client side. `Resolver::resolve` errors
   are still answered with a synthesized `Rcode::ServFail`, unchanged from
   the baseline. No existing `ServerBuilder`/`Server` public method
-  signature changes. See ADR-0016 (`DL-A-17`) for the full design
-  rationale.
+  signature changes.
 - Stage 0.3 Track E (inbound server listener, DoH) — the final Track E
   slice, completing Stage 0.3: new `ServerBuilder::doh_addr(SocketAddr,
   Arc<rustls::ServerConfig>, DohListenerConfig)` method and new public
@@ -153,8 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features on its existing dependencies (no new crate). No existing
   `ServerBuilder`/`Server` public method signature changes. This closes out
   Track E and Stage 0.3 in full — every planned UDP/TCP/DoT/DoH/DoQ
-  upstream backend and inbound listener for this stage has now landed. See
-  ADR-0016 for the full design rationale.
+  upstream backend and inbound listener for this stage has now landed.
 
 ## [0.2.0] - 2026-08-02
 

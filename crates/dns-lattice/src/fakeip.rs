@@ -1,9 +1,10 @@
 //! Stateful, deterministic Fake IP address allocation.
 //!
 //! [`FakeIpPool`] maps a DNS [`Name`] to one synthetic address in each
-//! configured family. It is a data-only control-plane component: it neither
-//! rewrites DNS messages, performs PTR synthesis, network I/O, durable
-//! persistence, or integration with an external data plane. Each mapping has
+//! configured family. It is a data-only control-plane component: it performs
+//! no network I/O, durable persistence, or integration with an external data
+//! plane. [`crate::engine::ResolverBuilder::fake_ip`] explicitly combines a
+//! pool and [`FakeIpPolicy`] to synthesize local DNS answers. Each mapping has
 //! the required pool TTL; expired mappings are removed on pool operations or
 //! by an explicit [`FakeIpPool::purge_expired`] call. Callers can retain a
 //! [`FakeIpPoolSnapshot`] and restore it into a new pool without this crate
@@ -23,11 +24,12 @@ use std::time::{Duration, Instant};
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{DomainMatcher, DomainPattern, Name};
 
-/// Selects the domain names for which a future resolver integration should
-/// synthesize Fake IP answers.
+/// Selects the domain names for which resolver integration synthesizes Fake
+/// IP answers.
 ///
 /// This policy only answers whether a name matches. It does not allocate an
-/// address or alter DNS messages; those remain separate responsibilities.
+/// address or alter DNS messages; [`crate::engine::ResolverBuilder::fake_ip`]
+/// combines it with a pool to enable that behavior explicitly.
 #[derive(Debug, Clone, Default)]
 pub struct FakeIpPolicy {
     matcher: DomainMatcher<()>,
@@ -131,8 +133,9 @@ impl FakeIpPool {
 
     /// Returns the lifetime assigned to each mapping.
     ///
-    /// Resolver integrations use this value as the TTL of synthetic DNS
-    /// records, so a client-facing answer cannot outlive its mapping.
+    /// Resolver integrations use a mapping's remaining portion of this value
+    /// as the TTL of synthetic DNS records, so a client-facing answer cannot
+    /// outlive its mapping.
     pub fn ttl(&self) -> Duration {
         self.ttl
     }
@@ -408,8 +411,8 @@ impl FakeIpPoolBuilder {
     }
 
     /// Sets the lifetime of every allocation. It must be a non-zero whole
-    /// number of seconds, matching the TTL a future DNS answer will advertise
-    /// for the mapping.
+    /// number of seconds. Resolver synthesis advertises no more than the
+    /// mapping's remaining lifetime in a DNS answer.
     ///
     /// This is required as of the pre-1.0 0.4 API revision; callers of the
     /// earlier pool-only API must explicitly choose their desired lifetime.

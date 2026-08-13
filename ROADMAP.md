@@ -81,7 +81,7 @@ Status: done
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.
 
-## Stage 0.4 — Fake IP pool
+## Stage 0.4 — Fake IP
 
 Status: active
 
@@ -89,9 +89,14 @@ Status: active
   domain, reverse lookup (address -> domain), explicit not-found handling,
   per-family LRU eviction on pool exhaustion, TTL expiry, and caller-owned
   in-memory snapshot/restore of live mappings.
-- Current public boundary: caller-invoked, data-only `fakeip` pool. It does
-  not yet rewrite DNS answers, synthesize PTR records, durably persist
-  mappings, or integrate with `Resolver`/`Server`.
+- `FakeIpPolicy` plus `ResolverBuilder::fake_ip` explicitly enable local
+  behavior: matching IN A/AAAA queries synthesize an address, while canonical
+  in-range IN PTR queries return the live name or NXDOMAIN. These local
+  answers bypass the ordinary cache/upstreams and advertise no more than the
+  mapping's remaining lifetime.
+- Snapshot/restore remains caller-owned, process-local in-memory state; this
+  crate supplies no serialization or durable persistence. DNS Lattice has no
+  direct dependency on `tunnel-lattice`; composition belongs above this crate.
 - Remaining release work: API/documentation/package reconciliation and
   independent review.
 

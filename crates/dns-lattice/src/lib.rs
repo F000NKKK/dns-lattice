@@ -22,8 +22,9 @@
 //! The canonical imports are domain-scoped: [`model`] for message, matcher,
 //! and policy types; [`engine`] for query orchestration; [`upstream`] for
 //! outbound transports; [`server`] for inbound listeners; and [`fakeip`] for
-//! caller-invoked synthetic-address storage. `Error` and `Result` are shared
-//! across those domains.
+//! synthetic-address pools, policies, and snapshots. `Error` and `Result` are
+//! shared across those domains. [`engine::ResolverBuilder::fake_ip`] explicitly
+//! connects a pool and policy to local Fake IP DNS synthesis.
 //!
 //! Existing flat aliases such as [`Name`], [`Resolver`], and [`UdpBackend`]
 //! remain supported for compatibility. New code should prefer the canonical

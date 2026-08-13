@@ -2,7 +2,7 @@
 
 Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
 `dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
-server listeners. Stage 0.4 is active with a pool-only Fake IP implementation;
+server listeners. Stage 0.4 is active with opt-in resolver Fake IP synthesis;
 later stages implement the remaining target shape incrementally. Update this
 document whenever an implementation slice changes a public contract.
 
@@ -115,7 +115,7 @@ yet split into their own crate remains:
 dns-lattice (facade crate)
 ├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ (implemented, stage 0.3)
 ├── engine         Resolver: query pipeline, cache, split-DNS routing (implemented, stage 0.2)
-├── fakeip         Caller-invoked Fake IP pool: allocate, reverse-lookup, LRU eviction
+├── fakeip         Fake IP pool, policy, snapshots, and mapping lifecycle
 ├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations (implemented, stage 0.3)
 └── hooks          Dynamic routing hook trait(s) consumed by callers
 ```
@@ -127,9 +127,9 @@ listener and backend traits stay distinct.
 
 Module and crate names above are a target shape, not committed public
 paths; the architect role confirms or revises them per bounded slice before
-implementation, and any public path is recorded in an ADR. `dns-lattice-core`
-and `dns-lattice-model` are the only crate splits made so far
-(`ADR-0004`, stage 0.1); further splits (e.g. a dedicated crate per
+implementation, and any public path is recorded before it stabilizes.
+`dns-lattice-core` and `dns-lattice-model` are the only crate splits made so
+far (stage 0.1); further splits (e.g. a dedicated crate per
 remaining module, or `dns-lattice-platform`) happen only when a stage
 actually needs them.
 
@@ -139,7 +139,12 @@ actually needs them.
 flowchart LR
     Client[Client] --> Listener[Server listener: UDP/TCP/DoT/DoH/DoQ]
     Listener --> Query[Incoming query]
-    Query --> Match[Zone / policy matcher]
+    Query --> FakePolicy{Fake IP policy?}
+    FakePolicy -->|matching IN A/AAAA| FakeIP[Fake IP pool: allocate/reuse]
+    FakePolicy -->|canonical in-range IN PTR| Reverse[Fake IP pool: lookup / NXDOMAIN]
+    FakeIP --> Answer[Answer]
+    Reverse --> Answer
+    FakePolicy -->|all other queries| Match[Zone / policy matcher]
     Match -->|hook decision| Hook[Dynamic routing hook]
     Match -->|static split rule| Route[Upstream group selection]
     Hook --> Route
@@ -149,7 +154,6 @@ flowchart LR
     Upstream --> Cache
     Cache --> Answer
     Answer --> Host[Host application]
-    Host -->|explicit allocation / reverse lookup| FakeIP[Fake IP pool]
     Answer --> Listener
     Listener --> Client
 ```
@@ -188,10 +192,13 @@ re-exports, at minimum:
 - `engine`: the resolver entry point (construct, resolve, shutdown), usable
   standalone (no listener) for applications that only need programmatic
   resolution.
-- `fakeip`: caller-invoked pool configuration, lookup/reverse-lookup, TTL,
-  and in-memory snapshot/restore types. It does not implicitly alter
-  resolver/server answers, synthesize PTR records, or durably persist
-  mappings.
+- `fakeip`: pool configuration, `FakeIpPolicy`, lookup/reverse-lookup, TTL,
+  and process-local in-memory snapshot/restore types. A caller opts into
+  resolver synthesis with `ResolverBuilder::fake_ip(Arc<FakeIpPool>,
+  FakeIpPolicy)`: matching IN A/AAAA are local synthetic answers, and
+  canonical in-range IN PTR returns a live mapping or NXDOMAIN. The mapping's
+  remaining lifetime bounds the emitted DNS TTL. The crate provides no durable
+  persistence or direct dependency on any sibling Lattice crate.
 - `upstream`: the backend trait, so callers can implement custom transports.
 - `hooks`: the dynamic routing hook trait.
 

@@ -41,7 +41,7 @@ split-DNS policy types (`policy`) — all pure, in-memory, no network I/O.
 `dns-lattice` facade also provides the resolver/cache, UDP/TCP/DoT/DoH/DoQ
 upstream transports, and matching inbound listeners. The current development
 state on `main` additionally
-contains the standalone, data-only Fake IP pool described below.
+contains the opt-in Fake IP resolver behavior and pool described below.
 
 Reports involving a decode panic, an infinite loop or excessive resource
 consumption on malformed wire input (e.g. a crafted name-compression
@@ -50,6 +50,7 @@ misrouted, cache poisoning or unbounded resource consumption, transport or
 TLS/QUIC failures that violate the documented error boundary, malformed DoH
 request handling, and listener failures are in scope. Reports of incorrect
 allocation, reverse lookup, or unbounded resource consumption in the
-development-state Fake IP pool are also in scope. Dynamic routing hooks are
-not implemented yet and remain out of scope until their corresponding stage
-ships.
+development-state Fake IP pool, policy matching, local IN A/AAAA and
+canonical in-range IN PTR synthesis, or their TTL/expiry handling are also in
+scope. Dynamic routing hooks are not implemented yet and remain out of scope
+until their corresponding stage ships.

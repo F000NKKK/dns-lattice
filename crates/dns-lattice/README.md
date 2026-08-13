@@ -11,7 +11,7 @@ For new code, prefer the canonical domain modules:
   upstream failover;
 - `dns_lattice::upstream` — the outbound backend trait and transports;
 - `dns_lattice::server` — inbound listener construction and lifecycle;
-- `dns_lattice::fakeip` — caller-invoked synthetic-address storage.
+- `dns_lattice::fakeip` — synthetic-address pool, policy, and snapshots.
 
 The existing flat root aliases remain compatible.
 
@@ -25,11 +25,9 @@ The existing flat root aliases remain compatible.
   ranges, allocate or reuse one address per DNS name, and reverse-resolve an
   address to its currently assigned name. Allocation uses a family-salted
   deterministic hash and circular probing; a full family evicts its LRU
-  mapping. Mappings have a required TTL and caller-owned in-memory snapshots
-  can restore their live entries and LRU order. The pool is data-only: it
-  performs no DNS answer/PTR rewriting, durable persistence, socket I/O,
-  resolver/server integration, or implicit integration with external data
-  planes.
+  mapping. Mappings have a required whole-second TTL and caller-owned,
+  process-local in-memory snapshots can restore their live entries and LRU
+  order. The pool itself performs no socket I/O or durable persistence.
 - An in-process resolver entry point (`Resolver`, `ResolverBuilder`): route
   one query through a `SplitDnsPolicy` to an upstream group, then try that
   group's registered backends in registration order — a backend failing
@@ -37,8 +35,14 @@ The existing flat root aliases remain compatible.
   group, and the first success is cached in memory (TTL-respecting, with
   RFC 2308 negative caching) so a repeated query is served without
   re-querying the backend. Once every backend in the group has failed, the
-  last attempted backend's error is returned as-is. `Resolver::resolve` is
-  `async fn` and must be called from inside a `tokio` runtime.
+  last attempted backend's error is returned as-is. `ResolverBuilder::fake_ip`
+  explicitly adds local Fake IP behavior: matching IN A/AAAA questions
+  allocate or reuse a synthetic address, while canonical IN PTR questions in
+  the configured ranges return a live mapping or NXDOMAIN. A selected but
+  disabled A/AAAA family returns local NODATA. These answers bypass the
+  ordinary cache and upstreams and use the mapping's remaining lifetime as
+  their DNS TTL. `Resolver::resolve` is `async fn` and must be called from
+  inside a `tokio` runtime.
 - A public, async `upstream` module (`UpstreamBackend` trait, `UdpBackend`,
   `TcpBackend`): baseline UDP and TCP upstream transports, no EDNS0/OPT
   support yet (`UdpBackend` falls back to a TCP query when a response's
@@ -155,6 +159,29 @@ assert_eq!(restored.lookup_ipv4(address), Some(Name::from_ascii("service.interna
 # Ok::<(), dns_lattice::Error>(())
 ```
 
+```rust
+use std::sync::Arc;
+
+use dns_lattice::{
+    engine::Resolver,
+    fakeip::{FakeIpPolicy, FakeIpPool},
+    model::{DomainPattern, Name, SplitDnsPolicy},
+};
+
+# let pool = Arc::new(FakeIpPool::builder()
+#     .ipv4_range("198.18.0.1".parse()?, "198.18.0.254".parse()?)
+#     .ttl(std::time::Duration::from_secs(60))
+#     .build()?);
+let fake_ip_policy = FakeIpPolicy::builder()
+    .rule(DomainPattern::suffix(Name::from_ascii("internal")?))
+    .build();
+let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+    .fake_ip(pool, fake_ip_policy)
+    .build();
+# let _ = resolver;
+# Ok::<(), dns_lattice::Error>(())
+```
+
 ## Status
 
 Version `0.3.0` is published and this crate remains pre-1.0: its public API
@@ -167,7 +194,8 @@ the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
 across a group's registered backends, and the `server` module's
 embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`) plus its
 opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
-(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Stage 0.4 added the
-standalone Fake IP pool with TTL expiry and in-memory snapshot/restore;
-resolver/server integration and dynamic routing hooks are not implemented
-yet. Types may change without notice until the first stable release.
+(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Stage 0.4 adds the
+opt-in Fake IP resolver behavior above, TTL expiry, and caller-owned,
+process-local snapshot/restore; it does not add durable persistence. Dynamic
+routing hooks are not implemented yet. Types may change without notice until
+the first stable release.

@@ -17,8 +17,9 @@
 > matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
-> `dns-lattice` facade. Development of `0.4` adds the standalone Fake IP
-> pool. The API remains pre-1.0; see Current Status below.
+> `dns-lattice` facade. Development of `0.4` adds opt-in Fake IP answer
+> synthesis through the resolver and every server transport. The API remains
+> pre-1.0; see Current Status below.
 
 ## Overview
 
@@ -31,6 +32,14 @@ The normal inbound path is:
 ```text
 DNS client → Server → Resolver → SplitDnsPolicy → UpstreamBackend → UDP/TCP/DoT/DoH/DoQ
 ```
+
+When a resolver is explicitly configured with a `FakeIpPool` and
+`FakeIpPolicy`, a matching IN A or AAAA question is answered locally before
+the cache and upstream path. If that selected address family is disabled, the
+resolver returns local NODATA (NOERROR with no records), still without an
+upstream lookup. Canonical IN reverse PTR questions inside a pool range are
+also local: a live mapping yields PTR and an unmapped address yields NXDOMAIN.
+Every other question follows the path above.
 
 Use domain-scoped imports for new code. Flat root aliases remain compatible.
 
@@ -71,6 +80,35 @@ server.serve().await?;
 `Resolver` orchestrates decoded queries, static routing, caching, and
 upstream failover. `Server` owns inbound listening and framing;
 `UpstreamBackend` implementations own outbound transport execution.
+
+To opt into Fake IP synthesis, configure the same resolver that is passed to
+the server. A pool is shared explicitly, so the host can also inspect,
+snapshot, or restore its mappings:
+
+```rust
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+use dns_lattice::{
+    engine::Resolver,
+    fakeip::{FakeIpPolicy, FakeIpPool},
+    model::{DomainPattern, Name, SplitDnsPolicy},
+};
+
+let pool = Arc::new(
+    FakeIpPool::builder()
+        .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
+        .ttl(Duration::from_secs(60))
+        .build()?,
+);
+let policy = FakeIpPolicy::builder()
+    .rule(DomainPattern::suffix(Name::from_ascii("internal")?))
+    .build();
+let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+    .fake_ip(pool, policy)
+    .build();
+# let _ = resolver;
+# Ok::<(), dns_lattice::Error>(())
+```
 
 ## Workspace crates
 
@@ -126,7 +164,17 @@ Implemented (`0.3.0` plus the current `0.4` development slice):
 - Inbound DNS-over-QUIC (DoQ, RFC 9250) listener behind the `doq` Cargo feature: `ServerBuilder::doq_addr` accepts a `quinn` QUIC endpoint (ALPN `doq`) and answers one query per bidirectional stream, reusing the same framing helpers as the `DoqBackend` upstream
 - Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: TCP `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s protocol-detecting server builder over TLS 1.2 or 1.3. A dual-protocol deployment configures `h2` and `http/1.1` ALPN identifiers; GET (`?dns=` base64url) and POST (`application/dns-message` body) work on either protocol.
 - HTTP/3 DoH is additive, not a replacement for legacy TCP: `Doh3Backend` and QUIC `ServerBuilder::doh3_addr` use QUIC/UDP with ALPN `h3` and TLS 1.3. Keep TCP `DohBackend`/`doh_addr` for HTTP/1.1 and HTTP/2 clients on TLS 1.2 or 1.3.
-- Caller-invoked `fakeip::FakeIpPool`: deterministic, concurrent IPv4 and/or IPv6 allocation and reverse lookup with inclusive ranges and per-family LRU eviction. Mappings have a required TTL and can be captured/restored as caller-owned in-memory snapshots. It is data-only: it does not rewrite DNS answers, synthesize PTR records, durably persist mappings, or integrate implicitly with `Resolver` or `Server`.
+- `fakeip::FakeIpPool` and `FakeIpPolicy`: deterministic, concurrent IPv4
+  and/or IPv6 allocation and reverse lookup with inclusive ranges and
+  per-family LRU eviction. Mappings have a required whole-second TTL and can
+  be captured/restored as caller-owned, process-local in-memory snapshots.
+  `ResolverBuilder::fake_ip` makes the behavior opt-in: matching IN A/AAAA
+  queries synthesize addresses locally, while canonical IN PTR queries inside
+  a configured range return a live mapping or NXDOMAIN. A selected but
+  disabled A/AAAA family returns local NODATA. Local Fake IP answers bypass
+  the ordinary resolver cache and upstreams; their DNS TTL is the mapping's
+  remaining lifetime, so it never extends the mapping. Snapshot data is not
+  serialized or durably persisted by this crate.
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
@@ -169,9 +217,9 @@ This gives a complete, tested DNS message model, a deterministic
 zone/domain matcher, an in-process resolver with real UDP/TCP/DoT/DoH/DoQ
 upstream transport and failover across a group's backends, and an
 embeddable inbound UDP/TCP/DoT/DoH/DoQ DNS server listener, all usable
-standalone today. The current development state also provides the standalone,
-caller-invoked Fake IP pool described above; it is not part of the resolver
-or server query path yet.
+standalone today. The current development state additionally supports opt-in
+Fake IP synthesis in the resolver query path, which every `Server` transport
+uses through its shared resolver.
 
 | Capability | Status |
 |---|:---:|
@@ -188,7 +236,7 @@ or server query path yet.
 | Inbound DoT server listener (`dot` Cargo feature) | ✅ |
 | Inbound DoQ server listener (`doq` Cargo feature) | ✅ |
 | Inbound DoH server listener (`doh` Cargo feature) | ✅ |
-| Fake IP pool (caller-invoked, data-only) | ✅ (0.4 development) |
+| Fake IP pool and opt-in resolver/server synthesis | ✅ (0.4 development) |
 | Dynamic routing hooks | planned (0.5) |
 
 ## Examples
@@ -211,7 +259,10 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
 4. **Stage 0.3: Upstream transport backends and server listener** *(completed)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
-5. **Stage 0.4: Fake IP pool** *(active)* — caller-invoked deterministic synthetic address allocation, reverse lookup, LRU eviction, TTL expiry, and in-memory snapshot/restore; no implicit DNS rewrite, PTR synthesis, or durable persistence.
+5. **Stage 0.4: Fake IP** *(active)* — deterministic synthetic address
+   allocation, reverse lookup, LRU eviction, expiry, and caller-owned
+   process-local snapshot/restore; opt-in resolver/server synthesis for
+   matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
 8. **Stage 1.0: Stable public API and first release** — public API frozen, `cargo package`/docs.rs verified, first crates.io release.
