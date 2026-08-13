@@ -29,10 +29,11 @@
 //! transport implementations, plus DNS-over-TLS/DNS-over-HTTPS/
 //! DNS-over-QUIC backends behind the default-off `dot`/`doh`/`doq` Cargo
 //! features, and the [`server`] module's [`Server`]/[`ServerBuilder`]
-//! inbound UDP/TCP listener — the first slice fulfilling the embeddable-
-//! DNS-server-engine goal (ADR-0015, `DL-A-16`). Later follow-up work adds
-//! `server`'s DoT/DoH/DoQ listeners, plus `fakeip` and `hooks`, behind this
-//! same facade. See `ARCHITECTURE.md` for the full module layout.
+//! inbound UDP/TCP baseline plus DoT/DoQ listeners — the first slice
+//! fulfilling the embeddable-DNS-server-engine goal (ADR-0015, `DL-A-16`;
+//! DoT/DoQ per ADR-0016, `DL-A-17`). Later follow-up work adds `server`'s
+//! DoH listener, plus `fakeip` and `hooks`, behind this same facade. See
+//! `ARCHITECTURE.md` for the full module layout.
 
 pub mod engine;
 pub mod server;

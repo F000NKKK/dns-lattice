@@ -4,12 +4,16 @@
 //! named in `ARCHITECTURE.md`.
 //!
 //! Per ADR-0015 (`DL-A-16`), the UDP/TCP baseline landed first; per
-//! ADR-0016 (`DL-A-17`), the DoT listener ([`ServerBuilder::dot_addr`])
-//! extends the same `ServerBuilder`/`Server` types behind the `dot` Cargo
-//! feature, reusing the baseline TCP per-connection loop unchanged once the
-//! TLS handshake completes. DoH/DoQ inbound listeners remain separate
-//! follow-up work behind the `doh`/`doq` Cargo features their `upstream`
-//! counterparts already use.
+//! ADR-0016 (`DL-A-17`), the DoT listener ([`ServerBuilder::dot_addr`]) and
+//! DoQ listener ([`ServerBuilder::doq_addr`]) extend the same
+//! `ServerBuilder`/`Server` types behind the `dot`/`doq` Cargo features. DoT
+//! reuses the baseline TCP per-connection loop unchanged once the TLS
+//! handshake completes; DoQ (RFC 9250) instead accepts one fresh
+//! bidirectional QUIC stream per query (RFC 9250 §4.2), reusing the same
+//! `read_framed`/`write_framed` framing helpers via the client-side
+//! `QuicStream` adapter already defined in [`crate::upstream`]. The DoH
+//! inbound listener remains separate follow-up work behind the `doh` Cargo
+//! feature its `upstream` counterpart already uses.
 //!
 //! # Lifecycle
 //!
@@ -58,6 +62,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::Resolver;
+#[cfg(feature = "doq")]
+use crate::upstream::QuicStream;
 use crate::upstream::{UDP_MAX_RESPONSE_LEN, read_framed, write_framed};
 
 /// Bounds each TCP read/write performed by the server's per-connection
@@ -79,6 +85,8 @@ pub struct ServerBuilder {
     tcp_addrs: Vec<SocketAddr>,
     #[cfg(feature = "dot")]
     dot_addrs: Vec<(SocketAddr, Arc<ServerConfig>)>,
+    #[cfg(feature = "doq")]
+    doq_addrs: Vec<(SocketAddr, quinn::ServerConfig)>,
 }
 
 impl ServerBuilder {
@@ -95,6 +103,8 @@ impl ServerBuilder {
             tcp_addrs: Vec::new(),
             #[cfg(feature = "dot")]
             dot_addrs: Vec::new(),
+            #[cfg(feature = "doq")]
+            doq_addrs: Vec::new(),
         }
     }
 
@@ -125,6 +135,25 @@ impl ServerBuilder {
     #[cfg(feature = "dot")]
     pub fn dot_addr(mut self, addr: SocketAddr, tls_config: Arc<ServerConfig>) -> Self {
         self.dot_addrs.push((addr, tls_config));
+        self
+    }
+
+    /// Adds a DNS-over-QUIC (RFC 9250) address to bind, with `server_config`
+    /// used to establish every QUIC connection's embedded TLS 1.3 session on
+    /// that address (ADR-0016, `DL-A-17` decision 1). May be called more
+    /// than once to bind multiple DoQ addresses, each with its own
+    /// `server_config`.
+    ///
+    /// This crate does not source certificate material itself (`DL-19`'s
+    /// stated non-goal, reaffirmed by `DL-A-17`), and it does not
+    /// special-case ALPN negotiation inside the listener — `server_config`'s
+    /// embedded `rustls` crypto config MUST already advertise the `doq` ALPN
+    /// protocol identifier (RFC 9250 §4.1.1); this is the caller's
+    /// responsibility, mirroring [`crate::upstream::DoqBackendConfig`]'s
+    /// existing client-side `tls_config`/ALPN ownership pattern.
+    #[cfg(feature = "doq")]
+    pub fn doq_addr(mut self, addr: SocketAddr, server_config: quinn::ServerConfig) -> Self {
+        self.doq_addrs.push((addr, server_config));
         self
     }
 
@@ -168,12 +197,23 @@ impl ServerBuilder {
             dot_listeners.push((listener, TlsAcceptor::from(tls_config)));
         }
 
+        #[cfg(feature = "doq")]
+        let mut doq_endpoints = Vec::with_capacity(self.doq_addrs.len());
+        #[cfg(feature = "doq")]
+        for (addr, server_config) in self.doq_addrs {
+            let endpoint = quinn::Endpoint::server(server_config, addr)
+                .map_err(|err| Error::Transport(err.to_string()))?;
+            doq_endpoints.push(endpoint);
+        }
+
         Ok(Server {
             resolver: self.resolver,
             udp_sockets,
             tcp_listeners,
             #[cfg(feature = "dot")]
             dot_listeners,
+            #[cfg(feature = "doq")]
+            doq_endpoints,
         })
     }
 }
@@ -187,6 +227,8 @@ pub struct Server {
     tcp_listeners: Vec<TcpListener>,
     #[cfg(feature = "dot")]
     dot_listeners: Vec<(TcpListener, TlsAcceptor)>,
+    #[cfg(feature = "doq")]
+    doq_endpoints: Vec<quinn::Endpoint>,
 }
 
 impl Server {
@@ -222,6 +264,8 @@ impl Server {
             tcp_listeners,
             #[cfg(feature = "dot")]
             dot_listeners,
+            #[cfg(feature = "doq")]
+            doq_endpoints,
         } = self;
 
         let udp_sockets: Vec<Arc<UdpSocket>> = udp_sockets.into_iter().map(Arc::new).collect();
@@ -239,6 +283,11 @@ impl Server {
         for (listener, acceptor) in dot_listeners {
             let resolver = resolver.clone();
             loops.spawn(async move { serve_dot(listener, acceptor, resolver).await });
+        }
+        #[cfg(feature = "doq")]
+        for endpoint in doq_endpoints {
+            let resolver = resolver.clone();
+            loops.spawn(async move { serve_doq(endpoint, resolver).await });
         }
 
         tokio::pin!(shutdown);
@@ -373,6 +422,84 @@ async fn serve_dot(
             handle_tcp_connection(tls_stream, &resolver).await;
         });
     }
+}
+
+/// Runs `endpoint`'s DoQ (RFC 9250) accept loop forever: one `tokio::task`
+/// per accepted QUIC connection (ADR-0016, `DL-A-17` decision 4), mirroring
+/// the non-blocking-accept-loop principle `serve_tcp`/`serve_dot` already
+/// establish — a single slow/hostile handshake cannot stall accepting the
+/// next connection. Once a connection's handshake completes, the task loops
+/// on `Connection::accept_bi`, spawning one further `tokio::task` per
+/// accepted bidirectional stream, since RFC 9250 §4.2 puts each query on its
+/// own fresh stream rather than reusing one stream for many queries (unlike
+/// DoT/TCP). Returns `Ok(())` once `endpoint.accept()` yields `None` (the
+/// endpoint was closed), or `Err` if the endpoint itself becomes
+/// unrecoverable.
+#[cfg(feature = "doq")]
+async fn serve_doq(endpoint: quinn::Endpoint, resolver: Arc<Resolver>) -> Result<()> {
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Ok(());
+        };
+        let resolver = resolver.clone();
+        tokio::spawn(async move {
+            let Ok(connection) = incoming.await else {
+                // Handshake failure: no reliable peer session to answer on,
+                // matching the DoT/TLS handshake-failure policy.
+                return;
+            };
+            loop {
+                let (send, recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    // Connection closed or errored: end this connection's
+                    // task, matching `handle_tcp_connection`'s
+                    // end-of-connection policy.
+                    Err(_) => return,
+                };
+                let resolver = resolver.clone();
+                tokio::spawn(async move {
+                    handle_doq_stream(send, recv, &resolver).await;
+                });
+            }
+        });
+    }
+}
+
+/// Serves one accepted DoQ bidirectional stream: reads exactly one
+/// length-prefixed query, resolves it, and writes exactly one
+/// length-prefixed response (RFC 9250 §4.2's one-stream-per-query framing,
+/// distinct from DoT/TCP's one-connection-many-queries loop in
+/// [`handle_tcp_connection`]). Wraps `send`/`recv` in [`QuicStream`]
+/// (`crate::upstream`'s existing client-side adapter, reused unchanged per
+/// ADR-0016, `DL-A-17` decision 4) so the same [`read_framed`]/
+/// [`write_framed`] helpers apply. A decode/resolve/write failure ends the
+/// stream without a response, same undecodable-message policy as UDP/TCP/
+/// DoT.
+#[cfg(feature = "doq")]
+async fn handle_doq_stream(send: quinn::SendStream, recv: quinn::RecvStream, resolver: &Resolver) {
+    let mut stream = QuicStream { send, recv };
+
+    let query = match read_framed(&mut stream, TCP_IO_TIMEOUT).await {
+        Ok(query) => query,
+        Err(_) => return,
+    };
+
+    let response = match resolver.resolve(&query).await {
+        Ok(answer) => answer,
+        Err(_) => servfail_response(&query),
+    };
+
+    if write_framed(&mut stream, TCP_IO_TIMEOUT, &response)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // Per RFC 9250 §4.2, the server SHOULD close the send side of the
+    // stream gracefully after sending the response, mirroring
+    // `DoqBackend::resolve`'s own client-side `finish()` call.
+    let _ = stream.send.finish();
 }
 
 /// Serves one accepted TCP (or TLS-wrapped TCP, for DoT) connection:
@@ -1032,6 +1159,222 @@ mod tests {
             let connector = TlsConnector::from(Arc::new(client_config));
             let query = query_for("nope.example.com", 33);
             let response = dot_query(&connector, server_name, addr, &query).await;
+            assert_eq!(response.header.rcode, Rcode::ServFail);
+            assert_eq!(response.header.id, 33);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+    }
+
+    #[cfg(feature = "doq")]
+    mod doq_tests {
+        use super::*;
+        use quinn::ClientConfig as QuinnClientConfig;
+        use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+        use rcgen::{CertifiedKey, generate_simple_self_signed};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::{
+            ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
+        };
+        use rustls_pki_types::ServerName;
+
+        /// The ALPN protocol identifier for DNS-over-QUIC (RFC 9250
+        /// §4.1.1), duplicated from `upstream::doq`'s private constant since
+        /// it is not exported — matches that module's own value.
+        const DOQ_ALPN: &[u8] = b"doq";
+
+        /// Generates a self-signed loopback certificate and matching
+        /// `quinn`/`rustls` server config plus a trusting `quinn` client
+        /// config (ALPN `doq`), mirroring `upstream::doq::tests::
+        /// self_signed_fixture` — fully offline and deterministic per
+        /// `@.claude/rules/ci.md`.
+        fn self_signed_fixture() -> (quinn::ServerConfig, QuinnClientConfig, ServerName<'static>) {
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let cert_der: CertificateDer<'static> = cert.der().clone();
+            let key_der: PrivateKeyDer<'static> =
+                PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
+
+            let mut rustls_server_config = RustlsServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .unwrap();
+            rustls_server_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
+            let quic_server_config: QuicServerConfig = rustls_server_config
+                .try_into()
+                .expect("valid TLS 1.3 initial cipher suite");
+            let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+
+            let mut roots = RootCertStore::empty();
+            roots.add(cert_der).unwrap();
+            let mut rustls_client_config = RustlsClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            rustls_client_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
+            let quic_client_config: QuicClientConfig =
+                rustls_client_config.try_into().expect("valid tls config");
+            let client_config = QuinnClientConfig::new(Arc::new(quic_client_config));
+
+            let server_name = ServerName::try_from("localhost").unwrap();
+            (server_config, client_config, server_name)
+        }
+
+        /// Opens a fresh QUIC connection and bidirectional stream, sends one
+        /// framed query, and reads back one framed response — mirroring
+        /// `DoqBackend::resolve`'s own client-side sequence.
+        async fn doq_query(
+            client_endpoint: &quinn::Endpoint,
+            client_config: QuinnClientConfig,
+            server_name: ServerName<'static>,
+            addr: SocketAddr,
+            query: &Message,
+        ) -> Message {
+            let connecting = client_endpoint
+                .connect_with(client_config, addr, server_name.to_str().as_ref())
+                .unwrap();
+            let connection = connecting.await.unwrap();
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+
+            let payload = query.encode().unwrap();
+            let len: u16 = payload.len().try_into().unwrap();
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&len.to_be_bytes());
+            framed.extend_from_slice(&payload);
+            send.write_all(&framed).await.unwrap();
+            let _ = send.finish();
+
+            let mut len_buf = [0u8; 2];
+            recv.read_exact(&mut len_buf).await.unwrap();
+            let response_len = u16::from_be_bytes(len_buf) as usize;
+            let mut response_buf = vec![0u8; response_len];
+            recv.read_exact(&mut response_buf).await.unwrap();
+            Message::decode(&response_buf).unwrap()
+        }
+
+        fn client_endpoint() -> quinn::Endpoint {
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn doq_round_trip_success() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 20),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doq_addr("127.0.0.1:0".parse().unwrap(), server_config)
+                .bind()
+                .await
+                .expect("binds doq");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doq_endpoints[0].local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let client_endpoint = client_endpoint();
+            let query = query_for("example.com", 21);
+            let response =
+                doq_query(&client_endpoint, client_config, server_name, addr, &query).await;
+            assert!(response.header.qr);
+            assert_eq!(response.header.id, 21);
+            assert_eq!(response.header.rcode, Rcode::NoError);
+            assert_eq!(response.answers.len(), 1);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doq_multiple_queries_over_one_quic_connection() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 21),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doq_addr("127.0.0.1:0".parse().unwrap(), server_config)
+                .bind()
+                .await
+                .expect("binds doq");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doq_endpoints[0].local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let client_endpoint = client_endpoint();
+            let connecting = client_endpoint
+                .connect_with(client_config, addr, server_name.to_str().as_ref())
+                .unwrap();
+            let connection = connecting.await.unwrap();
+
+            // RFC 9250 §4.2: each query gets its own bidirectional stream on
+            // the same QUIC connection, unlike DoT/TCP's shared-stream loop.
+            for id in [1u16, 2u16, 3u16] {
+                let query = query_for(&format!("q{id}.example.com"), id);
+                let (mut send, mut recv) = connection.open_bi().await.unwrap();
+                let payload = query.encode().unwrap();
+                let len: u16 = payload.len().try_into().unwrap();
+                let mut framed = Vec::new();
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&payload);
+                send.write_all(&framed).await.unwrap();
+                let _ = send.finish();
+
+                let mut len_buf = [0u8; 2];
+                recv.read_exact(&mut len_buf).await.unwrap();
+                let response_len = u16::from_be_bytes(len_buf) as usize;
+                let mut response_buf = vec![0u8; response_len];
+                recv.read_exact(&mut response_buf).await.unwrap();
+                let response = Message::decode(&response_buf).unwrap();
+                assert!(response.header.qr);
+                assert_eq!(response.header.id, id);
+            }
+
+            drop(connection);
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doq_servfail_synthesized_on_resolver_error() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FailingBackend);
+            let server = ServerBuilder::new(resolver)
+                .doq_addr("127.0.0.1:0".parse().unwrap(), server_config)
+                .bind()
+                .await
+                .expect("binds doq");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doq_endpoints[0].local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let client_endpoint = client_endpoint();
+            let query = query_for("nope.example.com", 33);
+            let response =
+                doq_query(&client_endpoint, client_config, server_name, addr, &query).await;
             assert_eq!(response.header.rcode, Rcode::ServFail);
             assert_eq!(response.header.id, 33);
 

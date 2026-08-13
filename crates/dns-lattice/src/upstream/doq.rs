@@ -152,9 +152,15 @@ impl UpstreamBackend for DoqBackend {
 /// halves into a single type implementing `tokio::io::{AsyncRead,
 /// AsyncWrite} + Unpin`, satisfying [`framed_query`]'s generic bound
 /// without any change to `framed_query` itself (ADR-0013 decision 3).
-struct QuicStream {
-    send: SendStream,
-    recv: RecvStream,
+///
+/// `pub(crate)` (not private) so `crate::server`'s DoQ listener
+/// (ADR-0016, `DL-A-17` decision 4) can reuse this exact adapter for its
+/// per-stream `read_framed`/`write_framed` calls instead of reimplementing
+/// it — same sharing precedent as [`super::read_framed`]/
+/// [`super::write_framed`] themselves.
+pub(crate) struct QuicStream {
+    pub(crate) send: SendStream,
+    pub(crate) recv: RecvStream,
 }
 
 impl AsyncRead for QuicStream {

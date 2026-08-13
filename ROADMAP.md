@@ -71,8 +71,8 @@ Status: planned
   Kestrel-style embeddable-server goal from `ARCHITECTURE.md`; DoT/DoH/DoQ
   listeners behind the same Cargo features as their upstream counterparts.
   UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT listener done
-  (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoH/DoQ listeners
-  remain.
+  (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoQ listener done
+  (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener remains.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.

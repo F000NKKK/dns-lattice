@@ -86,6 +86,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rcode::ServFail`, unchanged from the baseline. No existing `ServerBuilder`/
   `Server` public method signature changes. See ADR-0016 (`DL-A-17`) for the
   full design rationale (also covers deferred DoH/DoQ listener design).
+- Stage 0.3 Track E (inbound server listener, DoQ): new
+  `ServerBuilder::doq_addr(SocketAddr, quinn::ServerConfig)` method, behind
+  the existing default-off `doq` Cargo feature, additive to the UDP/TCP/DoT
+  listeners. Builds a `quinn::Endpoint` in server mode (ALPN `doq`, RFC
+  9250), accepts one fresh bidirectional QUIC stream per query, and reuses
+  the same `read_framed`/`write_framed` framing helpers `upstream`'s
+  `DoqBackend` already uses on the client side. `Resolver::resolve` errors
+  are still answered with a synthesized `Rcode::ServFail`, unchanged from
+  the baseline. No existing `ServerBuilder`/`Server` public method
+  signature changes. Only the DoH listener remains as deferred follow-up
+  work under Track E. See ADR-0016 (`DL-A-17`) for the full design
+  rationale.
 
 ## [0.2.0] - 2026-08-02
 

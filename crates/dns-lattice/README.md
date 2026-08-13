@@ -47,7 +47,12 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   (RFC 7858) listener: it TLS-accepts each connection via
   `tokio_rustls::TlsAcceptor` (caller-supplied `rustls::ServerConfig`) and
   then reuses the exact same length-prefixed read/write loop as the plain
-  TCP listener. DoH/DoQ inbound listeners are still planned.
+  TCP listener. Behind the default-off `doq` Cargo feature,
+  `ServerBuilder::doq_addr(addr, server_config)` adds an inbound
+  DNS-over-QUIC (RFC 9250) listener: a `quinn::Endpoint` in server mode
+  (ALPN `doq`) answers one query per accepted bidirectional stream,
+  reusing the same framing helpers as `DoqBackend`'s client side. The
+  inbound DoH listener is still planned.
 
 Fake IP and dynamic routing hook capabilities are planned for later
 stages; see `ROADMAP.md` in the repository root.
@@ -67,11 +72,12 @@ stages; see `ROADMAP.md` in the repository root.
   use directly.
 - `doq` feature: adds `rustls`, `rustls-pki-types`, `webpki-roots`, and
   `quinn` as dependencies. Independent of `dot`/`doh`; enable only this
-  feature to use `DoqBackend` without pulling in `tokio-rustls`/`hyper`.
-  `quinn`'s `rustls` crypto-provider feature is set to `rustls-aws-lc-rs`,
-  sharing the same `aws-lc-rs` provider `doh`'s `hyper-rustls` dependency
-  already pulls in, rather than compiling in a second (`ring`-based)
-  provider.
+  feature to use `DoqBackend`/`ServerBuilder::doq_addr` without pulling in
+  `tokio-rustls`/`hyper`. `quinn`'s `rustls` crypto-provider feature is set
+  to `rustls-aws-lc-rs`, matching the workspace `rustls` dependency's own
+  `aws-lc-rs` feature (enabled directly on `rustls` itself, not left to
+  arrive only transitively via `doh`/`doq` — every TLS handshake needs a
+  process-level `CryptoProvider` even with just `dot` enabled on its own).
 - `dot`, `doh`, and `doq` all use `rustls` (pure-Rust TLS, no OpenSSL/
   platform-TLS dependency) uniformly on Linux, Windows, and macOS — no
   platform-specific behavior. Cross-platform: no `cfg`-gated logic in any
@@ -105,7 +111,7 @@ far landed the public async `upstream` trait, baseline UDP/TCP backends,
 the opt-in `dot`/`doh`/`doq` encrypted-transport backends described above,
 failover across a group's registered backends, and the `server` module's
 embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`), plus its
-opt-in `dot`-gated inbound DoT listener (`ServerBuilder::dot_addr`). The
-inbound DoH/DoQ server listeners, Fake IP, and dynamic routing hooks are not
-implemented yet. Types may change without notice until the first stable
-release.
+opt-in `dot`/`doq`-gated inbound DoT/DoQ listeners (`ServerBuilder::dot_addr`/
+`doq_addr`). The inbound DoH server listener, Fake IP, and dynamic routing
+hooks are not implemented yet. Types may change without notice until the
+first stable release.

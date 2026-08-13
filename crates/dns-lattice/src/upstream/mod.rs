@@ -68,6 +68,13 @@ pub use doh::{DohBackend, DohBackendConfig, DohMethod};
 
 #[cfg(feature = "doq")]
 mod doq;
+/// `pub(crate)` (not exported from the crate root) so `crate::server`'s DoQ
+/// listener (ADR-0016, `DL-A-17` decision 4) can reuse the client-side
+/// `QuicStream` `AsyncRead`/`AsyncWrite` adapter unchanged, mirroring how
+/// `read_framed`/`write_framed` are already shared between `upstream` and
+/// `server`.
+#[cfg(feature = "doq")]
+pub(crate) use doq::QuicStream;
 #[cfg(feature = "doq")]
 pub use doq::{DoqBackend, DoqBackendConfig};
 
