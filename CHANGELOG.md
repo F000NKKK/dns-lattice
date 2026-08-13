@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage — later tracks add failover across the rest).
 - New `dns_lattice_core::Error` variants: `Timeout` and `Transport(String)`,
   produced by the new UDP/TCP backends.
+- Stage 0.3 Track B (upstream transport, part 2): two new default-off Cargo
+  features on `dns-lattice`, `dot` and `doh`. `dot` adds `DotBackend`/
+  `DotBackendConfig` (DNS-over-TLS, RFC 7858) over `rustls`/`tokio-rustls`;
+  `doh` adds `DohBackend`/`DohBackendConfig`/`DohMethod` (DNS-over-HTTPS,
+  RFC 8484, GET and POST wire formats) over `hyper`/`hyper-rustls`. Both
+  are independent and additive to the baseline UDP/TCP build, which keeps
+  zero TLS/HTTP dependency weight unless explicitly opted into. New
+  `dns_lattice_core::Error::Tls(String)` variant for TLS handshake/
+  certificate/hostname-verification failures, distinct from `Transport`.
+  See ADR-0012 (`DL-A-13`) for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 

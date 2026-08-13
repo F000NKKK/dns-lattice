@@ -22,3 +22,22 @@ dns-lattice = { path = "crates/dns-lattice", version = "0.2.0" }
 
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["net", "time", "rt", "macros", "io-util"] }
+
+# DoT (dns-lattice `dot` feature, RFC 7858)
+rustls = { version = "0.23", default-features = false, features = ["tls12", "std"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+webpki-roots = "1"
+
+# DoH (dns-lattice `doh` feature, RFC 8484)
+hyper = "1"
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "webpki-roots", "aws-lc-rs"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.23"
+
+# Test-only: generates a self-signed certificate/key pair for the loopback
+# DoT/DoH TLS test fixtures (dns-lattice `dot`/`doh` feature tests).
+rcgen = "0.14"
