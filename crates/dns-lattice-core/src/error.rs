@@ -52,6 +52,15 @@ pub enum Error {
     /// No split-DNS rule matched the queried name and no default upstream
     /// group is configured.
     NoRoute,
+    /// An upstream backend did not produce a response within its
+    /// configured timeout (stage 0.3, `upstream::UpstreamBackend`).
+    Timeout,
+    /// An upstream backend's transport (socket connect/send/receive)
+    /// failed. Carries a human-readable description of the underlying I/O
+    /// error; not `PartialEq`-sensitive to that error's exact kind since
+    /// `std::io::Error` is not itself comparable (stage 0.3,
+    /// `upstream::UpstreamBackend`).
+    Transport(String),
 }
 
 impl fmt::Display for Error {
@@ -84,6 +93,8 @@ impl fmt::Display for Error {
                 f,
                 "no split-dns rule matched and no default upstream group is configured"
             ),
+            Error::Timeout => write!(f, "upstream backend timed out"),
+            Error::Transport(message) => write!(f, "upstream transport error: {message}"),
         }
     }
 }
@@ -131,6 +142,11 @@ mod tests {
             (
                 Error::NoRoute,
                 "no split-dns rule matched and no default upstream group is configured",
+            ),
+            (Error::Timeout, "upstream backend timed out"),
+            (
+                Error::Transport("connection refused".to_string()),
+                "upstream transport error: connection refused",
             ),
         ];
         for (error, expected) in cases {

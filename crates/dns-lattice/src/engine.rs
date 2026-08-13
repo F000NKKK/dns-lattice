@@ -2,20 +2,26 @@
 //! query, and route it via static split-DNS matching (stage 0.1's
 //! [`SplitDnsPolicy`]) to an upstream group.
 //!
-//! Stage 0.2 also adds an in-memory, TTL-respecting answer cache including
-//! negative caching (RFC 2308) — no real network transport yet (see
-//! `ARCHITECTURE.md`'s stage sequencing). The upstream backend seam
-//! (`UpstreamBackend`) is crate-private and intentionally minimal; it is not
-//! a preview of the stage 0.3 public `upstream` trait.
+//! Stage 0.2 added an in-memory, TTL-respecting answer cache including
+//! negative caching (RFC 2308). Stage 0.3 (ADR-0011, `DL-A-12`) replaces
+//! the stage-0.2 crate-private, synchronous `UpstreamBackend` with the
+//! public, async [`crate::upstream::UpstreamBackend`] trait: [`Resolver`]
+//! now holds an ordered list of backends per [`UpstreamGroupId`] (so a
+//! later failover track can iterate without a storage redesign, though this
+//! stage always uses only the first registered backend) and
+//! [`Resolver::resolve`] is now an `async fn` — see the module-level
+//! runtime-requirement note on [`crate::upstream`].
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{
     Class, Message, Name, RData, Rcode, RecordType, SplitDnsPolicy, UpstreamGroupId,
 };
+
+use crate::upstream::UpstreamBackend;
 
 /// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
 /// response carries no SOA record in its authority section to derive a
@@ -90,44 +96,22 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-/// A synchronous, single-query seam between "which upstream group did
-/// routing select" and "get an answer [`Message`] back".
-///
-/// Crate-private per ADR-0009: stage 0.2 resolves exactly one backend per
-/// [`UpstreamGroupId`], with no failover across multiple backends within a
-/// group. Stage 0.3 designs its own public `upstream` trait independently.
-pub(crate) trait UpstreamBackend {
-    /// Resolves `query` against this backend, returning the answer message
-    /// or an error if the backend itself fails.
-    fn resolve(&self, query: &Message) -> Result<Message>;
-}
-
-// Any `Fn(&Message) -> Result<Message>` is usable as an [`UpstreamBackend`],
-// so [`ResolverBuilder::backend`] can accept a plain closure without ever
-// naming the crate-private trait in its own (public) signature.
-impl<F> UpstreamBackend for F
-where
-    F: Fn(&Message) -> Result<Message>,
-{
-    fn resolve(&self, query: &Message) -> Result<Message> {
-        self(query)
-    }
-}
-
-/// An in-process DNS resolver: construct from a split-DNS policy and one
-/// upstream backend per group, then resolve queries against it.
+/// An in-process DNS resolver: construct from a split-DNS policy and one or
+/// more upstream backends per group, then resolve queries against it.
 ///
 /// # Lifecycle
 ///
 /// Construct via [`Resolver::builder`], call [`Resolver::resolve`] as many
-/// times as needed, then drop. This stage holds no background threads or
-/// sockets, so there is no explicit `shutdown` method — Rust's ordinary drop
-/// semantics fully release any resources the resolver owns.
+/// times as needed, then drop. This stage holds no background threads, so
+/// there is no explicit `shutdown` method — Rust's ordinary drop semantics
+/// fully release any resources the resolver owns (including any sockets a
+/// registered [`crate::upstream::UdpBackend`]/[`crate::upstream::TcpBackend`]
+/// opens per call).
 pub struct Resolver {
     policy: SplitDnsPolicy,
-    backends: HashMap<UpstreamGroupId, Box<dyn UpstreamBackend + Send + Sync>>,
+    backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     clock: Box<dyn Clock + Send + Sync>,
-    cache: RefCell<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 impl Resolver {
@@ -145,17 +129,27 @@ impl Resolver {
     /// Extracts the queried name from `query`'s first question, checks the
     /// in-memory answer cache, and on a miss routes the query through the
     /// configured [`SplitDnsPolicy`] to select an upstream group and
-    /// forwards it to that group's backend. Successful (positive or
+    /// forwards it to that group's first registered backend (multiple
+    /// backends per group are stored to support a future failover track;
+    /// this stage always uses only the first). Successful (positive or
     /// negative) answers are cached with a TTL-derived expiry; a cache hit
     /// never calls the backend again.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NoRoute`] when no split-DNS rule matches the
-    /// queried name and no default upstream group is configured, or when no
-    /// question is present in `query`. Returns whatever error the selected
-    /// backend produces, propagated as-is (not cached).
-    pub fn resolve(&self, query: &Message) -> Result<Message> {
+    /// queried name and no default upstream group is configured, when no
+    /// question is present in `query`, or when the matched group has no
+    /// backend registered. Returns whatever error the selected backend
+    /// produces, propagated as-is (not cached).
+    ///
+    /// # Runtime requirement
+    ///
+    /// Must be called from inside a `tokio` runtime context if the selected
+    /// backend performs real socket I/O (e.g. [`crate::upstream::UdpBackend`]/
+    /// [`crate::upstream::TcpBackend`]) — see `crate::upstream`'s
+    /// module-level docs.
+    pub async fn resolve(&self, query: &Message) -> Result<Message> {
         let question = query.questions.first().ok_or(Error::NoRoute)?;
         let key = CacheKey {
             name: question.name.clone(),
@@ -164,21 +158,29 @@ impl Resolver {
         };
 
         let now = self.clock.now();
-        if let Some(entry) = self.cache.borrow().get(&key)
-            && entry.expires_at > now
         {
-            return Ok(entry.answer.clone());
+            let cache = self.cache.lock().expect("cache mutex poisoned");
+            if let Some(entry) = cache.get(&key)
+                && entry.expires_at > now
+            {
+                return Ok(entry.answer.clone());
+            }
         }
 
         let group = self
             .policy
             .resolve_group(&question.name)
             .ok_or(Error::NoRoute)?;
-        let backend = self.backends.get(group).ok_or(Error::NoRoute)?;
-        let answer = backend.resolve(query)?;
+        let backend = self
+            .backends
+            .get(group)
+            .and_then(|backends| backends.first())
+            .ok_or(Error::NoRoute)?;
+        let answer = backend.resolve(query).await?;
 
         if let Some(ttl) = cacheable_ttl(&answer) {
-            self.cache.borrow_mut().insert(
+            let mut cache = self.cache.lock().expect("cache mutex poisoned");
+            cache.insert(
                 key,
                 CacheEntry {
                     answer: answer.clone(),
@@ -228,28 +230,34 @@ fn cacheable_ttl(answer: &Message) -> Option<Duration> {
         .map(|ttl| Duration::from_secs(u64::from(ttl)))
 }
 
-/// Builds a [`Resolver`] from a split-DNS policy and one upstream backend
-/// per group.
+/// Builds a [`Resolver`] from a split-DNS policy and one or more upstream
+/// backends per group.
 pub struct ResolverBuilder {
     policy: SplitDnsPolicy,
-    backends: HashMap<UpstreamGroupId, Box<dyn UpstreamBackend + Send + Sync>>,
+    backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     clock: Box<dyn Clock + Send + Sync>,
 }
 
 impl ResolverBuilder {
-    /// Registers the upstream backend used to answer queries routed to
-    /// `group`. A later call for the same `group` replaces the earlier
-    /// registration.
+    /// Registers an upstream backend used to answer queries routed to
+    /// `group`, appended after any backend already registered for that
+    /// group. [`Resolver::resolve`] always uses the first registered
+    /// backend for a group this stage (multiple backends per group support
+    /// a future failover track, not implemented yet).
     ///
-    /// `backend` is a plain function/closure from a query [`Message`] to a
-    /// resolved answer [`Message`]; stage 0.2 has no real transport, so this
-    /// is how a fake in-process backend is wired in for testing.
+    /// `backend` is any [`crate::upstream::UpstreamBackend`] implementation
+    /// — e.g. [`crate::upstream::UdpBackend`]/
+    /// [`crate::upstream::TcpBackend`] for real transport, or a
+    /// test-only fake implementing the trait directly.
     pub fn backend(
         mut self,
         group: UpstreamGroupId,
-        backend: impl Fn(&Message) -> Result<Message> + Send + Sync + 'static,
+        backend: impl UpstreamBackend + 'static,
     ) -> Self {
-        self.backends.insert(group, Box::new(backend));
+        self.backends
+            .entry(group)
+            .or_default()
+            .push(Box::new(backend));
         self
     }
 
@@ -268,7 +276,7 @@ impl ResolverBuilder {
             policy: self.policy,
             backends: self.backends,
             clock: self.clock,
-            cache: RefCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -276,16 +284,37 @@ impl ResolverBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use dns_lattice_model::{
         Class, DomainPattern, Header, Name, Opcode, Question, Rcode, RecordType,
     };
 
-    /// A minimal test-only backend closure factory: always returns a fixed
-    /// answer, proving wiring without modelling any real upstream behavior.
-    fn fixed_backend(
-        answer: Message,
-    ) -> impl Fn(&Message) -> Result<Message> + Send + Sync + 'static {
-        move |_query: &Message| Ok(answer.clone())
+    /// A minimal test-only fake [`UpstreamBackend`] that always returns a
+    /// fixed answer, proving routing wiring without modelling any real
+    /// upstream transport behavior.
+    struct FixedBackend(Message);
+
+    #[async_trait]
+    impl UpstreamBackend for FixedBackend {
+        async fn resolve(&self, _query: &Message) -> Result<Message> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fixed_backend(answer: Message) -> FixedBackend {
+        FixedBackend(answer)
+    }
+
+    /// A test-only fake [`UpstreamBackend`] that always fails with a fixed
+    /// error, proving error propagation without modelling any real
+    /// upstream transport behavior.
+    struct FailingBackend(Error);
+
+    #[async_trait]
+    impl UpstreamBackend for FailingBackend {
+        async fn resolve(&self, _query: &Message) -> Result<Message> {
+            Err(self.0.clone())
+        }
     }
 
     fn n(s: &str) -> Name {
@@ -322,8 +351,8 @@ mod tests {
         msg
     }
 
-    #[test]
-    fn routes_exact_match_to_its_group() {
+    #[tokio::test]
+    async fn routes_exact_match_to_its_group() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::exact(n("host.corp.internal")),
@@ -339,12 +368,13 @@ mod tests {
 
         let answer = resolver
             .resolve(&query_for("host.corp.internal"))
+            .await
             .expect("routed to corp backend");
         assert_eq!(answer.header.id, 42);
     }
 
-    #[test]
-    fn routes_suffix_match_to_its_group() {
+    #[tokio::test]
+    async fn routes_suffix_match_to_its_group() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::suffix(n("corp.internal")),
@@ -360,12 +390,13 @@ mod tests {
 
         let answer = resolver
             .resolve(&query_for("host.corp.internal"))
+            .await
             .expect("routed to corp backend via suffix");
         assert_eq!(answer.header.id, 7);
     }
 
-    #[test]
-    fn routes_wildcard_match_to_its_group() {
+    #[tokio::test]
+    async fn routes_wildcard_match_to_its_group() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::wildcard(n("corp.internal")),
@@ -381,12 +412,13 @@ mod tests {
 
         let answer = resolver
             .resolve(&query_for("host.corp.internal"))
+            .await
             .expect("routed to corp backend via wildcard");
         assert_eq!(answer.header.id, 9);
     }
 
-    #[test]
-    fn routes_unmatched_query_to_default_group() {
+    #[tokio::test]
+    async fn routes_unmatched_query_to_default_group() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::suffix(n("corp.internal")),
@@ -403,23 +435,25 @@ mod tests {
 
         let answer = resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("routed to default group");
         assert_eq!(answer.header.id, 3);
     }
 
-    #[test]
-    fn no_route_when_no_match_and_no_default_group() {
+    #[tokio::test]
+    async fn no_route_when_no_match_and_no_default_group() {
         let policy = SplitDnsPolicy::builder().build();
         let resolver = Resolver::builder(policy).build();
 
         let err = resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect_err("no rule and no default group configured");
         assert_eq!(err, Error::NoRoute);
     }
 
-    #[test]
-    fn no_route_when_matched_group_has_no_registered_backend() {
+    #[tokio::test]
+    async fn no_route_when_matched_group_has_no_registered_backend() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::suffix(n("corp.internal")),
@@ -430,12 +464,13 @@ mod tests {
 
         let err = resolver
             .resolve(&query_for("host.corp.internal"))
+            .await
             .expect_err("matched group has no backend registered");
         assert_eq!(err, Error::NoRoute);
     }
 
-    #[test]
-    fn backend_error_propagates_as_is() {
+    #[tokio::test]
+    async fn backend_error_propagates_as_is() {
         let policy = SplitDnsPolicy::builder()
             .rule(
                 DomainPattern::suffix(n("corp.internal")),
@@ -443,13 +478,15 @@ mod tests {
             )
             .build();
         let resolver = Resolver::builder(policy)
-            .backend(UpstreamGroupId::new("corp"), |_query: &Message| {
-                Err(Error::NameTooLong)
-            })
+            .backend(
+                UpstreamGroupId::new("corp"),
+                FailingBackend(Error::NameTooLong),
+            )
             .build();
 
         let err = resolver
             .resolve(&query_for("host.corp.internal"))
+            .await
             .expect_err("backend failure propagates");
         assert_eq!(err, Error::NameTooLong);
     }
@@ -471,8 +508,9 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[async_trait]
     impl UpstreamBackend for CountingBackend {
-        fn resolve(&self, _query: &Message) -> Result<Message> {
+        async fn resolve(&self, _query: &Message) -> Result<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.answer.clone())
         }
@@ -539,15 +577,13 @@ mod tests {
         };
         let resolver = Resolver::builder(policy)
             .clock(clock)
-            .backend(UpstreamGroupId::new(group), move |query: &Message| {
-                backend.resolve(query)
-            })
+            .backend(UpstreamGroupId::new(group), backend)
             .build();
         (resolver, calls)
     }
 
-    #[test]
-    fn cache_hit_does_not_call_backend_again() {
+    #[tokio::test]
+    async fn cache_hit_does_not_call_backend_again() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -560,17 +596,19 @@ mod tests {
 
         let first = resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("first resolve populates cache");
         let second = resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("second resolve served from cache");
 
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "backend called only once");
     }
 
-    #[test]
-    fn cache_entry_still_hit_just_before_ttl_elapses() {
+    #[tokio::test]
+    async fn cache_entry_still_hit_just_before_ttl_elapses() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -584,6 +622,7 @@ mod tests {
 
         resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("first resolve populates cache");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -591,12 +630,13 @@ mod tests {
 
         resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("still cached before ttl elapses");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cache hit before expiry");
     }
 
-    #[test]
-    fn negative_answer_is_cached_with_soa_minimum_ttl() {
+    #[tokio::test]
+    async fn negative_answer_is_cached_with_soa_minimum_ttl() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -609,16 +649,18 @@ mod tests {
 
         let first = resolver
             .resolve(&query_for("missing.example.com"))
+            .await
             .expect("nxdomain is Ok(Message), not Err");
         assert_eq!(first.header.rcode, Rcode::NxDomain);
         resolver
             .resolve(&query_for("missing.example.com"))
+            .await
             .expect("served from negative cache");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "negative answer cached");
     }
 
-    #[test]
-    fn negative_answer_without_soa_uses_fixed_floor_ttl() {
+    #[tokio::test]
+    async fn negative_answer_without_soa_uses_fixed_floor_ttl() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -631,9 +673,11 @@ mod tests {
 
         resolver
             .resolve(&query_for("missing.example.com"))
+            .await
             .expect("nxdomain without soa still Ok");
         resolver
             .resolve(&query_for("missing.example.com"))
+            .await
             .expect("served from cache using the fixed floor ttl");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -642,8 +686,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nodata_answer_is_cached_as_negative() {
+    #[tokio::test]
+    async fn nodata_answer_is_cached_as_negative() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -656,15 +700,17 @@ mod tests {
 
         resolver
             .resolve(&query_for("empty.example.com"))
+            .await
             .expect("nodata is Ok(Message)");
         resolver
             .resolve(&query_for("empty.example.com"))
+            .await
             .expect("served from cache");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "nodata answer cached");
     }
 
-    #[test]
-    fn expired_cache_entry_triggers_a_fresh_backend_call() {
+    #[tokio::test]
+    async fn expired_cache_entry_triggers_a_fresh_backend_call() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
             .build();
@@ -674,6 +720,7 @@ mod tests {
 
         resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("first resolve populates cache");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -681,6 +728,7 @@ mod tests {
 
         resolver
             .resolve(&query_for("example.com"))
+            .await
             .expect("expired entry re-queries the backend");
         assert_eq!(
             calls.load(Ordering::SeqCst),
