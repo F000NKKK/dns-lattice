@@ -28,10 +28,14 @@
 //! [`UpstreamBackend`] trait plus baseline [`UdpBackend`]/[`TcpBackend`]
 //! transport implementations, plus DNS-over-TLS/DNS-over-HTTPS/
 //! DNS-over-QUIC backends behind the default-off `dot`/`doh`/`doq` Cargo
-//! features. Later stages add `server`, `fakeip`, and `hooks` behind this
+//! features, and the [`server`] module's [`Server`]/[`ServerBuilder`]
+//! inbound UDP/TCP listener — the first slice fulfilling the embeddable-
+//! DNS-server-engine goal (ADR-0015, `DL-A-16`). Later follow-up work adds
+//! `server`'s DoT/DoH/DoQ listeners, plus `fakeip` and `hooks`, behind this
 //! same facade. See `ARCHITECTURE.md` for the full module layout.
 
 pub mod engine;
+pub mod server;
 pub mod upstream;
 
 pub use dns_lattice_core::{Error, Result};
@@ -40,6 +44,7 @@ pub use dns_lattice_model::{
     RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
 };
 pub use engine::{Resolver, ResolverBuilder};
+pub use server::{Server, ServerBuilder};
 #[cfg(feature = "doh")]
 pub use upstream::{DohBackend, DohBackendConfig, DohMethod};
 #[cfg(feature = "doq")]

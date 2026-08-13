@@ -76,7 +76,13 @@ pub use doq::{DoqBackend, DoqBackendConfig};
 /// standard UDP message size). A larger answer arrives with `TC=1` set and
 /// is size-truncated by the responding server itself; [`UdpBackend`] then
 /// falls back to a TCP query per ADR-0011 point 5.
-const UDP_MAX_RESPONSE_LEN: usize = 512;
+///
+/// `pub(crate)` (not private) so `crate::server`'s UDP listener can reuse
+/// the same boundary when deciding whether to truncate an outbound response
+/// and set `TC=1`, per ADR-0015 (`DL-A-16`) point 3 — the baseline server
+/// has no larger negotiated payload size to honor either, so it shares this
+/// exact constant rather than redefining an equivalent one.
+pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
 
 /// A public, async, object-safe upstream DNS backend seam: given a query
 /// [`Message`], resolve it against this backend and return the answer.
@@ -258,6 +264,11 @@ async fn tcp_query(
 /// returns the decoded response. Shared by [`tcp_query`] (plaintext TCP)
 /// and, behind the `dot` feature, `dot::DotBackend` (the same framing over
 /// an established TLS stream).
+///
+/// Implemented in terms of [`write_framed`] and [`read_framed`] (ADR-0015,
+/// `DL-A-16` point 5) — this one-shot write-then-read shape stays as the
+/// client-role helper; `crate::server`'s read-many/respond-many TCP loop
+/// calls the two halves directly instead of this function.
 pub(crate) async fn framed_query<S>(
     stream: &mut S,
     budget: Duration,
@@ -266,7 +277,27 @@ pub(crate) async fn framed_query<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let payload = query.encode()?;
+    write_framed(stream, budget, query).await?;
+    read_framed(stream, budget).await
+}
+
+/// Writes `message` to `stream` using RFC 1035 §4.2.2's 2-byte big-endian
+/// length-prefixed framing (a 2-byte length prefix followed by the encoded
+/// message), bounded by `budget`.
+///
+/// One half of the `framed_query` split (ADR-0015, `DL-A-16` point 5):
+/// shared by [`framed_query`] (client-side, one write per call) and
+/// `crate::server`'s TCP listener (one write per response, potentially many
+/// per connection).
+pub(crate) async fn write_framed<S>(
+    stream: &mut S,
+    budget: Duration,
+    message: &Message,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let payload = message.encode()?;
     let len: u16 = payload
         .len()
         .try_into()
@@ -280,7 +311,25 @@ where
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
+    Ok(())
+}
 
+/// Reads one RFC 1035 §4.2.2 length-prefixed message from `stream`, bounded
+/// by `budget`.
+///
+/// One half of the `framed_query` split (ADR-0015, `DL-A-16` point 5):
+/// shared by [`framed_query`] (client-side, one read per call) and
+/// `crate::server`'s TCP listener (one read per inbound request,
+/// potentially many per connection). Returns [`Error::Timeout`] if the
+/// length prefix or payload is not fully read within `budget` — in
+/// particular, a peer that never sends anything (e.g. an idle/closed
+/// connection) surfaces as this same error rather than hanging, since
+/// `read_exact` on a cleanly closed stream returns an I/O error mapped to
+/// [`Error::Transport`] rather than `Ok`.
+pub(crate) async fn read_framed<S>(stream: &mut S, budget: Duration) -> Result<Message>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 2];
     timeout(budget, stream.read_exact(&mut len_buf))
         .await

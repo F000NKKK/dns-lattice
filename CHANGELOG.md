@@ -49,6 +49,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `Error` variant, no synthesized answer, not cached) — this is a
   purely internal behavioral change, `Resolver::resolve`'s signature is
   unchanged. See ADR-0014 (`DL-A-15`) for the full design rationale.
+- Stage 0.3 Track E (inbound server listener, UDP/TCP baseline): new public
+  `dns_lattice::server` module — `Server`/`ServerBuilder`, an embeddable
+  DNS server engine built on `engine::Resolver`. `ServerBuilder::new` takes
+  a shared `Arc<Resolver>`; `udp_addr`/`tcp_addr` configure one or more
+  listen addresses; `bind` performs the actual socket binds; `serve`/
+  `serve_until` run the UDP receive loop and TCP accept loop concurrently
+  (one `tokio` task per datagram, one per TCP connection looping over
+  multiple length-prefixed queries per RFC 1035 §4.2.2) until dropped or a
+  caller-supplied shutdown future resolves. Oversized UDP answers are
+  truncated with `TC=1` set at the existing 512-byte RFC 1035 §4.2.1
+  boundary; a `Resolver::resolve` error is answered with a synthesized
+  `Rcode::ServFail` response rather than dropped or left to crash the
+  listener, while an inbound message that fails to decode at all is
+  dropped (no reliable id/question to answer with). Binding a privileged
+  port stays the composing application's responsibility, not this crate's.
+  Internally, `upstream::framed_query` is now implemented in terms of two
+  new crate-private `read_framed`/`write_framed` halves, shared unchanged
+  by both `upstream` (client role) and `server` (listener role) — no
+  public API change to `upstream`. This is the first slice fulfilling the
+  "embeddable DNS server engine" goal named in the architecture doc;
+  DoT/DoH/DoQ inbound listeners are deferred to follow-up work behind the
+  same `dot`/`doh`/`doq` Cargo features their `upstream` counterparts use.
+  See ADR-0015 (`DL-A-16`) for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 

@@ -66,10 +66,12 @@ Status: planned
   record the gap as an ADR and defer. Done — `quinn` cleared the bar; the
   `doq` Cargo feature landed (`DoqBackend`/`DoqBackendConfig`).
 - Fallback/failover across upstreams within a group (see the failure-flow
-  diagram in `ARCHITECTURE.md`).
+  diagram in `ARCHITECTURE.md`). Done.
 - `server` inbound listener: UDP and TCP first, matching the crate's
   Kestrel-style embeddable-server goal from `ARCHITECTURE.md`; DoT/DoH/DoQ
   listeners behind the same Cargo features as their upstream counterparts.
+  UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT/DoH/DoQ listeners
+  remain.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.

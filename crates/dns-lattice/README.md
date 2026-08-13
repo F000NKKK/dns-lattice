@@ -21,7 +21,7 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
 - A public, async `upstream` module (`UpstreamBackend` trait, `UdpBackend`,
   `TcpBackend`): baseline UDP and TCP upstream transports, no EDNS0/OPT
   support yet (`UdpBackend` falls back to a TCP query when a response's
-  `TC` bit is set). The inbound server listener is still planned.
+  `TC` bit is set).
 - Three opt-in, default-off Cargo features adding encrypted upstream
   transports to the same `upstream` module: `dot` (`DotBackend`/
   `DotBackendConfig`, DNS-over-TLS, RFC 7858, over `rustls`/`tokio-rustls`),
@@ -31,9 +31,21 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   `quinn`, with TLS 1.3 embedded in QUIC via `rustls`). `doq` opens a fresh
   QUIC connection per query in this stage — no connection pooling/reuse
   yet.
+- A public, async `server` module (`Server`, `ServerBuilder`): an
+  embeddable inbound UDP/TCP DNS listener over a shared `Arc<Resolver>`.
+  `ServerBuilder::new(resolver)` plus `udp_addr`/`tcp_addr` configure one or
+  more listen addresses, `bind` performs the actual socket binds, and
+  `serve`/`serve_until` run the UDP receive loop and TCP accept loop
+  concurrently — one `tokio` task per received UDP datagram, one per
+  accepted TCP connection (looping over multiple RFC 1035 §4.2.2
+  length-prefixed queries per connection). Oversized UDP answers are
+  truncated with `TC=1` set at the existing 512-byte boundary; a
+  `Resolver::resolve` error is answered with a synthesized
+  `Rcode::ServFail` response instead of being dropped or crashing the
+  listener. DoT/DoH/DoQ inbound listeners are still planned.
 
-Server, Fake IP, and dynamic routing hook capabilities are planned for
-later stages; see `ROADMAP.md` in the repository root.
+Fake IP and dynamic routing hook capabilities are planned for later
+stages; see `ROADMAP.md` in the repository root.
 
 ## Feature/platform constraints
 
@@ -86,6 +98,8 @@ resolver's construct/resolve lifecycle, static split-DNS routing, and its
 in-memory TTL/negative-caching answer cache; stage 0.3 (in progress) has so
 far landed the public async `upstream` trait, baseline UDP/TCP backends,
 the opt-in `dot`/`doh`/`doq` encrypted-transport backends described above,
-and failover across a group's registered backends. The inbound server
-listener, Fake IP, and dynamic routing hooks are not implemented yet. Types
-may change without notice until the first stable release.
+failover across a group's registered backends, and the `server` module's
+embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`). The inbound
+DoT/DoH/DoQ server listeners, Fake IP, and dynamic routing hooks are not
+implemented yet. Types may change without notice until the first stable
+release.
