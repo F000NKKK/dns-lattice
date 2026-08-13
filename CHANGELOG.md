@@ -119,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ServerBuilder`/`Server` public method signature changes. This closes out
   Track E and Stage 0.3 in full — every planned UDP/TCP/DoT/DoH/DoQ
   upstream backend and inbound listener for this stage has now landed. See
-  ADR-0016 (`DL-A-17`) for the full design rationale.
+  ADR-0016 for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 

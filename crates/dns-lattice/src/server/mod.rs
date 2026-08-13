@@ -3,12 +3,12 @@
 //! [`crate::engine::Resolver`], fulfilling the embeddable-server-engine goal
 //! named in `ARCHITECTURE.md`.
 //!
-//! Per ADR-0015 (`DL-A-16`), the UDP/TCP baseline landed first; per
-//! ADR-0016 (`DL-A-17`), the DoT listener ([`ServerBuilder::dot_addr`]), DoQ
+//! Per ADR-0015, the UDP/TCP baseline landed first; per ADR-0016, the DoT
+//! listener ([`ServerBuilder::dot_addr`]), DoQ
 //! listener ([`ServerBuilder::doq_addr`]), and DoH listener
 //! ([`ServerBuilder::doh_addr`]) extend the same `ServerBuilder`/`Server`
 //! types behind the `dot`/`doq`/`doh` Cargo features, closing out Track E
-//! (`DL-19`) and Stage 0.3 (`DL-14`) entirely. DoT reuses the baseline TCP
+//! and Stage 0.3 entirely. DoT reuses the baseline TCP
 //! per-connection loop unchanged once the TLS handshake completes; DoQ (RFC
 //! 9250) instead accepts one fresh bidirectional QUIC stream per query (RFC
 //! 9250 §4.2), reusing the same `read_framed`/`write_framed` framing helpers
@@ -130,8 +130,7 @@ pub struct ServerBuilder {
 /// a mandated one — this crate does not hardcode it).
 ///
 /// Any request whose path does not match `path` gets an HTTP 404 response,
-/// entirely outside `Message`/`Resolver` (ADR-0016, `DL-A-17` decision 3,
-/// point 1).
+/// entirely outside `Message`/`Resolver` (ADR-0016, decision 3, point 1).
 #[cfg(feature = "doh")]
 #[derive(Debug, Clone)]
 pub struct DohListenerConfig {
@@ -203,12 +202,12 @@ impl ServerBuilder {
 
     /// Adds a DNS-over-HTTPS (RFC 8484) address to bind, with `tls_config`
     /// used to accept the TLS session on every connection to that address
-    /// and `config` selecting the URI path answered (ADR-0016, `DL-A-17`
-    /// decision 1/3). May be called more than once to bind multiple DoH
+    /// and `config` selecting the URI path answered (ADR-0016, decision
+    /// 1/3). May be called more than once to bind multiple DoH
     /// addresses, each with its own `tls_config`/`config`.
     ///
-    /// This crate does not source certificate material itself (`DL-19`'s
-    /// stated non-goal, reaffirmed by `DL-A-17`) — the caller supplies a
+    /// This crate does not source certificate material itself — the caller
+    /// supplies a
     /// fully configured `Arc<rustls::ServerConfig>`, exactly like
     /// [`ServerBuilder::dot_addr`].
     #[cfg(feature = "doh")]
@@ -580,7 +579,7 @@ async fn serve_doh(
 /// query parameter or POST's `application/dns-message` body), decodes,
 /// resolves, and re-encodes the answer, following the same
 /// `Result`-to-response pattern as [`handle_tcp_connection`]/
-/// [`handle_doq_stream`] (ADR-0016, `DL-A-17` decision 3/5).
+/// [`handle_doq_stream`] (ADR-0016, decision 3/5).
 ///
 /// See the module-level "Error handling" docs for exactly which failures map
 /// to which HTTP status: a path mismatch is HTTP 404; an unsupported method

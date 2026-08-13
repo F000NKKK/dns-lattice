@@ -30,8 +30,8 @@
 //! DNS-over-QUIC backends behind the default-off `dot`/`doh`/`doq` Cargo
 //! features, and the [`server`] module's [`Server`]/[`ServerBuilder`]
 //! inbound UDP/TCP baseline plus DoT/DoH/DoQ listeners, completing the
-//! embeddable-DNS-server-engine goal for this stage (ADR-0015, `DL-A-16`;
-//! DoT/DoH/DoQ per ADR-0016, `DL-A-17`). Later follow-up work adds
+//! embeddable-DNS-server-engine goal for this stage (ADR-0015; DoT/DoH/DoQ
+//! per ADR-0016). Later follow-up work adds
 //! `fakeip` and `hooks` behind this same facade. See `ARCHITECTURE.md` for
 //! the full module layout.
 
