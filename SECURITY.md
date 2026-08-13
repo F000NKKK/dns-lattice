@@ -37,9 +37,10 @@ The latest published `0.3.0` release provides a hand-rolled DNS message model
 resource-record wire encode/decode, including name decompression on
 decode), a deterministic zone/domain matcher (`matcher`), and static
 split-DNS policy types (`policy`) — all pure, in-memory, no network I/O.
-`dns-lattice-core` provides the shared `Error`/`Result` pair. It also provides
-the resolver/cache, UDP/TCP/DoT/DoH/DoQ upstream transports, and matching
-inbound listeners. The current development state on `main` additionally
+`dns-lattice-core` provides the shared `Error`/`Result` pair. The published
+`dns-lattice` facade also provides the resolver/cache, UDP/TCP/DoT/DoH/DoQ
+upstream transports, and matching inbound listeners. The current development
+state on `main` additionally
 contains the standalone, data-only Fake IP pool described below.
 
 Reports involving a decode panic, an infinite loop or excessive resource
