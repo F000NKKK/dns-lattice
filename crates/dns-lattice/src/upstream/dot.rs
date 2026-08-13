@@ -74,10 +74,11 @@ impl DotBackendConfig {
 /// [`super::TcpBackend`] (ADR-0011); this backend adds no fields or
 /// methods to the [`UpstreamBackend`] trait itself.
 ///
-/// A plain TCP connect failure below the TLS layer maps to
-/// [`Error::Transport`], matching [`super::TcpBackend`]'s own
-/// connect-failure mapping; a TLS handshake or certificate/hostname
-/// verification failure maps to [`Error::Tls`] (ADR-0012).
+/// An underlying TCP failure before a TLS session is established (including
+/// a peer closing the connection) maps to [`Error::Transport`], matching
+/// [`super::TcpBackend`]'s own connection-failure mapping. A failure that
+/// `rustls` reports during TLS negotiation or certificate/hostname
+/// verification maps to [`Error::Tls`] (ADR-0012).
 pub struct DotBackend {
     config: DotBackendConfig,
 }
@@ -107,10 +108,38 @@ impl UpstreamBackend for DotBackend {
         )
         .await
         .map_err(|_| Error::Timeout)?
-        .map_err(|err| Error::Tls(err.to_string()))?;
+        .map_err(map_tls_connect_error)?;
 
         framed_query(&mut tls_stream, self.config.read_timeout, query).await
     }
+}
+
+/// Maps a failed TLS setup to [`Error::Tls`] only when `rustls` actually
+/// reported a TLS error. A peer that resets or closes the underlying TCP
+/// connection before a TLS session exists is a transport failure instead.
+fn map_tls_connect_error(err: std::io::Error) -> Error {
+    if error_chain_is_tls(&err) {
+        Error::Tls(err.to_string())
+    } else {
+        Error::Transport(err.to_string())
+    }
+}
+
+fn error_chain_is_tls(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(node) = current {
+        if node.downcast_ref::<tokio_rustls::rustls::Error>().is_some() {
+            return true;
+        }
+        if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+            && error_chain_is_tls(inner)
+        {
+            return true;
+        }
+        current = node.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -119,27 +148,10 @@ mod tests {
     use dns_lattice_model::{Class, Header, Name, Opcode, Question, Rcode, RecordType};
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
-
-    /// Reserves a loopback port with no TCP listener ever bound to it, for
-    /// a deterministic "connection refused" test case. Binding then
-    /// dropping a *TCP* listener is not reliable for this across
-    /// platforms: on Windows, a `connect()` racing the just-closed
-    /// listener's teardown can transiently succeed instead of failing
-    /// immediately, which previously made this test observe a later-stage
-    /// (TLS) error instead of the intended connect-level `Transport`
-    /// error. A UDP socket never accepts TCP connections at all, so a TCP
-    /// `connect()` to its port fails immediately and deterministically on
-    /// every platform, with the UDP socket kept alive so the OS cannot
-    /// reassign the port to something else mid-test.
-    async fn reserve_closed_tcp_port() -> (UdpSocket, SocketAddr) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        (socket, addr)
-    }
 
     fn query_for(name: &str) -> Message {
         Message {
@@ -278,10 +290,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dot_backend_connection_failure_is_transport_or_timeout() {
+    async fn dot_backend_returns_transport_when_peer_closes_before_tls() {
         let (_server_config, client_config, server_name) = self_signed_fixture();
 
-        let (_reserved, addr) = reserve_closed_tcp_port().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
 
         let backend = DotBackend::new(DotBackendConfig {
             server: addr,
@@ -294,11 +311,9 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("a listenerless loopback port cannot start TLS");
-        // The UDP-backed reservation is a TCP refusal on some platforms,
-        // while Windows can let it consume the connect budget. Neither
-        // outcome reached the TLS handshake, so `Error::Tls` is invalid.
-        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
+            .expect_err("a peer that closes before TLS is a transport failure");
+        assert!(matches!(err, Error::Transport(_)));
+        responder.await.unwrap();
     }
 
     #[tokio::test]

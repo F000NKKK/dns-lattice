@@ -529,15 +529,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_backend_connection_failure_is_transport_or_timeout() {
-        // Reserve a loopback port via a UDP socket that is never a TCP
-        // listener. A TCP connect to it is an immediate refusal on some
-        // platforms, but Windows may instead blackhole the TCP packets
-        // until the configured connect budget expires. Both outcomes are
-        // non-TLS connection failures; the dedicated timeout test above
-        // covers the latter boundary independently.
-        let reserved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = reserved.local_addr().unwrap();
+    async fn tcp_backend_returns_transport_when_peer_closes_connection() {
+        // A controlled loopback peer accepts exactly one TCP connection and
+        // closes it without speaking DNS. This avoids relying on the OS-
+        // specific behavior of connecting TCP to a UDP-bound port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
 
         let backend = TcpBackend::new(TcpBackendConfig {
             server: addr,
@@ -548,7 +549,8 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("a listenerless loopback port cannot resolve a query");
-        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
+            .expect_err("a peer that closes before a DNS response is transport failure");
+        assert!(matches!(err, Error::Transport(_)));
+        responder.await.unwrap();
     }
 }

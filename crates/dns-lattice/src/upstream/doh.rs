@@ -188,21 +188,10 @@ mod tests {
     use dns_lattice_model::{Class, Header, Name, Opcode, Question, Rcode, RecordType};
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
-
-    /// Reserves a loopback port with no TCP listener ever bound to it, for
-    /// a deterministic "connection refused" test case — see the identical
-    /// helper's doc comment in `upstream::dot::tests` for why bind-then-
-    /// drop of a TCP listener is not reliable across platforms (Windows in
-    /// particular).
-    async fn reserve_closed_tcp_port() -> (UdpSocket, std::net::SocketAddr) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        (socket, addr)
-    }
 
     fn query_for(name: &str) -> Message {
         Message {
@@ -437,17 +426,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doh_backend_connection_failure_is_transport_or_timeout() {
+    async fn doh_backend_returns_transport_when_peer_closes_before_tls() {
         let (_server_config, client_config) = self_signed_fixture();
 
-        let (_reserved, addr) = reserve_closed_tcp_port().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
 
         let backend = DohBackend::new(DohBackendConfig {
-            // Keep the URI on the same IPv4 loopback address the UDP
-            // reservation uses. `localhost` may resolve to IPv6 first on
-            // Windows, which turns this connection-refused fixture into an
-            // unrelated address-family/DNS-selection test before the DoH
-            // connector reaches its transport-error boundary.
             uri: Uri::from_str(&format!("https://127.0.0.1:{}/dns-query", addr.port())).unwrap(),
             method: DohMethod::Get,
             tls_config: Arc::new(client_config),
@@ -457,10 +446,8 @@ mod tests {
         let err = backend
             .resolve(&query_for("example.com"))
             .await
-            .expect_err("a listenerless loopback port cannot establish HTTPS");
-        // The UDP-backed reservation is a TCP refusal on some platforms,
-        // while Windows can let it consume the whole request budget. This
-        // must never be classified as a TLS failure.
-        assert!(matches!(err, Error::Transport(_) | Error::Timeout));
+            .expect_err("a peer that closes before TLS is a transport failure");
+        assert!(matches!(err, Error::Transport(_)));
+        responder.await.unwrap();
     }
 }

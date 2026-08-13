@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- DoT now classifies an underlying TCP connection close before a TLS session
+  exists as `Error::Transport`; only errors reported by `rustls` during TLS
+  negotiation or certificate verification are `Error::Tls`. The upstream
+  TCP, DoT, and DoH transport-failure tests now use a controlled loopback
+  peer-close fixture instead of relying on platform-specific behavior of a
+  TCP connection to a UDP-bound port.
+
 - Stage 0.3 Track A (upstream transport, part 1): new public, async
   `dns_lattice::upstream` module — `UpstreamBackend` trait (replacing
   stage 0.2's crate-private, synchronous `engine::UpstreamBackend`,
