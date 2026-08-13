@@ -15,6 +15,22 @@
 //! server whenever a UDP response arrives with the `TC` (truncated) bit
 //! set, rather than negotiating a larger UDP payload size.
 //!
+//! # DoT and DoH (feature-gated)
+//!
+//! Two additional backends land in this module, each behind its own
+//! default-off Cargo feature so the baseline UDP/TCP build carries no
+//! TLS/HTTP dependency weight, per ADR-0012 (`DL-A-13`):
+//!
+//! - `dot` (`#[cfg(feature = "dot")]`): `DotBackend`/`DotBackendConfig`,
+//!   DNS-over-TLS (RFC 7858) over `rustls`/`tokio-rustls`.
+//! - `doh` (`#[cfg(feature = "doh")]`): `DohBackend`/`DohBackendConfig`,
+//!   DNS-over-HTTPS (RFC 8484) over `hyper`/`hyper-rustls`.
+//!
+//! Both follow the same `Config` + `Backend` +
+//! `#[async_trait] impl UpstreamBackend` pattern as [`UdpBackend`]/
+//! [`TcpBackend`]; TLS/HTTP-specific fields (SNI server name, TLS client
+//! config, HTTP method) live on the new config structs, not the trait.
+//!
 //! # Runtime requirement
 //!
 //! Both [`UdpBackend`] and [`TcpBackend`] perform real socket I/O via
@@ -32,6 +48,16 @@ use dns_lattice_model::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
+
+#[cfg(feature = "dot")]
+mod dot;
+#[cfg(feature = "dot")]
+pub use dot::{DotBackend, DotBackendConfig};
+
+#[cfg(feature = "doh")]
+mod doh;
+#[cfg(feature = "doh")]
+pub use doh::{DohBackend, DohBackendConfig, DohMethod};
 
 /// Maximum size, in bytes, of a UDP response this baseline backend accepts
 /// without EDNS0 payload-size negotiation (RFC 1035 §4.2.1's 512-byte
@@ -212,6 +238,22 @@ async fn tcp_query(
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
 
+    framed_query(&mut stream, read_timeout, query).await
+}
+
+/// Sends `query` over an already-established, ordered byte stream using
+/// RFC 1035 §4.2.2's 2-byte big-endian length-prefixed framing, and
+/// returns the decoded response. Shared by [`tcp_query`] (plaintext TCP)
+/// and, behind the `dot` feature, `dot::DotBackend` (the same framing over
+/// an established TLS stream).
+pub(crate) async fn framed_query<S>(
+    stream: &mut S,
+    budget: Duration,
+    query: &Message,
+) -> Result<Message>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let payload = query.encode()?;
     let len: u16 = payload
         .len()
@@ -222,20 +264,20 @@ async fn tcp_query(
     framed.extend_from_slice(&len.to_be_bytes());
     framed.extend_from_slice(&payload);
 
-    timeout(read_timeout, stream.write_all(&framed))
+    timeout(budget, stream.write_all(&framed))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
 
     let mut len_buf = [0u8; 2];
-    timeout(read_timeout, stream.read_exact(&mut len_buf))
+    timeout(budget, stream.read_exact(&mut len_buf))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
     let response_len = u16::from_be_bytes(len_buf) as usize;
 
     let mut response_buf = vec![0u8; response_len];
-    timeout(read_timeout, stream.read_exact(&mut response_buf))
+    timeout(budget, stream.read_exact(&mut response_buf))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;

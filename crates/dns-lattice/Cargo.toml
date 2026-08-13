@@ -12,11 +12,45 @@ keywords.workspace = true
 description = "Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks."
 readme = "README.md"
 
+[features]
+# DNS-over-TLS (RFC 7858) upstream backend. Default off: the baseline
+# UDP/TCP build carries no TLS dependency weight unless explicitly opted
+# into. See `DL-A-13` (ADR-0012).
+dot = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
+# DNS-over-HTTPS (RFC 8484) upstream backend. Default off, independent of
+# `dot`. See `DL-A-13` (ADR-0012).
+doh = [
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:base64",
+]
+
 [dependencies]
 dns-lattice-core = { workspace = true }
 dns-lattice-model = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+rcgen = { workspace = true }

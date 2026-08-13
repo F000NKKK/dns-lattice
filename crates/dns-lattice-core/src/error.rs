@@ -61,6 +61,13 @@ pub enum Error {
     /// `std::io::Error` is not itself comparable (stage 0.3,
     /// `upstream::UpstreamBackend`).
     Transport(String),
+    /// A TLS handshake, certificate validation, or hostname verification
+    /// failure while establishing or maintaining an encrypted upstream
+    /// connection (stage 0.3, DoT `upstream::DotBackend`/DoH
+    /// `upstream::DohBackend`). Carries a human-readable description; not
+    /// `PartialEq`-sensitive to the underlying TLS library's exact error
+    /// type, matching `Transport`'s existing precedent.
+    Tls(String),
 }
 
 impl fmt::Display for Error {
@@ -95,6 +102,7 @@ impl fmt::Display for Error {
             ),
             Error::Timeout => write!(f, "upstream backend timed out"),
             Error::Transport(message) => write!(f, "upstream transport error: {message}"),
+            Error::Tls(message) => write!(f, "upstream tls error: {message}"),
         }
     }
 }
@@ -147,6 +155,10 @@ mod tests {
             (
                 Error::Transport("connection refused".to_string()),
                 "upstream transport error: connection refused",
+            ),
+            (
+                Error::Tls("certificate expired".to_string()),
+                "upstream tls error: certificate expired",
             ),
         ];
         for (error, expected) in cases {
