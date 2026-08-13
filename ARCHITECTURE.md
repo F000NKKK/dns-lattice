@@ -29,9 +29,9 @@ sdk-lattice      Application-facing SDK composing the crates above
 - `flow-lattice` compiles user/operator rules into platform-neutral plans. It
   may produce the routing policy that `dns-lattice` executes, but it does not
   execute DNS lookups itself.
-- `tunnel-lattice` provides the TUN/TAP data path that Fake IP responses are
-  ultimately routed through; `dns-lattice` only allocates and resolves the
-  Fake IP mapping, it does not own the tunnel.
+- `tunnel-lattice` is the ecosystem's TUN/TAP interface crate. It has its
+  own data-plane scope and is not part of DNS Lattice's API or dependency
+  graph.
 - `sdk-lattice` wires the crates above together for an application. It is the
   only crate expected to depend on all of them simultaneously.
 
@@ -67,7 +67,7 @@ crate's core and is invoked by the composing application, typically through
   domain/zone matchers, source context, or a caller-supplied hook, rather
   than a single fixed upstream.
 - **Fake IP.** Deterministic, reversible allocation of synthetic addresses
-  per domain, for transparent proxying in combination with `tunnel-lattice`.
+  per domain for callers that need synthetic-address state.
 - **Dynamic routing hooks.** A stable extension point so `flow-lattice`
   (or any caller) can influence per-query resolution without a compile-time
   dependency from `dns-lattice` on `flow-lattice`.
@@ -85,7 +85,7 @@ crate's core and is invoked by the composing application, typically through
 - Owning or mutating OS-level DNS configuration (`net-lattice`'s job).
 - Compiling user-facing rule syntax into policy (`flow-lattice`'s job); this
   crate consumes an already-structured policy/hook, not raw rule text.
-- Managing the TUN/TAP device or packet forwarding (`tunnel-lattice`'s job).
+- Managing TUN/TAP devices or packet forwarding.
 - Shipping a standalone DNS server **product** (CLI entry point, config
   file format, process supervision, packaging as a system service). The
   crate provides the full server *engine* — listening, serving, and
@@ -190,7 +190,7 @@ re-exports, at minimum:
   resolution.
 - `fakeip`: caller-invoked pool configuration and lookup/reverse-lookup
   types. It does not implicitly alter resolver/server answers, synthesize
-  PTR records, expire/persist mappings, or integrate with a tunnel.
+  PTR records, or expire/persist mappings.
 - `upstream`: the backend trait, so callers can implement custom transports.
 - `hooks`: the dynamic routing hook trait.
 

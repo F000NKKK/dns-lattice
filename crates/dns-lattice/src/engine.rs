@@ -7,7 +7,7 @@
 //!
 //! It does **not** own inbound server lifecycle, socket binding, wire
 //! framing, TLS/HTTP/QUIC protocol handling, Fake IP allocation, dynamic
-//! hooks, operating-system DNS configuration, or TUN/TAP integration. Those
+//! hooks, operating-system DNS configuration, or packet forwarding. Those
 //! responsibilities belong respectively to [`crate::server`],
 //! [`crate::upstream`], caller-invoked [`crate::fakeip`], future hook APIs,
 //! and composing applications.

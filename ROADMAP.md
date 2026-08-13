@@ -90,8 +90,7 @@ Status: active
   and per-family LRU eviction on pool exhaustion.
 - Current public boundary: caller-invoked, data-only `fakeip` pool. It does
   not yet rewrite DNS answers, synthesize PTR records, expire or persist
-  mappings, integrate with `Resolver`/`Server`, or depend on
-  `tunnel-lattice`.
+  mappings, or integrate with `Resolver`/`Server`.
 - Remaining release work: API/documentation/package reconciliation and
   independent review.
 
@@ -129,5 +128,5 @@ Status: planned
 
 - OS-level DNS configuration mutation — tracked in `net-lattice`.
 - Rule-syntax compilation — tracked in `flow-lattice`.
-- TUN/TAP device management — tracked in `tunnel-lattice`.
+- TUN/TAP device management and packet forwarding.
 - Cross-crate composition and application wiring — tracked in `sdk-lattice`.

@@ -3,7 +3,7 @@
 //! [`FakeIpPool`] maps a DNS [`Name`] to one synthetic address in each
 //! configured family. It is a data-only control-plane component: it neither
 //! rewrites DNS messages nor performs PTR synthesis, TTL handling, network
-//! I/O, persistence, or tunnel integration.
+//! I/O, persistence, or integration with an external data plane.
 //!
 //! Ranges are inclusive. A name's first candidate is selected with a
 //! family-salted FNV-1a hash of its canonical (case-insensitive) labels;

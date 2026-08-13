@@ -27,7 +27,7 @@ The existing flat root aliases remain compatible.
   deterministic hash and circular probing; a full family evicts its LRU
   mapping. The pool is data-only: it performs no DNS answer/PTR rewriting,
   TTL expiry, persistence, socket I/O, resolver/server integration, or
-  `tunnel-lattice` integration.
+  implicit integration with external data planes.
 - An in-process resolver entry point (`Resolver`, `ResolverBuilder`): route
   one query through a `SplitDnsPolicy` to an upstream group, then try that
   group's registered backends in registration order — a backend failing

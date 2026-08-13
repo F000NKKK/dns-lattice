@@ -13,8 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each family uses a family-salted FNV-1a candidate, circular probing, and
   independent LRU eviction when full. It is a synchronous, concurrent,
   data-only pool: DNS answer/PTR synthesis, TTL expiry, persistence,
-  resolver/server integration, and `tunnel-lattice` integration remain out
-  of scope.
+  and resolver/server integration remain out of scope.
 - New typed `dns_lattice_core::Error` variants for invalid/unconfigured Fake
   IP pool configuration and allocation in a disabled family.
 
