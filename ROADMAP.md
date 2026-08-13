@@ -74,7 +74,7 @@ Status: done
   (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoQ listener done
   (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener done
   (`ServerBuilder::doh_addr`, `doh` Cargo feature), with ALPN-negotiated
-  HTTP/1.1 and HTTP/2 support. Final cross-platform verification remains.
+  HTTP/1.1 and HTTP/2 support. Final cross-platform verification passed.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.

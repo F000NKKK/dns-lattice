@@ -4,7 +4,7 @@
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
 published `0.1.x` to reserve their names on crates.io. Development on `main`
-has since landed stages 0.1-0.2 and stage 0.3 implementation; no public API is stable yet. Security fixes
+has since completed stages 0.1-0.3; no public API is stable yet. Security fixes
 target the latest `0.1.x` release and the development state on `main`.
 
 | Version | Supported |

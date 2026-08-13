@@ -13,7 +13,7 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** Stages 0.1-0.2 are complete; stage 0.3 has landed the DNS message model, zone/domain
+> **Status:** Stages 0.1-0.3 are complete. They deliver the DNS message model, zone/domain
 > matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
@@ -63,7 +63,7 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (stages 0.1-0.2, plus stage 0.3 under final verification):
+Implemented (stages 0.1-0.3):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -154,7 +154,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
-4. **Stage 0.3: Upstream transport backends and server listener** *(active: final verification)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
+4. **Stage 0.3: Upstream transport backends and server listener** *(completed)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
 5. **Stage 0.4: Fake IP pool** — deterministic synthetic address allocation, reverse lookup, LRU eviction, documented `tunnel-lattice` integration contract.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
