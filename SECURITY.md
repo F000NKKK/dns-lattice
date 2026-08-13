@@ -3,9 +3,9 @@
 ## Supported Versions
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
-publish `0.1.x` to reserve their names on crates.io and to land stage 0.1
-(core model); no public API is stable yet. Security fixes target the latest
-`0.1.x` release and the development state on `main`.
+published `0.1.x` to reserve their names on crates.io. Development on `main`
+has since landed stages 0.1-0.3; no public API is stable yet. Security fixes
+target the latest `0.1.x` release and the development state on `main`.
 
 | Version | Supported |
 | ------- | --------- |
@@ -32,19 +32,20 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-The latest published release, stage 0.1 of DNS Lattice's
-[architecture](ARCHITECTURE.md), provides a hand-rolled DNS message model
+The latest published release provides a hand-rolled DNS message model
 (`dns-lattice-model`'s `message`/`record` modules: header, question, and
 resource-record wire encode/decode, including name decompression on
 decode), a deterministic zone/domain matcher (`matcher`), and static
 split-DNS policy types (`policy`) — all pure, in-memory, no network I/O.
-`dns-lattice-core` provides the shared `Error`/`Result` pair.
+`dns-lattice-core` provides the shared `Error`/`Result` pair. The current
+development state on `main` additionally provides the resolver/cache,
+UDP/TCP/DoT/DoH/DoQ upstream transports, and matching inbound listeners.
 
 Reports involving a decode panic, an infinite loop or excessive resource
 consumption on malformed wire input (e.g. a crafted name-compression
 pointer loop), incorrect matcher precedence that could cause a query to be
-misrouted, or memory-safety issues anywhere in this crate are in scope. No
-network I/O, upstream transport, server listener, cache, or Fake IP exist
-yet (see [ROADMAP.md](ROADMAP.md)'s stage 0.1 non-goals); reports against
-functionality that does not exist yet are out of scope until the stage
-that implements it ships.
+misrouted, cache poisoning or unbounded resource consumption, transport or
+TLS/QUIC failures that violate the documented error boundary, malformed DoH
+request handling, and listener failures are in scope. Fake IP and dynamic
+routing hooks are not implemented yet; reports against those future
+capabilities are out of scope until the corresponding stage ships.

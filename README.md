@@ -13,12 +13,12 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** Stages 0.1-0.2 have landed the DNS message model,
-> zone/domain matcher, split-DNS policy types, and an in-process resolver
-> (routing plus a TTL/negative-caching answer cache) across three crates —
-> `dns-lattice-core`, `dns-lattice-model`, and the `dns-lattice` facade.
-> `0.1.0` versions were published to reserve the crate names on crates.io;
-> no public API is stable yet. See Current Status below.
+> **Status:** Stages 0.1-0.3 have landed the DNS message model, zone/domain
+> matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
+> upstream transports, failover, and matching inbound server listeners
+> across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
+> `dns-lattice` facade. `0.1.0` versions reserved the crate names on
+> crates.io; no public API is stable yet. See Current Status below.
 
 ## Overview
 

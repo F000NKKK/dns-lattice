@@ -1,10 +1,11 @@
 # DNS Lattice architecture
 
-Status: draft. Stage 0.1 (core model) has landed the `dns-lattice-core` and
-`dns-lattice-model` crates below; later stages implement the rest of the
-target shape incrementally. Update this document whenever an implementation
-slice changes a public contract; internal design-decision records are
-tracked separately and are not part of this document.
+Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
+`dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
+server listeners below; later stages implement the remaining target shape
+incrementally. Update this document whenever an implementation slice changes
+a public contract; internal design-decision records are tracked separately
+and are not part of this document.
 
 ## Scope and role in the Lattice ecosystem
 
@@ -105,7 +106,7 @@ it does not itself hold implementation modules beyond that re-export layer.
 dns-lattice-core     Error/Result shared across the workspace (implemented, stage 0.1)
 dns-lattice-model    DNS message types, zones/domain matchers, policy types (implemented, stage 0.1)
 dns-lattice-platform Cross-platform provider trait(s), once a stage needs OS-facing behavior (target, not yet implemented)
-dns-lattice          Facade crate: re-exports model/core (and later server/engine/upstream/fakeip/hooks) as the crate's stable public surface
+dns-lattice          Facade crate: re-exports model/core/engine/server/upstream (and later fakeip/hooks) as the crate's stable public surface
 ```
 
 Within `dns-lattice` itself, the target module layout for capabilities not
@@ -113,10 +114,10 @@ yet split into their own crate remains:
 
 ```text
 dns-lattice (facade crate)
-├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ
+├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ (implemented, stage 0.3)
 ├── engine         Resolver: query pipeline, cache, split-DNS routing (implemented, stage 0.2)
 ├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
-├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations
+├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations (implemented, stage 0.3)
 └── hooks          Dynamic routing hook trait(s) consumed by callers
 ```
 

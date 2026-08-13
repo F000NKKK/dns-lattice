@@ -1,10 +1,9 @@
 name: CI
 
-# Bootstrap-stage CI: this repository has no platform-specific backend
-# code yet, so this runs plain fmt/clippy/check/test/doc across the three
-# platforms the DNS Lattice ecosystem targets. Widen this workflow (coverage,
-# privileged jobs, per-crate matrices) once real platform code lands —
-# see net-lattice's .github/workflows/ci.yml for the pattern to grow into.
+# Cross-platform baseline CI: the all-feature matrix covers the implemented
+# upstream transports and inbound listeners on the three supported platforms.
+# Stage 0.6 still adds hardening work such as coverage, fuzz/property, and
+# dedicated privileged jobs; see net-lattice's workflow for that pattern.
 
 on:
   push:

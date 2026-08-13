@@ -10,8 +10,9 @@ Thank you for your interest in DNS Lattice.
 
 ## Project Status
 
-DNS Lattice is pre-release: repository workflow, policies, and packaging
-scaffolding are in place, and the DNS message/matcher/policy model (stage
-0.1) has landed, but no public API is stable yet and no version has been
-published. Questions about direction and design are welcome; usage support
-will start once a first release ships.
+DNS Lattice is pre-release: stages 0.1-0.3 have landed the DNS
+message/matcher/policy model, resolver/cache, upstream transports, failover,
+and inbound server listeners. The `0.1.0` releases reserved crate names on
+crates.io, but no public API is stable yet. Questions, bug reports, and
+design discussion are welcome; full usage support will start once a stable
+release ships.
