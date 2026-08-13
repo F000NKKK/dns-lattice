@@ -72,9 +72,11 @@ Status: done
   listeners behind the same Cargo features as their upstream counterparts.
   UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT listener done
   (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoQ listener done
-  (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener done
-  (`ServerBuilder::doh_addr`, `doh` Cargo feature), with ALPN-negotiated
-  HTTP/1.1 and HTTP/2 support. Final cross-platform verification passed.
+  (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listeners done:
+  TCP `ServerBuilder::doh_addr` supports ALPN-negotiated HTTP/1.1 and HTTP/2
+  over TLS 1.2/1.3, while QUIC `ServerBuilder::doh3_addr` supports HTTP/3
+  with ALPN `h3` and TLS 1.3 (`doh` Cargo feature). Final cross-platform
+  verification passed.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.

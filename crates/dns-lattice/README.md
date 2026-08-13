@@ -54,8 +54,8 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   reusing the same framing helpers as `DoqBackend`'s client side. Behind
   the default-off `doh` Cargo feature, `ServerBuilder::doh_addr(addr,
   tls_config, config)` adds an inbound DNS-over-HTTPS (RFC 8484) listener:
-  it TLS-accepts each connection like `dot_addr`, then serves the
-  ALPN-negotiated HTTP/1.1 or HTTP/2 protocol via `hyper_util`'s
+  it TLS-accepts each TCP connection like `dot_addr` over TLS 1.2 or 1.3,
+  then serves the ALPN-negotiated HTTP/1.1 or HTTP/2 protocol via `hyper_util`'s
   protocol-detecting server builder, parsing RFC 8484 GET (`?dns=`
   base64url query parameter) and POST (`application/dns-message` body)
   requests. A dual-protocol deployment configures `h2` and `http/1.1` in
@@ -67,7 +67,7 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   on a resolver error, matching every other transport's error policy.
   `ServerBuilder::doh3_addr(addr, quinn_config, config)` separately binds
   HTTP/3 over QUIC/UDP with ALPN `h3` and TLS 1.3. Keep `doh_addr` for
-  HTTP/1.1/HTTP/2 legacy TCP clients (including TLS 1.2).
+  HTTP/1.1/HTTP/2 legacy TCP clients on TLS 1.2 or 1.3.
 
 Fake IP and dynamic routing hook capabilities are planned for later
 stages; see `ROADMAP.md` in the repository root.
