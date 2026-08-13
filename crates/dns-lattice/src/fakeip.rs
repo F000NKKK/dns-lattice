@@ -140,6 +140,24 @@ impl FakeIpPool {
         self.ttl
     }
 
+    /// Returns whether this pool has an IPv4 allocation range.
+    ///
+    /// Crate-private resolver orchestration uses this before validating a
+    /// wire TTL so a selected but disabled family can return local NODATA
+    /// without an allocation or an unrelated TTL error.
+    pub(crate) fn ipv4_enabled(&self) -> bool {
+        self.ipv4.is_some()
+    }
+
+    /// Returns whether this pool has an IPv6 allocation range.
+    ///
+    /// Crate-private resolver orchestration uses this before validating a
+    /// wire TTL so a selected but disabled family can return local NODATA
+    /// without an allocation or an unrelated TTL error.
+    pub(crate) fn ipv6_enabled(&self) -> bool {
+        self.ipv6.is_some()
+    }
+
     /// Captures the pool's configured ranges, TTL, and currently live
     /// mappings.
     ///

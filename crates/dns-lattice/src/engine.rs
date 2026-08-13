@@ -255,6 +255,9 @@ fn fake_ip_answer(query: &Message, fake_ip: &FakeIpResolverConfig) -> Result<Opt
 
     match question.qtype {
         RecordType::A if fake_ip.policy.matches(&question.name) => {
+            if !fake_ip.pool.ipv4_enabled() {
+                return Ok(Some(local_response(query, Rcode::NoError)));
+            }
             fake_ip_ttl(fake_ip.pool.ttl())?;
             let mut answer = local_response(query, Rcode::NoError);
             match fake_ip.pool.allocate_ipv4_with_ttl(question.name.clone()) {
@@ -271,6 +274,9 @@ fn fake_ip_answer(query: &Message, fake_ip: &FakeIpResolverConfig) -> Result<Opt
             Ok(Some(answer))
         }
         RecordType::Aaaa if fake_ip.policy.matches(&question.name) => {
+            if !fake_ip.pool.ipv6_enabled() {
+                return Ok(Some(local_response(query, Rcode::NoError)));
+            }
             fake_ip_ttl(fake_ip.pool.ttl())?;
             let mut answer = local_response(query, Rcode::NoError);
             match fake_ip.pool.allocate_ipv6_with_ttl(question.name.clone()) {
@@ -1383,6 +1389,87 @@ mod tests {
             Err(Error::FakeIpTtlOutOfRange)
         );
         assert!(pool.snapshot().mappings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_fake_ip_families_return_nodata_even_with_unrepresentable_ttl() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(
+            FakeIpPool::builder()
+                .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2))
+                .ttl(Duration::from_secs(u64::from(u32::MAX) + 1))
+                .clock(PoolClock::new())
+                .build()
+                .unwrap(),
+        );
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("g"),
+            CountingBackend {
+                answer: answer_tagged(78),
+                calls: calls.clone(),
+            },
+        )
+        .fake_ip(pool.clone(), fake_ip_policy("example.test"))
+        .build();
+
+        let aaaa = resolver
+            .resolve(&query_for_type(
+                "www.example.test",
+                RecordType::Aaaa,
+                Class::In,
+                24,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(aaaa.header.rcode, Rcode::NoError);
+        assert!(aaaa.answers.is_empty());
+        assert!(pool.snapshot().mappings.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let ipv6_only_pool = Arc::new(
+            FakeIpPool::builder()
+                .ipv6_range(
+                    "2001:db8::1".parse().unwrap(),
+                    "2001:db8::2".parse().unwrap(),
+                )
+                .ttl(Duration::from_secs(u64::from(u32::MAX) + 1))
+                .clock(PoolClock::new())
+                .build()
+                .unwrap(),
+        );
+        let ipv6_only_resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("g"),
+            CountingBackend {
+                answer: answer_tagged(79),
+                calls: calls.clone(),
+            },
+        )
+        .fake_ip(ipv6_only_pool.clone(), fake_ip_policy("example.test"))
+        .build();
+
+        let a = ipv6_only_resolver
+            .resolve(&query_for_type(
+                "www.example.test",
+                RecordType::A,
+                Class::In,
+                25,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(a.header.rcode, Rcode::NoError);
+        assert!(a.answers.is_empty());
+        assert!(ipv6_only_pool.snapshot().mappings.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

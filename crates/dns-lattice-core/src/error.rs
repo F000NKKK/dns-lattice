@@ -79,8 +79,8 @@ pub enum Error {
     /// A Fake IP pool mapping lifetime was zero or did not contain a whole
     /// positive number of seconds.
     InvalidFakeIpTtl,
-    /// A valid Fake IP TTL could not be represented relative to the pool's
-    /// monotonic clock instant.
+    /// A valid Fake IP TTL could not be represented as either a pool
+    /// monotonic-clock expiry instant or a 32-bit DNS record TTL.
     FakeIpTtlOutOfRange,
     /// A caller-provided Fake IP pool snapshot was structurally invalid or
     /// incompatible with its declared pool configuration.
@@ -131,7 +131,7 @@ impl fmt::Display for Error {
             Error::FakeIpTtlOutOfRange => {
                 write!(
                     f,
-                    "fake ip ttl cannot be represented by the monotonic clock"
+                    "fake ip ttl cannot be represented by the pool clock or dns wire ttl"
                 )
             }
             Error::InvalidFakeIpSnapshot => write!(f, "invalid fake ip pool snapshot"),
@@ -210,7 +210,7 @@ mod tests {
             ),
             (
                 Error::FakeIpTtlOutOfRange,
-                "fake ip ttl cannot be represented by the monotonic clock",
+                "fake ip ttl cannot be represented by the pool clock or dns wire ttl",
             ),
             (
                 Error::InvalidFakeIpSnapshot,
