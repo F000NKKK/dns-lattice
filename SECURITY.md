@@ -46,6 +46,8 @@ consumption on malformed wire input (e.g. a crafted name-compression
 pointer loop), incorrect matcher precedence that could cause a query to be
 misrouted, cache poisoning or unbounded resource consumption, transport or
 TLS/QUIC failures that violate the documented error boundary, malformed DoH
-request handling, and listener failures are in scope. Fake IP and dynamic
-routing hooks are not implemented yet; reports against those future
-capabilities are out of scope until the corresponding stage ships.
+request handling, and listener failures are in scope. The development state
+on `main` also contains a data-only Fake IP pool; reports of incorrect
+allocation, reverse lookup, or unbounded resource consumption in that pool
+are in scope. Dynamic routing hooks are not implemented yet and remain out
+of scope until their corresponding stage ships.

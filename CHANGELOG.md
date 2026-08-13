@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- New public `dns_lattice::fakeip` module: `FakeIpPool` configures inclusive
+  IPv4 and/or IPv6 ranges, deterministically allocates or reuses one
+  synthetic address per DNS name, and reverse-resolves active mappings.
+  Each family uses a family-salted FNV-1a candidate, circular probing, and
+  independent LRU eviction when full. It is a synchronous, concurrent,
+  data-only pool: DNS answer/PTR synthesis, TTL expiry, persistence,
+  resolver/server integration, and `tunnel-lattice` integration remain out
+  of scope.
+- New typed `dns_lattice_core::Error` variants for invalid/unconfigured Fake
+  IP pool configuration and allocation in a disabled family.
+
+## [0.3.0] - 2026-08-13
+
 - The default-off `doh` feature now enables ALPN-negotiated HTTP/1.1 and
   HTTP/2 over TCP/TLS 1.2 or 1.3 for both `DohBackend` and
   `ServerBuilder::doh_addr`. GET and POST are covered end-to-end on both

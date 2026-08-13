@@ -9,6 +9,14 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   `DomainMatcher`), and split-DNS policy types (`SplitDnsPolicy`), re-exported
   through this facade crate.
 - `dns-lattice-core`'s `Error`/`Result` pair.
+- A synchronous, concurrent `fakeip` module (`FakeIpPool`,
+  `FakeIpPoolBuilder`): configure one or both inclusive synthetic IPv4/IPv6
+  ranges, allocate or reuse one address per DNS name, and reverse-resolve an
+  address to its currently assigned name. Allocation uses a family-salted
+  deterministic hash and circular probing; a full family evicts its LRU
+  mapping. The pool is data-only: it performs no DNS answer/PTR rewriting,
+  TTL expiry, persistence, socket I/O, resolver/server integration, or
+  `tunnel-lattice` integration.
 - An in-process resolver entry point (`Resolver`, `ResolverBuilder`): route
   one query through a `SplitDnsPolicy` to an upstream group, then try that
   group's registered backends in registration order — a backend failing
@@ -69,8 +77,8 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   HTTP/3 over QUIC/UDP with ALPN `h3` and TLS 1.3. Keep `doh_addr` for
   HTTP/1.1/HTTP/2 legacy TCP clients on TLS 1.2 or 1.3.
 
-Fake IP and dynamic routing hook capabilities are planned for later
-stages; see `ROADMAP.md` in the repository root.
+Dynamic routing hooks are planned for a later stage; see `ROADMAP.md` in the
+repository root.
 
 ## Feature/platform constraints
 
@@ -116,6 +124,19 @@ let name = Name::from_ascii("host.corp.internal").unwrap();
 assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 ```
 
+```rust
+use std::net::Ipv4Addr;
+
+use dns_lattice::{FakeIpPool, Name};
+
+let pool = FakeIpPool::builder()
+    .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
+    .build()?;
+let address = pool.allocate_ipv4(Name::from_ascii("service.internal")?)?;
+assert_eq!(pool.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?));
+# Ok::<(), dns_lattice::Error>(())
+```
+
 ## Status
 
 Pre-0.1 stage: this crate has no stable API yet. Stage 0.1 (core model)
@@ -128,6 +149,7 @@ the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
 across a group's registered backends, and the `server` module's
 embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`) plus its
 opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
-(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Fake IP and dynamic
-routing hooks are not implemented yet (stage 0.4/0.5). Types may change
-without notice until the first stable release.
+(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Stage 0.4 added the
+standalone Fake IP pool; resolver/server integration and dynamic routing
+hooks are not implemented yet. Types may change without notice until the
+first stable release.

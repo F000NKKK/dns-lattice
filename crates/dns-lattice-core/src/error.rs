@@ -68,6 +68,14 @@ pub enum Error {
     /// `PartialEq`-sensitive to the underlying TLS library's exact error
     /// type, matching `Transport`'s existing precedent.
     Tls(String),
+    /// A Fake IP pool range was empty because its start address was greater
+    /// than its end address.
+    InvalidFakeIpRange,
+    /// A Fake IP pool was built without an IPv4 or IPv6 range.
+    FakeIpPoolUnconfigured,
+    /// An operation requested an address family not configured on a Fake IP
+    /// pool.
+    FakeIpFamilyDisabled,
 }
 
 impl fmt::Display for Error {
@@ -103,6 +111,11 @@ impl fmt::Display for Error {
             Error::Timeout => write!(f, "upstream backend timed out"),
             Error::Transport(message) => write!(f, "upstream transport error: {message}"),
             Error::Tls(message) => write!(f, "upstream tls error: {message}"),
+            Error::InvalidFakeIpRange => write!(f, "fake ip range start exceeds its end"),
+            Error::FakeIpPoolUnconfigured => {
+                write!(f, "fake ip pool requires an ipv4 or ipv6 range")
+            }
+            Error::FakeIpFamilyDisabled => write!(f, "fake ip address family is not configured"),
         }
     }
 }
@@ -159,6 +172,18 @@ mod tests {
             (
                 Error::Tls("certificate expired".to_string()),
                 "upstream tls error: certificate expired",
+            ),
+            (
+                Error::InvalidFakeIpRange,
+                "fake ip range start exceeds its end",
+            ),
+            (
+                Error::FakeIpPoolUnconfigured,
+                "fake ip pool requires an ipv4 or ipv6 range",
+            ),
+            (
+                Error::FakeIpFamilyDisabled,
+                "fake ip address family is not configured",
             ),
         ];
         for (error, expected) in cases {

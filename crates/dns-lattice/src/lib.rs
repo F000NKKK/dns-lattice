@@ -31,11 +31,15 @@
 //! features, and the [`server`] module's [`Server`]/[`ServerBuilder`]
 //! inbound UDP/TCP baseline plus DoT/DoH/DoQ listeners, completing the
 //! embeddable-DNS-server-engine goal for this stage (ADR-0015; DoT/DoH/DoQ
-//! per ADR-0016). Later follow-up work adds
-//! `fakeip` and `hooks` behind this same facade. See `ARCHITECTURE.md` for
-//! the full module layout.
+//! per ADR-0016). Stage 0.4 adds the [`fakeip`] module's [`FakeIpPool`]: a
+//! pure, concurrent data store that allocates and reverse-resolves synthetic
+//! IPv4/IPv6 addresses. It deliberately does not integrate with
+//! [`Resolver`], [`Server`], DNS message rewriting, or a tunnel. Later work
+//! adds `hooks` behind this same facade. See `ARCHITECTURE.md` for the full
+//! module layout.
 
 pub mod engine;
+pub mod fakeip;
 pub mod server;
 pub mod upstream;
 
@@ -45,6 +49,7 @@ pub use dns_lattice_model::{
     RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
 };
 pub use engine::{Resolver, ResolverBuilder};
+pub use fakeip::{FakeIpPool, FakeIpPoolBuilder};
 pub use server::{Server, ServerBuilder};
 #[cfg(feature = "doh")]
 pub use upstream::{DohBackend, DohBackendConfig, DohMethod};

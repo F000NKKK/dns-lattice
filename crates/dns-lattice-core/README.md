@@ -7,7 +7,8 @@ system dependency.
 ## What it provides
 
 - `Error`, one enum covering every DNS Lattice failure mode (message
-  decode/encode, domain pattern parsing);
+  decode/encode, domain pattern parsing, upstream transport, and Fake IP
+  pool configuration);
 - `Result<T>`, the `Result<T, Error>` alias used across the workspace.
 
 Most applications should use these types through the `dns-lattice` crate
