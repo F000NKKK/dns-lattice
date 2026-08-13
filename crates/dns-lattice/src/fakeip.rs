@@ -250,14 +250,22 @@ impl FakeIpPool {
     /// Returns [`Error::FakeIpFamilyDisabled`] if no IPv4 range was
     /// configured. Reusing an existing mapping refreshes its LRU recency.
     pub fn allocate_ipv4(&self, name: Name) -> Result<Ipv4Addr> {
+        self.allocate_ipv4_with_ttl(name)
+            .map(|(address, _)| address)
+    }
+
+    /// Allocates or reuses this name's synthetic IPv4 address and returns its
+    /// remaining mapping lifetime atomically with the address.
+    ///
+    /// Reuse changes only LRU recency; it never extends the mapping expiry.
+    /// The lifetime can be used as a DNS record TTL without allowing the
+    /// record to outlive the mapping.
+    pub fn allocate_ipv4_with_ttl(&self, name: Name) -> Result<(Ipv4Addr, Duration)> {
         let state = self.ipv4.as_ref().ok_or(Error::FakeIpFamilyDisabled)?;
+        let mut state = state.lock().expect("fake ip ipv4 mutex poisoned");
         let now = self.clock.now();
-        Ok(Ipv4Addr::from(
-            state
-                .lock()
-                .expect("fake ip ipv4 mutex poisoned")
-                .allocate(name, IPV4_HASH_SALT, now, self.ttl)?,
-        ))
+        let (address, ttl) = state.allocate_with_ttl(name, IPV4_HASH_SALT, now, self.ttl)?;
+        Ok((Ipv4Addr::from(address), ttl))
     }
 
     /// Allocates or reuses this name's synthetic IPv6 address.
@@ -265,14 +273,22 @@ impl FakeIpPool {
     /// Returns [`Error::FakeIpFamilyDisabled`] if no IPv6 range was
     /// configured. Reusing an existing mapping refreshes its LRU recency.
     pub fn allocate_ipv6(&self, name: Name) -> Result<Ipv6Addr> {
+        self.allocate_ipv6_with_ttl(name)
+            .map(|(address, _)| address)
+    }
+
+    /// Allocates or reuses this name's synthetic IPv6 address and returns its
+    /// remaining mapping lifetime atomically with the address.
+    ///
+    /// Reuse changes only LRU recency; it never extends the mapping expiry.
+    /// The lifetime can be used as a DNS record TTL without allowing the
+    /// record to outlive the mapping.
+    pub fn allocate_ipv6_with_ttl(&self, name: Name) -> Result<(Ipv6Addr, Duration)> {
         let state = self.ipv6.as_ref().ok_or(Error::FakeIpFamilyDisabled)?;
+        let mut state = state.lock().expect("fake ip ipv6 mutex poisoned");
         let now = self.clock.now();
-        Ok(Ipv6Addr::from(
-            state
-                .lock()
-                .expect("fake ip ipv6 mutex poisoned")
-                .allocate(name, IPV6_HASH_SALT, now, self.ttl)?,
-        ))
+        let (address, ttl) = state.allocate_with_ttl(name, IPV6_HASH_SALT, now, self.ttl)?;
+        Ok((Ipv6Addr::from(address), ttl))
     }
 
     /// Returns the name currently mapped to `address` in the IPv4 pool.
@@ -281,12 +297,23 @@ impl FakeIpPool {
     /// unknown addresses all return `None`. A successful lookup refreshes
     /// the mapping's LRU recency.
     pub fn lookup_ipv4(&self, address: Ipv4Addr) -> Option<Name> {
-        let now = self.clock.now();
-        self.ipv4
+        self.lookup_ipv4_with_ttl(address).map(|(name, _)| name)
+    }
+
+    /// Returns the name and remaining mapping lifetime for `address` in the
+    /// IPv4 pool atomically.
+    ///
+    /// Disabled families, addresses outside the configured range, and
+    /// unknown addresses all return `None`. A successful lookup refreshes
+    /// only LRU recency, never mapping expiry.
+    pub fn lookup_ipv4_with_ttl(&self, address: Ipv4Addr) -> Option<(Name, Duration)> {
+        let mut state = self
+            .ipv4
             .as_ref()?
             .lock()
-            .expect("fake ip ipv4 mutex poisoned")
-            .lookup(u32::from(address), now)
+            .expect("fake ip ipv4 mutex poisoned");
+        let now = self.clock.now();
+        state.lookup_with_ttl(u32::from(address), now)
     }
 
     /// Returns the name currently mapped to `address` in the IPv6 pool.
@@ -295,12 +322,23 @@ impl FakeIpPool {
     /// unknown addresses all return `None`. A successful lookup refreshes
     /// the mapping's LRU recency.
     pub fn lookup_ipv6(&self, address: Ipv6Addr) -> Option<Name> {
-        let now = self.clock.now();
-        self.ipv6
+        self.lookup_ipv6_with_ttl(address).map(|(name, _)| name)
+    }
+
+    /// Returns the name and remaining mapping lifetime for `address` in the
+    /// IPv6 pool atomically.
+    ///
+    /// Disabled families, addresses outside the configured range, and
+    /// unknown addresses all return `None`. A successful lookup refreshes
+    /// only LRU recency, never mapping expiry.
+    pub fn lookup_ipv6_with_ttl(&self, address: Ipv6Addr) -> Option<(Name, Duration)> {
+        let mut state = self
+            .ipv6
             .as_ref()?
             .lock()
-            .expect("fake ip ipv6 mutex poisoned")
-            .lookup(u128::from(address), now)
+            .expect("fake ip ipv6 mutex poisoned");
+        let now = self.clock.now();
+        state.lookup_with_ttl(u128::from(address), now)
     }
 
     /// Returns whether `address` lies in this pool's configured IPv4 range.
@@ -381,7 +419,7 @@ impl FakeIpPoolBuilder {
     }
 
     #[cfg(test)]
-    fn clock(mut self, clock: impl Clock + Send + Sync + 'static) -> Self {
+    pub(crate) fn clock(mut self, clock: impl Clock + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
         self
     }
@@ -423,7 +461,7 @@ struct Mapping<T> {
     expires_at: Instant,
 }
 
-trait Clock {
+pub(crate) trait Clock {
     fn now(&self) -> Instant;
 }
 
@@ -496,14 +534,26 @@ impl<T: Address> FamilyState<T> {
         })
     }
 
-    fn allocate(&mut self, name: Name, salt: u64, now: Instant, ttl: Duration) -> Result<T> {
+    fn allocate_with_ttl(
+        &mut self,
+        name: Name,
+        salt: u64,
+        now: Instant,
+        ttl: Duration,
+    ) -> Result<(T, Duration)> {
         let expires_at = now.checked_add(ttl).ok_or(Error::FakeIpTtlOutOfRange)?;
         self.purge_expired(now);
         if self.forward.contains_key(&name) {
             let recency = self.touch();
             let mapping = self.forward.get_mut(&name).expect("mapping checked above");
             mapping.recency = recency;
-            return Ok(mapping.address);
+            return Ok((
+                mapping.address,
+                mapping
+                    .expires_at
+                    .checked_duration_since(now)
+                    .expect("expired mappings were purged"),
+            ));
         }
         if self
             .capacity()
@@ -532,18 +582,25 @@ impl<T: Address> FamilyState<T> {
                 expires_at,
             },
         );
-        Ok(address)
+        Ok((address, ttl))
     }
 
-    fn lookup(&mut self, address: T, now: Instant) -> Option<Name> {
+    fn lookup_with_ttl(&mut self, address: T, now: Instant) -> Option<(Name, Duration)> {
         self.purge_expired(now);
         if !self.contains(address) {
             return None;
         }
         let name = self.reverse.get(&address)?.clone();
         let recency = self.touch();
-        self.forward.get_mut(&name)?.recency = recency;
-        Some(name)
+        let mapping = self.forward.get_mut(&name)?;
+        mapping.recency = recency;
+        Some((
+            name,
+            mapping
+                .expires_at
+                .checked_duration_since(now)
+                .expect("expired mappings were purged"),
+        ))
     }
 
     fn candidate(&self, hash: u64) -> T {
