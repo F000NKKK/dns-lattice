@@ -241,7 +241,7 @@ impl Resolver {
 /// Returns a locally synthesized Fake IP response when `query` is handled by
 /// `fake_ip`, or `None` when the ordinary resolver pipeline must handle it.
 ///
-/// Only IN A, AAAA, and canonical reverse PTR questions can be handled. A
+/// Only IN A, IN AAAA, and canonical IN reverse PTR questions can be handled. A
 /// synthesized response intentionally bypasses the resolver cache and every
 /// upstream backend: its lifetime is the pool mapping lifetime and the pool
 /// is the authority for its reverse range.
@@ -476,10 +476,12 @@ impl ResolverBuilder {
     ///
     /// Matching IN A/AAAA questions allocate or reuse an address in `pool`
     /// and return a local response without consulting the cache or an
-    /// upstream. Canonical IN PTR questions inside one of the pool's ranges
-    /// are likewise handled locally: live mappings return PTR, and an
-    /// unmapped address returns NXDOMAIN. All other questions follow normal
-    /// split-DNS resolution.
+    /// upstream. If the selected address family is disabled in `pool`, the
+    /// resolver instead returns a local NOERROR empty answer (NODATA), still
+    /// without a cache or upstream lookup. Canonical IN PTR questions inside
+    /// one of the pool's ranges are likewise handled locally: live mappings
+    /// return PTR, and an unmapped address returns NXDOMAIN. All other
+    /// questions follow normal split-DNS resolution.
     pub fn fake_ip(mut self, pool: Arc<FakeIpPool>, policy: FakeIpPolicy) -> Self {
         self.fake_ip = Some(FakeIpResolverConfig { pool, policy });
         self
