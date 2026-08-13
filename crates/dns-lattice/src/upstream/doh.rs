@@ -227,9 +227,10 @@ impl UpstreamBackend for Doh3Backend {
             ));
         }
 
-        let (_driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
             .await
             .map_err(|err| Error::Transport(err.to_string()))?;
+        let driver_task = tokio::spawn(async move { driver.wait_idle().await });
         let request = DohBackend {
             config: DohBackendConfig {
                 uri: self.config.uri.clone(),
@@ -277,6 +278,7 @@ impl UpstreamBackend for Doh3Backend {
             body.extend_from_slice(chunk.chunk());
         }
         endpoint.close(0u32.into(), b"request complete");
+        driver_task.abort();
         Message::decode(&body)
     }
 }
@@ -323,6 +325,8 @@ mod tests {
     use hyper::body::Incoming;
     use hyper::{Response, StatusCode};
     use hyper_util::rt::TokioIo;
+    use quinn::ServerConfig as QuinnServerConfig;
+    use quinn::crypto::rustls::QuicServerConfig;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -380,6 +384,57 @@ mod tests {
             .with_no_client_auth();
 
         (server_config, client_config)
+    }
+
+    fn http3_fixture() -> (QuinnServerConfig, ClientConfig) {
+        let (mut server_config, client_config) = self_signed_fixture();
+        server_config.alpn_protocols = vec![b"h3".to_vec()];
+        let crypto = QuicServerConfig::try_from(Arc::new(server_config)).unwrap();
+        (
+            QuinnServerConfig::with_crypto(Arc::new(crypto)),
+            client_config,
+        )
+    }
+
+    async fn serve_one_doh3_response(
+        endpoint: quinn::Endpoint,
+        response: Message,
+        expected_method: hyper::Method,
+    ) {
+        let incoming = endpoint.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        let data = connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(b"h3".as_slice()));
+        let mut h3_connection = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+            .await
+            .unwrap();
+        let resolver = h3_connection.accept().await.unwrap().unwrap();
+        let (request, mut stream) = resolver.resolve_request().await.unwrap();
+        assert_eq!(request.method(), expected_method);
+        assert_eq!(request.uri().path(), "/dns-query");
+        while stream.recv_data().await.unwrap().is_some() {}
+        stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header("content-type", "application/dns-message")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream
+            .send_data(Bytes::from(response.encode().unwrap()))
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        // Keep the H3 connection alive until the client finishes reading;
+        // dropping it immediately sends H3_NO_ERROR before the response can
+        // deterministically reach the loopback client.
+        let _ = h3_connection.accept().await;
     }
 
     /// Minimal, single-request, loopback-only HTTP/1.1-over-TLS responder:
@@ -584,6 +639,52 @@ mod tests {
             timeout: Duration::from_secs(2),
         });
 
+        let answer = backend.resolve(&query_for("example.com")).await.unwrap();
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_resolves_with_get_over_http3() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doh3_response(
+            endpoint,
+            answer_for("example.com", 0),
+            hyper::Method::GET,
+        ));
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+        let answer = backend.resolve(&query_for("example.com")).await.unwrap();
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_resolves_with_post_over_http3() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doh3_response(
+            endpoint,
+            answer_for("example.com", 0),
+            hyper::Method::POST,
+        ));
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Post,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
         let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
         responder.await.unwrap();

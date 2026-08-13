@@ -77,6 +77,7 @@ Implemented (stages 0.1-0.2, plus stage 0.3 under final verification):
 - Inbound DNS-over-TLS (DoT, RFC 7858) listener behind the `dot` Cargo feature: `ServerBuilder::dot_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor` and reuses the same length-prefixed read/write loop as the TCP listener
 - Inbound DNS-over-QUIC (DoQ, RFC 9250) listener behind the `doq` Cargo feature: `ServerBuilder::doq_addr` accepts a `quinn` QUIC endpoint (ALPN `doq`) and answers one query per bidirectional stream, reusing the same framing helpers as the `DoqBackend` upstream
 - Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s protocol-detecting server builder. A dual-protocol deployment configures `h2` and `http/1.1` ALPN identifiers; GET (`?dns=` base64url) and POST (`application/dns-message` body) work on either protocol.
+- HTTP/3 DoH is additive, not a replacement for legacy TCP: `Doh3Backend` and `ServerBuilder::doh3_addr` use QUIC/UDP with ALPN `h3` and TLS 1.3. Keep `DohBackend`/`doh_addr` bound over TCP for HTTP/1.1 and HTTP/2 clients, including TLS 1.2 deployments.
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 

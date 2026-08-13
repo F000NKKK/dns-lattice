@@ -1545,6 +1545,8 @@ mod tests {
         use http_body_util::{BodyExt, Full};
         use hyper::body::Bytes;
         use hyper_util::rt::{TokioExecutor, TokioIo};
+        use quinn::ClientConfig as QuinnClientConfig;
+        use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
         use rcgen::{CertifiedKey, generate_simple_self_signed};
         use tokio_rustls::TlsConnector;
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -1576,6 +1578,51 @@ mod tests {
 
             let server_name = ServerName::try_from("localhost").unwrap();
             (server_config, client_config, server_name)
+        }
+
+        fn http3_server_config(server_config: ServerConfig) -> quinn::ServerConfig {
+            let crypto = QuicServerConfig::try_from(Arc::new(server_config)).unwrap();
+            quinn::ServerConfig::with_crypto(Arc::new(crypto))
+        }
+
+        async fn send_http3_request(
+            client_config: ClientConfig,
+            addr: SocketAddr,
+            request: http::Request<()>,
+            body: Bytes,
+        ) -> (u16, Vec<u8>) {
+            let mut client_config = client_config;
+            client_config.alpn_protocols = vec![b"h3".to_vec()];
+            let crypto = QuicClientConfig::try_from(Arc::new(client_config)).unwrap();
+            let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+            let connection = endpoint
+                .connect_with(QuinnClientConfig::new(Arc::new(crypto)), addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            let data = connection
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .unwrap();
+            assert_eq!(data.protocol.as_deref(), Some(b"h3".as_slice()));
+            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let driver_task = tokio::spawn(async move { driver.wait_idle().await });
+            let mut stream = sender.send_request(request).await.unwrap();
+            if !body.is_empty() {
+                stream.send_data(body).await.unwrap();
+            }
+            stream.finish().await.unwrap();
+            let response = stream.recv_response().await.unwrap();
+            let status = response.status().as_u16();
+            let mut response_body = Vec::new();
+            while let Some(chunk) = stream.recv_data().await.unwrap() {
+                response_body.extend_from_slice(chunk.chunk());
+            }
+            endpoint.close(0u32.into(), b"request complete");
+            driver_task.abort();
+            (status, response_body)
         }
 
         fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1869,6 +1916,95 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(Message::decode(&body).unwrap().header.id, 45);
 
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh3_get_round_trip_success() {
+            let (mut server_config, client_config, _server_name) = self_signed_fixture();
+            server_config.alpn_protocols = vec![b"h3".to_vec()];
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 36),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh3_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    http3_server_config(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let addr = server.doh3_endpoints[0].0.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            let query = query_for("example.com", 46);
+            let encoded = URL_SAFE_NO_PAD.encode(query.encode().unwrap());
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(format!("https://localhost/dns-query?dns={encoded}"))
+                .body(())
+                .unwrap();
+            let (status, body) =
+                send_http3_request(client_config, addr, request, Bytes::new()).await;
+            assert_eq!(status, 200);
+            assert_eq!(Message::decode(&body).unwrap().header.id, 46);
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh3_post_round_trip_success() {
+            let (mut server_config, client_config, _server_name) = self_signed_fixture();
+            server_config.alpn_protocols = vec![b"h3".to_vec()];
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 37),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh3_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    http3_server_config(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let addr = server.doh3_endpoints[0].0.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            let query = query_for("example.com", 47);
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://localhost/dns-query")
+                .header("content-type", "application/dns-message")
+                .body(())
+                .unwrap();
+            let (status, body) = send_http3_request(
+                client_config,
+                addr,
+                request,
+                Bytes::from(query.encode().unwrap()),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(Message::decode(&body).unwrap().header.id, 47);
             shutdown_tx.send(()).unwrap();
             serve_task.await.unwrap().unwrap();
         }

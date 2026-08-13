@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 for both `DohBackend` and `ServerBuilder::doh_addr`. GET and POST
   are covered end-to-end on both HTTP versions; a dual-protocol inbound
   deployment supplies `h2` and `http/1.1` in its `rustls::ServerConfig`.
+- `Doh3Backend`/`Doh3BackendConfig` and `ServerBuilder::doh3_addr` add
+  RFC 9114 HTTP/3 over QUIC/UDP with ALPN `h3`. HTTP/3 uses TLS 1.3 as
+  required by QUIC; existing TCP HTTP/1.1/HTTP/2 DoH APIs remain available
+  for TLS 1.2 legacy compatibility.
 
 - DoT now classifies an underlying TCP connection close before a TLS session
   exists as `Error::Transport`; only errors reported by `rustls` during TLS

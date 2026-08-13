@@ -79,6 +79,7 @@ DNS Lattice — один из крейтов более широкого сем�
 - Входящий слушатель DNS-over-TLS (DoT, RFC 7858) за Cargo-фичей `dot`: `ServerBuilder::dot_addr` принимает TLS-сессию на каждом соединении через `tokio_rustls::TlsAcceptor` и переиспользует тот же цикл чтения/записи с префиксом длины, что и слушатель TCP
 - Входящий слушатель DNS-over-QUIC (DoQ, RFC 9250) за Cargo-фичей `doq`: `ServerBuilder::doq_addr` принимает QUIC-эндпойнт `quinn` (ALPN `doq`) и отвечает на каждый запрос через отдельный двунаправленный поток, переиспользуя те же хелперы фрейминга, что и апстрим `DoqBackend`
 - Входящий слушатель DNS-over-HTTPS (DoH, RFC 8484) за Cargo-фичей `doh`: `ServerBuilder::doh_addr` принимает TLS-сессию на каждом соединении через `tokio_rustls::TlsAcceptor`, затем обслуживает согласованные через ALPN HTTP/1.1 или HTTP/2 сервер-билдером `hyper_util`. Для двух протоколов конфигурация содержит ALPN-идентификаторы `h2` и `http/1.1`; GET (`?dns=` в base64url) и POST (тело `application/dns-message`) работают в обоих протоколах.
+- DoH HTTP/3 дополняет, а не заменяет legacy TCP: `Doh3Backend` и `ServerBuilder::doh3_addr` используют QUIC/UDP с ALPN `h3` и TLS 1.3. Для HTTP/1.1/HTTP/2-клиентов, включая TLS 1.2, остаются TCP `DohBackend`/`doh_addr`.
 
 Запланировано (см. [ROADMAP.ru.md](ROADMAP.ru.md)):
 

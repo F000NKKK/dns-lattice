@@ -65,6 +65,9 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   gets HTTP 400, and everything else is answered HTTP 200 with an
   `application/dns-message` body — including a synthesized `Rcode::ServFail`
   on a resolver error, matching every other transport's error policy.
+  `ServerBuilder::doh3_addr(addr, quinn_config, config)` separately binds
+  HTTP/3 over QUIC/UDP with ALPN `h3` and TLS 1.3. Keep `doh_addr` for
+  HTTP/1.1/HTTP/2 legacy TCP clients (including TLS 1.2).
 
 Fake IP and dynamic routing hook capabilities are planned for later
 stages; see `ROADMAP.md` in the repository root.
