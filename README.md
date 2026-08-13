@@ -63,17 +63,18 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (stage 0.1-0.2):
+Implemented (stage 0.1-0.2, plus stage 0.3 Track A):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
 - Zone/domain matcher with deterministic exact/suffix/wildcard precedence
 - Static split-DNS policy types (`SplitDnsPolicy`) built on the matcher
-- In-process `Resolver`: construct from a `SplitDnsPolicy`, route one query to an upstream group, and resolve it through a registered backend, with an in-memory TTL-respecting answer cache including RFC 2308 negative caching
+- In-process, async `Resolver`: construct from a `SplitDnsPolicy`, route one query to an upstream group, and resolve it through a registered backend, with an in-memory TTL-respecting answer cache including RFC 2308 negative caching
+- Public, async `upstream` module (`UpstreamBackend` trait, `UdpBackend`, `TcpBackend`): baseline UDP and TCP upstream transports over `tokio`, no EDNS0/OPT yet (UDP falls back to TCP on a truncated response)
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
-- UDP/TCP/DoT/DoH/DoQ upstream backends and the inbound server listener (stage 0.3)
+- DoT/DoH/DoQ upstream backends behind Cargo features, upstream failover, and the inbound server listener (rest of stage 0.3)
 - Fake IP address pool with reverse lookup (stage 0.4)
 - Dynamic routing hooks for caller-driven policy (stage 0.5)
 - Cross-platform CI matrix, fuzz/property tests, observability sink (stage 0.6)
@@ -87,18 +88,20 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 
 ## Current Status
 
-Stages 0.1-0.2 implementation of the [architecture](ARCHITECTURE.md)'s
+Stages 0.1-0.2 plus stage 0.3 Track A of the [architecture](ARCHITECTURE.md)'s
 module layout is covered by deterministic unit/doc tests, `clippy -D
 warnings`, and verified `cargo package` listings for all three crates:
 
 - `dns-lattice-core`'s `Error`/`Result` pair, hand-rolled `Display`/`std::error::Error`
 - `dns-lattice-model`'s `message` (`Message`, `Header`, `Question`, `ResourceRecord`), `record` (`RecordType`, `Class`, `RData`), `matcher` (`DomainPattern`, `DomainMatcher<T>`), and `policy` (`SplitDnsPolicy`) modules
-- the `dns-lattice` facade's `engine` module (`Resolver`, `ResolverBuilder`): in-process construct/resolve, static split-DNS routing, and an in-memory TTL-respecting/negative-caching answer cache — no real network transport yet
+- the `dns-lattice` facade's `engine` module (`Resolver`, `ResolverBuilder`): in-process, async construct/resolve, static split-DNS routing, and an in-memory TTL-respecting/negative-caching answer cache
+- the `dns-lattice` facade's `upstream` module (`UpstreamBackend`, `UdpBackend`, `TcpBackend`): baseline UDP/TCP upstream transports over `tokio`, no EDNS0/OPT yet
 
 This gives a complete, tested DNS message model, a deterministic
-zone/domain matcher, and an in-process resolver usable standalone today,
-ahead of any real transport or server code. No real network I/O or Fake IP
-exist yet — see Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
+zone/domain matcher, and an in-process resolver with real UDP/TCP upstream
+transport usable standalone today, ahead of DoT/DoH/DoQ, upstream
+failover, and the inbound server listener. No Fake IP exists yet — see
+Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 
 | Capability | Status |
 |---|:---:|
@@ -107,7 +110,8 @@ exist yet — see Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 | Zone/domain matcher (exact/suffix/wildcard) | ✅ |
 | Static split-DNS policy types | ✅ |
 | Resolver engine / answer cache | ✅ |
-| UDP/TCP/DoT/DoH/DoQ upstream + server listener | planned (0.3) |
+| UDP/TCP upstream backends | ✅ |
+| DoT/DoH/DoQ upstream + failover + server listener | planned (0.3) |
 | Fake IP pool | planned (0.4) |
 | Dynamic routing hooks | planned (0.5) |
 
