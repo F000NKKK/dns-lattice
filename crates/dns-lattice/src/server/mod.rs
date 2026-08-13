@@ -2010,6 +2010,131 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn doh3_malformed_get_query_param_is_http_400() {
+            let (mut server_config, client_config, _server_name) = self_signed_fixture();
+            server_config.alpn_protocols = vec![b"h3".to_vec()];
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 38),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh3_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    http3_server_config(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let addr = server.doh3_endpoints[0].0.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://localhost/dns-query?dns=@@@not-base64@@@")
+                .body(())
+                .unwrap();
+            let (status, body) =
+                send_http3_request(client_config, addr, request, Bytes::new()).await;
+            assert_eq!(status, 400);
+            assert!(body.is_empty());
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh3_wrong_path_is_http_404() {
+            let (mut server_config, client_config, _server_name) = self_signed_fixture();
+            server_config.alpn_protocols = vec![b"h3".to_vec()];
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 39),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh3_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    http3_server_config(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let addr = server.doh3_endpoints[0].0.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            let query = query_for("example.com", 48);
+            let encoded = URL_SAFE_NO_PAD.encode(query.encode().unwrap());
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(format!("https://localhost/wrong-path?dns={encoded}"))
+                .body(())
+                .unwrap();
+            let (status, body) =
+                send_http3_request(client_config, addr, request, Bytes::new()).await;
+            assert_eq!(status, 404);
+            assert!(body.is_empty());
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh3_servfail_is_dns_response_not_http_error() {
+            let (mut server_config, client_config, _server_name) = self_signed_fixture();
+            server_config.alpn_protocols = vec![b"h3".to_vec()];
+            let server = ServerBuilder::new(resolver_with(FailingBackend))
+                .doh3_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    http3_server_config(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let addr = server.doh3_endpoints[0].0.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            let query = query_for("example.com", 49);
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://localhost/dns-query")
+                .body(())
+                .unwrap();
+            let (status, body) = send_http3_request(
+                client_config,
+                addr,
+                request,
+                Bytes::from(query.encode().unwrap()),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let response = Message::decode(&body).unwrap();
+            assert_eq!(response.header.id, 49);
+            assert_eq!(response.header.rcode, Rcode::ServFail);
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
         async fn doh_servfail_synthesized_on_resolver_error() {
             let (server_config, client_config, server_name) = self_signed_fixture();
             let resolver = resolver_with(FailingBackend);

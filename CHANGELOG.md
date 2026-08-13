@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Doh3Backend`/`Doh3BackendConfig` and `ServerBuilder::doh3_addr` add
   RFC 9114 HTTP/3 over QUIC/UDP with ALPN `h3`. HTTP/3 uses TLS 1.3 as
   required by QUIC; existing TCP HTTP/1.1/HTTP/2 DoH APIs remain available
-  for TLS 1.2 legacy compatibility.
+  for TLS 1.2 legacy compatibility. HTTP/3 now preserves the public error
+  boundary for QUIC TLS alerts (`Error::Tls`), HTTP/3/transport failures
+  (`Error::Transport`), and expired request bounds (`Error::Timeout`).
 
 - DoT now classifies an underlying TCP connection close before a TLS session
   exists as `Error::Transport`; only errors reported by `rustls` during TLS

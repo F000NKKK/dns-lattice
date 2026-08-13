@@ -98,6 +98,11 @@ pub struct Doh3BackendConfig {
 /// This is deliberately separate from [`DohBackend`]: HTTP/3 is UDP/QUIC
 /// with TLS 1.3, while [`DohBackend`] preserves TCP HTTP/1.1/HTTP/2 support
 /// for legacy clients and TLS 1.2 deployments.
+///
+/// A QUIC TLS alert is reported as [`Error::Tls`]. A non-success HTTP
+/// status, a peer closing the negotiated connection, and other non-TLS QUIC
+/// or HTTP/3 failures are [`Error::Transport`]; expiry of `timeout` is
+/// [`Error::Timeout`].
 pub struct Doh3Backend {
     config: Doh3BackendConfig,
 }
@@ -214,7 +219,7 @@ impl UpstreamBackend for Doh3Backend {
         let connection = timeout(self.config.timeout, connecting)
             .await
             .map_err(|_| Error::Timeout)?
-            .map_err(|err| Error::Transport(err.to_string()))?;
+            .map_err(map_quinn_connection_error)?;
         if connection
             .handshake_data()
             .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -227,9 +232,13 @@ impl UpstreamBackend for Doh3Backend {
             ));
         }
 
-        let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
-            .await
-            .map_err(|err| Error::Transport(err.to_string()))?;
+        let (mut driver, mut sender) = timeout(
+            self.config.timeout,
+            h3::client::new(h3_quinn::Connection::new(connection)),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|err| Error::Transport(err.to_string()))?;
         let driver_task = tokio::spawn(async move { driver.wait_idle().await });
         let request = DohBackend {
             config: DohBackendConfig {
@@ -250,14 +259,14 @@ impl UpstreamBackend for Doh3Backend {
         .map_err(|err| Error::Transport(err.to_string()))?;
         let bytes = body.into_inner().unwrap_or_default();
         if !bytes.is_empty() {
-            stream
-                .send_data(bytes)
+            timeout(self.config.timeout, stream.send_data(bytes))
                 .await
+                .map_err(|_| Error::Timeout)?
                 .map_err(|err| Error::Transport(err.to_string()))?;
         }
-        stream
-            .finish()
+        timeout(self.config.timeout, stream.finish())
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(|err| Error::Transport(err.to_string()))?;
         let response = timeout(self.config.timeout, stream.recv_response())
             .await
@@ -281,6 +290,19 @@ impl UpstreamBackend for Doh3Backend {
         driver_task.abort();
         Message::decode(&body)
     }
+}
+
+/// Maps QUIC handshake failures onto the crate's stable error boundary.
+/// QUIC represents TLS alerts as transport errors in the `0x100..0x200`
+/// range (RFC 9000 §20.1), so they remain TLS failures to callers rather
+/// than being flattened into generic transport errors.
+fn map_quinn_connection_error(err: quinn::ConnectionError) -> Error {
+    if let quinn::ConnectionError::TransportError(transport) = &err
+        && (0x100..0x200).contains(&u64::from(transport.code))
+    {
+        return Error::Tls(err.to_string());
+    }
+    Error::Transport(err.to_string())
 }
 
 /// Maps a `hyper_util` client error to [`Error::Tls`] if it stemmed from
@@ -408,9 +430,10 @@ mod tests {
             .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
             .unwrap();
         assert_eq!(data.protocol.as_deref(), Some(b"h3".as_slice()));
-        let mut h3_connection = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-            .await
-            .unwrap();
+        let mut h3_connection =
+            h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
         let resolver = h3_connection.accept().await.unwrap().unwrap();
         let (request, mut stream) = resolver.resolve_request().await.unwrap();
         assert_eq!(request.method(), expected_method);
@@ -434,6 +457,24 @@ mod tests {
         // Keep the H3 connection alive until the client finishes reading;
         // dropping it immediately sends H3_NO_ERROR before the response can
         // deterministically reach the loopback client.
+        let _ = h3_connection.accept().await;
+    }
+
+    async fn serve_one_doh3_status(endpoint: quinn::Endpoint, status: http::StatusCode) {
+        let incoming = endpoint.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        let mut h3_connection =
+            h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+        let resolver = h3_connection.accept().await.unwrap().unwrap();
+        let (_request, mut stream) = resolver.resolve_request().await.unwrap();
+        while stream.recv_data().await.unwrap().is_some() {}
+        stream
+            .send_response(http::Response::builder().status(status).body(()).unwrap())
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
         let _ = h3_connection.accept().await;
     }
 
@@ -687,6 +728,115 @@ mod tests {
         });
         let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_returns_transport_error_on_non_success_status() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doh3_status(
+            endpoint,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a non-2xx HTTP/3 status is a transport failure");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_returns_tls_error_on_untrusted_certificate() {
+        let (server_config, _trusted_client_config) = http3_fixture();
+        let (_other_server_config, untrusted_client_config) = self_signed_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let _ = incoming.await;
+        });
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(untrusted_client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("an untrusted HTTP/3 certificate fails TLS");
+        assert!(matches!(err, Error::Tls(_)), "got {err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_times_out_when_server_never_completes_handshake() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            // Keeping the endpoint alive without polling `accept` prevents a
+            // server handshake while retaining a deterministic local UDP peer.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(endpoint);
+        });
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_millis(30),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("an incomplete HTTP/3 handshake must time out");
+        assert!(matches!(err, Error::Timeout), "got {err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_returns_transport_when_peer_closes_after_handshake() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            connection.close(0u32.into(), b"test peer closed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a peer closing a negotiated HTTP/3 connection is transport failure");
+        assert!(matches!(err, Error::Transport(_)), "got {err:?}");
         responder.await.unwrap();
     }
 
