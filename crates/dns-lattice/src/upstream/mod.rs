@@ -64,7 +64,7 @@ pub use dot::{DotBackend, DotBackendConfig};
 #[cfg(feature = "doh")]
 mod doh;
 #[cfg(feature = "doh")]
-pub use doh::{DohBackend, DohBackendConfig, DohMethod};
+pub use doh::{Doh3Backend, Doh3BackendConfig, DohBackend, DohBackendConfig, DohMethod};
 
 #[cfg(feature = "doq")]
 mod doq;

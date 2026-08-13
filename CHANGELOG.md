@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The default-off `doh` feature now enables ALPN-negotiated HTTP/1.1 and
+  HTTP/2 for both `DohBackend` and `ServerBuilder::doh_addr`. GET and POST
+  are covered end-to-end on both HTTP versions; a dual-protocol inbound
+  deployment supplies `h2` and `http/1.1` in its `rustls::ServerConfig`.
+
 - DoT now classifies an underlying TCP connection close before a TLS session
   exists as `Error::Transport`; only errors reported by `rustls` during TLS
   negotiation or certificate verification are `Error::Tls`. The upstream
@@ -111,7 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/dns-query`), behind the existing default-off `doh` Cargo feature,
   additive to the UDP/TCP/DoT/DoQ listeners. Binds a TCP listener,
   TLS-accepts each connection identically to `dot_addr`, then serves
-  HTTP/1.1 via `hyper_util::server::conn::auto::Builder`, parsing RFC 8484
+  ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util::server::conn::auto::Builder`, parsing RFC 8484
   GET (`?dns=` base64url query parameter) and POST (`application/
   dns-message` body) requests. A path mismatch responds HTTP 404; an
   unsupported method or a request whose bytes cannot be extracted/decoded

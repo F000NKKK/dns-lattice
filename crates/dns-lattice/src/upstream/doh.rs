@@ -1,9 +1,9 @@
 //! DNS-over-HTTPS upstream backend (RFC 8484), behind the `doh` Cargo
-//! feature. Per ADR-0012 (`DL-A-13`): HTTP transport via `hyper`/
-//! `hyper-rustls` (coupled to the same `rustls` TLS stack the `dot`
-//! feature uses), supporting the GET wire format (RFC 8484 §4.1's
+//! feature. HTTP transport via `hyper`/`hyper-rustls` (coupled to the same
+//! `rustls` TLS stack the `dot` feature uses) negotiates HTTP/1.1 or HTTP/2
+//! through TLS ALPN, and supports the GET wire format (RFC 8484 §4.1's
 //! base64url `dns` query parameter) and the POST wire format
-//! (`application/dns-message` body).
+//! (`application/dns-message` body) on either HTTP version.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bytes::Buf;
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::Message;
 use http::{Request, Uri};
@@ -22,6 +23,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use tokio::time::timeout;
+
+#[cfg(feature = "doh")]
+use quinn::crypto::rustls::QuicClientConfig;
+#[cfg(feature = "doh")]
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 
 use super::UpstreamBackend;
 
@@ -66,6 +72,41 @@ pub struct DohBackendConfig {
 /// TLS as surfaced by `hyper`) map to [`Error::Transport`] (ADR-0012).
 pub struct DohBackend {
     config: DohBackendConfig,
+}
+
+/// Configuration for [`Doh3Backend`], the HTTP/3-over-QUIC DoH transport.
+///
+/// HTTP/3 uses UDP/QUIC and TLS 1.3; use [`DohBackendConfig`] for legacy
+/// TCP HTTPS clients requiring HTTP/1.1 or HTTP/2 with TLS 1.2 support.
+#[derive(Clone)]
+pub struct Doh3BackendConfig {
+    /// The HTTPS DoH endpoint URI. Its host is used for SNI and its path is
+    /// used for the RFC 8484 request target.
+    pub uri: Uri,
+    /// The resolved UDP socket address of the HTTP/3 endpoint.
+    pub server: std::net::SocketAddr,
+    /// Which RFC 8484 wire format to use.
+    pub method: DohMethod,
+    /// TLS trust and client-auth configuration. HTTP/3 fixes ALPN to `h3`.
+    pub tls_config: Arc<ClientConfig>,
+    /// Bounds QUIC connection setup and the complete HTTP/3 request.
+    pub timeout: Duration,
+}
+
+/// DNS-over-HTTPS over HTTP/3 (RFC 9114) and QUIC, gated by `doh`.
+///
+/// This is deliberately separate from [`DohBackend`]: HTTP/3 is UDP/QUIC
+/// with TLS 1.3, while [`DohBackend`] preserves TCP HTTP/1.1/HTTP/2 support
+/// for legacy clients and TLS 1.2 deployments.
+pub struct Doh3Backend {
+    config: Doh3BackendConfig,
+}
+
+impl Doh3Backend {
+    /// Builds an HTTP/3 DoH backend from `config`.
+    pub fn new(config: Doh3BackendConfig) -> Self {
+        Self { config }
+    }
 }
 
 impl DohBackend {
@@ -120,6 +161,7 @@ impl UpstreamBackend for DohBackend {
             .with_tls_config((*self.config.tls_config).clone())
             .https_only()
             .enable_http1()
+            .enable_http2()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
 
@@ -143,6 +185,98 @@ impl UpstreamBackend for DohBackend {
             .map_err(|err| Error::Transport(err.to_string()))?
             .to_bytes();
 
+        Message::decode(&body)
+    }
+}
+
+#[async_trait]
+impl UpstreamBackend for Doh3Backend {
+    async fn resolve(&self, query: &Message) -> Result<Message> {
+        let host = self
+            .config
+            .uri
+            .host()
+            .ok_or_else(|| Error::Transport("DoH HTTP/3 URI has no host".to_string()))?;
+        let mut tls_config = (*self.config.tls_config).clone();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config = QuicClientConfig::try_from(Arc::new(tls_config))
+            .map_err(|err| Error::Tls(err.to_string()))?;
+        let mut quinn_config = QuinnClientConfig::new(Arc::new(client_config));
+        quinn_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+        let endpoint = Endpoint::client(match self.config.server {
+            std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        })
+        .map_err(|err| Error::Transport(err.to_string()))?;
+        let connecting = endpoint
+            .connect_with(quinn_config, self.config.server, host)
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        let connection = timeout(self.config.timeout, connecting)
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        if connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol)
+            .as_deref()
+            != Some(b"h3")
+        {
+            return Err(Error::Tls(
+                "HTTP/3 peer did not negotiate ALPN h3".to_string(),
+            ));
+        }
+
+        let (_driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        let request = DohBackend {
+            config: DohBackendConfig {
+                uri: self.config.uri.clone(),
+                method: self.config.method,
+                tls_config: self.config.tls_config.clone(),
+                timeout: self.config.timeout,
+            },
+        }
+        .build_request(query)?;
+        let (parts, body) = request.into_parts();
+        let mut stream = timeout(
+            self.config.timeout,
+            sender.send_request(http::Request::from_parts(parts, ())),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|err| Error::Transport(err.to_string()))?;
+        let bytes = body.into_inner().unwrap_or_default();
+        if !bytes.is_empty() {
+            stream
+                .send_data(bytes)
+                .await
+                .map_err(|err| Error::Transport(err.to_string()))?;
+        }
+        stream
+            .finish()
+            .await
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        let response = timeout(self.config.timeout, stream.recv_response())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        if !response.status().is_success() {
+            return Err(Error::Transport(format!(
+                "doh HTTP/3 server returned http status {}",
+                response.status()
+            )));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = timeout(self.config.timeout, stream.recv_data())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|err| Error::Transport(err.to_string()))?
+        {
+            body.extend_from_slice(chunk.chunk());
+        }
+        endpoint.close(0u32.into(), b"request complete");
         Message::decode(&body)
     }
 }
@@ -186,6 +320,9 @@ fn error_chain_is_tls(err: &(dyn std::error::Error + 'static)) -> bool {
 mod tests {
     use super::*;
     use dns_lattice_model::{Class, Header, Name, Opcode, Question, Rcode, RecordType};
+    use hyper::body::Incoming;
+    use hyper::{Response, StatusCode};
+    use hyper_util::rt::TokioIo;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -302,6 +439,46 @@ mod tests {
         tls_stream.shutdown().await.unwrap();
     }
 
+    /// Serves one TLS-ALPN-negotiated HTTP/2 DoH request. The assertion on
+    /// the selected ALPN protocol makes this an end-to-end HTTP/2 test, not
+    /// merely a server-side HTTP/2 parser test.
+    async fn serve_one_doh_h2_response(
+        listener: TcpListener,
+        acceptor: TlsAcceptor,
+        response: Message,
+        expected_method: hyper::Method,
+    ) {
+        let (tcp_stream, _) = listener.accept().await.unwrap();
+        let tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+        assert_eq!(
+            tls_stream.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_slice())
+        );
+
+        let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
+            let response = response.clone();
+            let expected_method = expected_method.clone();
+            async move {
+                assert_eq!(request.version(), hyper::Version::HTTP_2);
+                assert_eq!(request.method(), expected_method);
+                assert_eq!(request.uri().path(), "/dns-query");
+                let _ = request.into_body().collect().await.unwrap();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/dns-message")
+                        .body(Full::new(Bytes::from(response.encode().unwrap())))
+                        .unwrap(),
+                )
+            }
+        });
+
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(tls_stream), service)
+            .await
+            .unwrap();
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack
             .windows(needle.len())
@@ -356,6 +533,58 @@ mod tests {
             .resolve(&query_for("example.com"))
             .await
             .expect("doh backend resolves over post");
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_backend_resolves_with_get_over_http2() {
+        let (mut server_config, client_config) = self_signed_fixture();
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doh_h2_response(
+            listener,
+            acceptor,
+            answer_for("example.com", 0),
+            hyper::Method::GET,
+        ));
+
+        let backend = DohBackend::new(DohBackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let answer = backend.resolve(&query_for("example.com")).await.unwrap();
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_backend_resolves_with_post_over_http2() {
+        let (mut server_config, client_config) = self_signed_fixture();
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doh_h2_response(
+            listener,
+            acceptor,
+            answer_for("example.com", 0),
+            hyper::Method::POST,
+        ));
+
+        let backend = DohBackend::new(DohBackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            method: DohMethod::Post,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
         responder.await.unwrap();
     }

@@ -28,7 +28,7 @@ Status: done (this document and `ARCHITECTURE.md` are its output)
 
 ## Stage 0.1 — Core model
 
-Status: done
+Status: active
 
 - DNS message model: query, answer, record types needed by the engine
   (evaluate reuse of an existing DNS protocol crate vs. hand-rolled types;
@@ -73,8 +73,8 @@ Status: done
   UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT listener done
   (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoQ listener done
   (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener done
-  (`ServerBuilder::doh_addr`, `doh` Cargo feature) — Track E, and Stage
-  0.3 as a whole, are now complete.
+  (`ServerBuilder::doh_addr`, `doh` Cargo feature), with ALPN-negotiated
+  HTTP/1.1 and HTTP/2 support. Final cross-platform verification remains.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.

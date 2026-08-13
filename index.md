@@ -59,9 +59,9 @@ implementation starts.
 ## Current status
 
 The `0.1.0` releases reserved the crate names on crates.io; the public API
-remains pre-1.0 and unstable. `ROADMAP.md` records stages 0.0 through 0.3 as
-done: the core model, resolver/cache, upstream transports, failover, and
-inbound server listeners have landed. Stage 0.4 (Fake IP pool) is next. See
+remains pre-1.0 and unstable. Stages 0.0 through 0.2 are done; stage 0.3's
+core model, resolver/cache, upstream transports, failover, and inbound
+server listeners have landed and are in final verification. See
 `CONTRIBUTING.md` and `SUPPORT.md` for current project-status language.
 
 ## Useful commands

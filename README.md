@@ -13,7 +13,7 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** Stages 0.1-0.3 have landed the DNS message model, zone/domain
+> **Status:** Stages 0.1-0.2 are complete; stage 0.3 has landed the DNS message model, zone/domain
 > matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
@@ -63,7 +63,7 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (stage 0.1-0.2, plus stage 0.3 in full — Tracks A, B, C, D, and E):
+Implemented (stages 0.1-0.2, plus stage 0.3 under final verification):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -76,7 +76,7 @@ Implemented (stage 0.1-0.2, plus stage 0.3 in full — Tracks A, B, C, D, and E)
 - Public, async `server` module (`Server`, `ServerBuilder`): embeddable inbound UDP/TCP DNS listener over an `Arc<Resolver>` — construct/bind/serve/shutdown lifecycle, one task per UDP datagram and one task per TCP connection (looping over multiple length-prefixed queries per RFC 1035 §4.2.2), oversized UDP answers truncated with `TC=1`, and `Rcode::ServFail` synthesis when the resolver returns an error
 - Inbound DNS-over-TLS (DoT, RFC 7858) listener behind the `dot` Cargo feature: `ServerBuilder::dot_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor` and reuses the same length-prefixed read/write loop as the TCP listener
 - Inbound DNS-over-QUIC (DoQ, RFC 9250) listener behind the `doq` Cargo feature: `ServerBuilder::doq_addr` accepts a `quinn` QUIC endpoint (ALPN `doq`) and answers one query per bidirectional stream, reusing the same framing helpers as the `DoqBackend` upstream
-- Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves HTTP/1.1 via `hyper_util`'s protocol-detecting server builder, parsing RFC 8484 GET (`?dns=` base64url) and POST (`application/dns-message` body) requests and answering with the resolved message as an `application/dns-message` body (HTTP 200, `ServFail` rcode included) or an HTTP 400/404 for a request that never reaches the DNS layer
+- Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s protocol-detecting server builder. A dual-protocol deployment configures `h2` and `http/1.1` ALPN identifiers; GET (`?dns=` base64url) and POST (`application/dns-message` body) work on either protocol.
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
@@ -93,7 +93,7 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 
 ## Current Status
 
-Stages 0.1-0.2 plus stage 0.3 in full (Tracks A, B, C, D, and E) of the
+Stages 0.1-0.2 plus the implementation scope of stage 0.3 of the
 [architecture](ARCHITECTURE.md)'s module layout is covered by
 deterministic unit/doc tests, `clippy -D warnings`, and verified `cargo
 package` listings for all three crates:
@@ -107,7 +107,7 @@ package` listings for all three crates:
 - the `dns-lattice` facade's `server` module (`Server`, `ServerBuilder`): inbound UDP/TCP listener over an in-process fake `Resolver` fixture, covering round-trip resolution over both transports, UDP truncation/`TC=1` behavior, `Rcode::ServFail` synthesis on a resolver error, and graceful shutdown via `serve_until`
 - the `dns-lattice` facade's `server` module's opt-in `dot` Cargo feature (`ServerBuilder::dot_addr`): inbound DNS-over-TLS listener, tested against a loopback TLS client with a locally generated self-signed certificate, covering round-trip resolution, multiple queries over one TLS connection, and `Rcode::ServFail` synthesis on a resolver error
 - the `dns-lattice` facade's `server` module's opt-in `doq` Cargo feature (`ServerBuilder::doq_addr`): inbound DNS-over-QUIC listener, tested against a loopback `quinn` QUIC client with a locally generated self-signed certificate, covering round-trip resolution, multiple queries over one QUIC connection (separate streams), and `Rcode::ServFail` synthesis on a resolver error
-- the `dns-lattice` facade's `server` module's opt-in `doh` Cargo feature (`ServerBuilder::doh_addr`): inbound DNS-over-HTTPS listener, tested against a manually constructed HTTP/1.1-over-TLS client with a locally generated self-signed certificate, covering GET and POST round-trip resolution, `Rcode::ServFail` synthesis on a resolver error, an HTTP 400 on an undecodable GET `dns` parameter, and an HTTP 404 on a request to the wrong path
+- the `dns-lattice` facade's `server` module's opt-in `doh` Cargo feature (`ServerBuilder::doh_addr`): inbound DNS-over-HTTPS listener, tested end-to-end over ALPN-negotiated HTTP/1.1 and HTTP/2 with a locally generated self-signed certificate, covering GET and POST round trips on both protocols
 
 This gives a complete, tested DNS message model, a deterministic
 zone/domain matcher, an in-process resolver with real UDP/TCP/DoT/DoH/DoQ
@@ -153,7 +153,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
-4. **Stage 0.3: Upstream transport backends and server listener** *(completed — Tracks A, B, C, D, and E)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
+4. **Stage 0.3: Upstream transport backends and server listener** *(active: final verification)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
 5. **Stage 0.4: Fake IP pool** — deterministic synthetic address allocation, reverse lookup, LRU eviction, documented `tunnel-lattice` integration contract.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.

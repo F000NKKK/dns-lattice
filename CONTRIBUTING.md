@@ -8,7 +8,8 @@ DNS Lattice is pre-release: repository workflow, policies, and packaging
 scaffolding are in place, ported from
 [net-lattice](https://github.com/F000NKKK/net-lattice), and the DNS
 message/matcher/policy model, resolver/cache, upstream transports, failover,
-and inbound server listeners (stages 0.1-0.3) have landed. No public API is
+and inbound server listeners (stages 0.1-0.2 plus stage 0.3 under final
+verification) have landed. No public API is
 stable yet. The most valuable contributions right now are:
 
 - Feedback on the project's vision, scope, and roadmap (see [README.md](README.md))

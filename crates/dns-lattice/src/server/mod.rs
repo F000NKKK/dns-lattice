@@ -14,8 +14,8 @@
 //! 9250 §4.2), reusing the same `read_framed`/`write_framed` framing helpers
 //! via the client-side `QuicStream` adapter already defined in
 //! [`crate::upstream`]. DoH (RFC 8484) TLS-accepts identically to DoT, then
-//! serves HTTP/1.1 via `hyper_util`'s protocol-detecting server builder,
-//! parsing RFC 8484 GET/POST requests and answering with the resolved
+//! serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s
+//! protocol-detecting server builder, parsing RFC 8484 GET/POST requests and answering with the resolved
 //! [`Message`] as an `application/dns-message` body.
 //!
 //! # Lifecycle
@@ -82,6 +82,8 @@ use base64::Engine;
 #[cfg(feature = "doh")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 #[cfg(feature = "doh")]
+use bytes::Buf;
+#[cfg(feature = "doh")]
 use http_body_util::{BodyExt, Full};
 #[cfg(feature = "doh")]
 use hyper::body::{Bytes, Incoming};
@@ -120,6 +122,8 @@ pub struct ServerBuilder {
     dot_addrs: Vec<(SocketAddr, Arc<ServerConfig>)>,
     #[cfg(feature = "doh")]
     doh_addrs: Vec<(SocketAddr, Arc<ServerConfig>, DohListenerConfig)>,
+    #[cfg(feature = "doh")]
+    doh3_addrs: Vec<(SocketAddr, quinn::ServerConfig, DohListenerConfig)>,
     #[cfg(feature = "doq")]
     doq_addrs: Vec<(SocketAddr, quinn::ServerConfig)>,
 }
@@ -165,6 +169,8 @@ impl ServerBuilder {
             dot_addrs: Vec::new(),
             #[cfg(feature = "doh")]
             doh_addrs: Vec::new(),
+            #[cfg(feature = "doh")]
+            doh3_addrs: Vec::new(),
             #[cfg(feature = "doq")]
             doq_addrs: Vec::new(),
         }
@@ -209,7 +215,9 @@ impl ServerBuilder {
     /// This crate does not source certificate material itself — the caller
     /// supplies a
     /// fully configured `Arc<rustls::ServerConfig>`, exactly like
-    /// [`ServerBuilder::dot_addr`].
+    /// [`ServerBuilder::dot_addr`]. A deployment that serves both DoH HTTP
+    /// versions must configure its ALPN list with `h2` and `http/1.1`; the
+    /// listener serves whichever protocol TLS negotiates.
     #[cfg(feature = "doh")]
     pub fn doh_addr(
         mut self,
@@ -218,6 +226,25 @@ impl ServerBuilder {
         config: DohListenerConfig,
     ) -> Self {
         self.doh_addrs.push((addr, tls_config, config));
+        self
+    }
+
+    /// Adds a DNS-over-HTTPS HTTP/3 (RFC 9114) UDP/QUIC address. This is
+    /// additive to [`ServerBuilder::doh_addr`], which remains the TCP path
+    /// for HTTP/1.1 and HTTP/2 (including TLS 1.2 legacy clients).
+    ///
+    /// `server_config` must be a QUIC `quinn::ServerConfig` whose embedded
+    /// TLS configuration advertises ALPN `h3`. QUIC mandates TLS 1.3, so a
+    /// host serving all DoH generations binds this UDP address as well as a
+    /// TCP [`ServerBuilder::doh_addr`] address.
+    #[cfg(feature = "doh")]
+    pub fn doh3_addr(
+        mut self,
+        addr: SocketAddr,
+        server_config: quinn::ServerConfig,
+        config: DohListenerConfig,
+    ) -> Self {
+        self.doh3_addrs.push((addr, server_config, config));
         self
     }
 
@@ -290,6 +317,15 @@ impl ServerBuilder {
             doh_listeners.push((listener, TlsAcceptor::from(tls_config), config));
         }
 
+        #[cfg(feature = "doh")]
+        let mut doh3_endpoints = Vec::with_capacity(self.doh3_addrs.len());
+        #[cfg(feature = "doh")]
+        for (addr, server_config, config) in self.doh3_addrs {
+            let endpoint = quinn::Endpoint::server(server_config, addr)
+                .map_err(|err| Error::Transport(err.to_string()))?;
+            doh3_endpoints.push((endpoint, config));
+        }
+
         #[cfg(feature = "doq")]
         let mut doq_endpoints = Vec::with_capacity(self.doq_addrs.len());
         #[cfg(feature = "doq")]
@@ -307,6 +343,8 @@ impl ServerBuilder {
             dot_listeners,
             #[cfg(feature = "doh")]
             doh_listeners,
+            #[cfg(feature = "doh")]
+            doh3_endpoints,
             #[cfg(feature = "doq")]
             doq_endpoints,
         })
@@ -324,6 +362,8 @@ pub struct Server {
     dot_listeners: Vec<(TcpListener, TlsAcceptor)>,
     #[cfg(feature = "doh")]
     doh_listeners: Vec<(TcpListener, TlsAcceptor, DohListenerConfig)>,
+    #[cfg(feature = "doh")]
+    doh3_endpoints: Vec<(quinn::Endpoint, DohListenerConfig)>,
     #[cfg(feature = "doq")]
     doq_endpoints: Vec<quinn::Endpoint>,
 }
@@ -363,6 +403,8 @@ impl Server {
             dot_listeners,
             #[cfg(feature = "doh")]
             doh_listeners,
+            #[cfg(feature = "doh")]
+            doh3_endpoints,
             #[cfg(feature = "doq")]
             doq_endpoints,
         } = self;
@@ -387,6 +429,11 @@ impl Server {
         for (listener, acceptor, config) in doh_listeners {
             let resolver = resolver.clone();
             loops.spawn(async move { serve_doh(listener, acceptor, config, resolver).await });
+        }
+        #[cfg(feature = "doh")]
+        for (endpoint, config) in doh3_endpoints {
+            let resolver = resolver.clone();
+            loops.spawn(async move { serve_doh3(endpoint, config, resolver).await });
         }
         #[cfg(feature = "doq")]
         for endpoint in doq_endpoints {
@@ -531,10 +578,9 @@ async fn serve_dot(
 /// Runs `listener`'s DoH (RFC 8484) accept loop forever, mirroring
 /// [`serve_dot`]: TLS-accept happens inside the spawned per-connection task,
 /// not this accept loop (same non-blocking-accept-loop principle). Once the
-/// TLS handshake completes, the connection is served as HTTP/1.1 via
-/// `hyper_util`'s protocol-detecting [`auto::Builder`] (the `server-auto`
-/// feature; HTTP/1.1 only in this stage, matching the client-side `DohBackend`
-/// scope) with a [`service_fn`] closure that dispatches to
+/// TLS handshake completes, the connection is served as its ALPN-negotiated
+/// HTTP/1.1 or HTTP/2 protocol via `hyper_util`'s protocol-detecting
+/// [`auto::Builder`] (the `server-auto` feature) with a [`service_fn`] closure that dispatches to
 /// [`handle_doh_request`] for every request on the connection. A handshake
 /// failure ends that connection's task without a response, matching DoT.
 #[cfg(feature = "doh")]
@@ -654,6 +700,98 @@ fn http_status_response(status: StatusCode) -> Response<Full<Bytes>> {
         .status(status)
         .body(Full::new(Bytes::new()))
         .expect("a bare status response always builds")
+}
+
+/// Runs the UDP/QUIC HTTP/3 DoH accept loop. This intentionally shares the
+/// HTTP request-to-DNS response policy with TCP DoH while retaining QUIC's
+/// TLS-1.3-only and `h3` ALPN boundary.
+#[cfg(feature = "doh")]
+async fn serve_doh3(
+    endpoint: quinn::Endpoint,
+    config: DohListenerConfig,
+    resolver: Arc<Resolver>,
+) -> Result<()> {
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Ok(());
+        };
+        let config = config.clone();
+        let resolver = resolver.clone();
+        tokio::spawn(async move {
+            let Ok(connection) = incoming.await else {
+                return;
+            };
+            let Some(data) = connection
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            else {
+                return;
+            };
+            if data.protocol.as_deref() != Some(b"h3") {
+                return;
+            }
+            let Ok(mut h3_connection) =
+                h3::server::Connection::new(h3_quinn::Connection::new(connection)).await
+            else {
+                return;
+            };
+            while let Ok(Some(request)) = h3_connection.accept().await {
+                let config = config.clone();
+                let resolver = resolver.clone();
+                tokio::spawn(async move {
+                    let Ok((request, mut stream)) = request.resolve_request().await else {
+                        return;
+                    };
+                    let mut body = Vec::new();
+                    while let Ok(Some(chunk)) = stream.recv_data().await {
+                        body.extend_from_slice(chunk.chunk());
+                    }
+                    let query_bytes = extract_doh3_query_bytes(&request, body);
+                    let (status, payload) =
+                        match query_bytes.and_then(|bytes| Message::decode(&bytes).ok()) {
+                            Some(query) if request.uri().path() == config.path => {
+                                let answer = resolver
+                                    .resolve(&query)
+                                    .await
+                                    .unwrap_or_else(|_| servfail_response(&query));
+                                match answer.encode() {
+                                    Ok(bytes) => (StatusCode::OK, bytes),
+                                    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Vec::new()),
+                                }
+                            }
+                            Some(_) => (StatusCode::NOT_FOUND, Vec::new()),
+                            None => (StatusCode::BAD_REQUEST, Vec::new()),
+                        };
+                    let response = Response::builder()
+                        .status(status)
+                        .header("content-type", "application/dns-message")
+                        .body(())
+                        .unwrap();
+                    if stream.send_response(response).await.is_ok() {
+                        if !payload.is_empty() {
+                            let _ = stream.send_data(Bytes::from(payload)).await;
+                        }
+                        let _ = stream.finish().await;
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[cfg(feature = "doh")]
+fn extract_doh3_query_bytes(request: &http::Request<()>, body: Vec<u8>) -> Option<Vec<u8>> {
+    match *request.method() {
+        hyper::Method::GET => {
+            let encoded = request.uri().query()?.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == "dns").then_some(value)
+            })?;
+            URL_SAFE_NO_PAD.decode(encoded).ok()
+        }
+        hyper::Method::POST => Some(body),
+        _ => None,
+    }
 }
 
 /// Runs `endpoint`'s DoQ (RFC 9250) accept loop forever: one `tokio::task`
@@ -1404,6 +1542,9 @@ mod tests {
         use super::*;
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
         use rcgen::{CertifiedKey, generate_simple_self_signed};
         use tokio_rustls::TlsConnector;
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -1425,7 +1566,7 @@ mod tests {
                 .with_no_client_auth()
                 .with_single_cert(vec![cert_der.clone()], key_der)
                 .unwrap();
-            server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
@@ -1502,6 +1643,45 @@ mod tests {
                 status,
                 buf[body_start..body_start + content_length].to_vec(),
             )
+        }
+
+        /// Sends one HTTP/2 DoH request after requiring TLS ALPN to select
+        /// `h2`; returns the HTTP status and response body.
+        async fn send_http2_request(
+            client_config: ClientConfig,
+            server_name: ServerName<'static>,
+            addr: SocketAddr,
+            request: hyper::Request<Full<Bytes>>,
+        ) -> (u16, Vec<u8>) {
+            let mut client_config = client_config;
+            client_config.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let tcp_stream = TcpStream::connect(addr).await.unwrap();
+            let tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+            assert_eq!(
+                tls_stream.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_slice())
+            );
+
+            let (mut sender, connection) =
+                hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                    .handshake(TokioIo::new(tls_stream))
+                    .await
+                    .unwrap();
+            let connection_task = tokio::spawn(async move { connection.await.unwrap() });
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.version(), hyper::Version::HTTP_2);
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
+            drop(sender);
+            connection_task.await.unwrap();
+            (status, body)
         }
 
         #[tokio::test]
@@ -1602,6 +1782,92 @@ mod tests {
             assert_eq!(response.header.id, 42);
             assert_eq!(response.header.rcode, Rcode::NoError);
             assert_eq!(response.answers.len(), 1);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh_get_round_trip_success_over_http2() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 34),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::new(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doh_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let query = query_for("example.com", 44);
+            let encoded = URL_SAFE_NO_PAD.encode(query.encode().unwrap());
+            let request = hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri(format!("https://localhost/dns-query?dns={encoded}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let (status, body) =
+                send_http2_request(client_config, server_name, addr, request).await;
+            assert_eq!(status, 200);
+            assert_eq!(Message::decode(&body).unwrap().header.id, 44);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh_post_round_trip_success_over_http2() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 35),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::new(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .unwrap();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doh_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let query = query_for("example.com", 45);
+            let request = hyper::Request::builder()
+                .method(hyper::Method::POST)
+                .uri("https://localhost/dns-query")
+                .header("content-type", "application/dns-message")
+                .body(Full::new(Bytes::from(query.encode().unwrap())))
+                .unwrap();
+            let (status, body) =
+                send_http2_request(client_config, server_name, addr, request).await;
+            assert_eq!(status, 200);
+            assert_eq!(Message::decode(&body).unwrap().header.id, 45);
 
             shutdown_tx.send(()).unwrap();
             serve_task.await.unwrap().unwrap();

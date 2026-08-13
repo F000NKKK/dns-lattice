@@ -54,10 +54,12 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   reusing the same framing helpers as `DoqBackend`'s client side. Behind
   the default-off `doh` Cargo feature, `ServerBuilder::doh_addr(addr,
   tls_config, config)` adds an inbound DNS-over-HTTPS (RFC 8484) listener:
-  it TLS-accepts each connection like `dot_addr`, then serves HTTP/1.1 via
-  `hyper_util`'s protocol-detecting server builder, parsing RFC 8484 GET
-  (`?dns=` base64url query parameter) and POST (`application/dns-message`
-  body) requests. `config` (a `DohListenerConfig`, defaulting to the
+  it TLS-accepts each connection like `dot_addr`, then serves the
+  ALPN-negotiated HTTP/1.1 or HTTP/2 protocol via `hyper_util`'s
+  protocol-detecting server builder, parsing RFC 8484 GET (`?dns=`
+  base64url query parameter) and POST (`application/dns-message` body)
+  requests. A dual-protocol deployment configures `h2` and `http/1.1` in
+  its `rustls::ServerConfig` ALPN list. `config` (a `DohListenerConfig`, defaulting to the
   `/dns-query` path) selects which URI path the listener answers; any
   other path gets HTTP 404, an unsupported method or undecodable request
   gets HTTP 400, and everything else is answered HTTP 200 with an
@@ -116,7 +118,8 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 Pre-0.1 stage: this crate has no stable API yet. Stage 0.1 (core model)
 landed the DNS message/matcher/policy model above; stage 0.2 landed the
 resolver's construct/resolve lifecycle, static split-DNS routing, and its
-in-memory TTL/negative-caching answer cache; stage 0.3 (complete) landed
+in-memory TTL/negative-caching answer cache; stage 0.3 is in final
+verification and has landed
 the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
 `dot`/`doh`/`doq` encrypted-transport backends described above, failover
 across a group's registered backends, and the `server` module's

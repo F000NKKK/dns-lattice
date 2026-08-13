@@ -38,12 +38,14 @@ webpki-roots = "1"
 
 # DoH (dns-lattice `doh` feature, RFC 8484)
 hyper = "1"
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "webpki-roots", "aws-lc-rs"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "webpki-roots", "aws-lc-rs"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
 base64 = "0.23"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 # DoQ (dns-lattice `doq` feature, RFC 9250). `rustls-aws-lc-rs` shares this
 # workspace's already-pinned `rustls`/`aws-lc-rs` crypto-provider line

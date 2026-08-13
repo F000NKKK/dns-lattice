@@ -1,6 +1,6 @@
 # DNS Lattice architecture
 
-Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
+Status: draft. Stages 0.1-0.2 have landed the `dns-lattice-core` and
 `dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
 server listeners below; later stages implement the remaining target shape
 incrementally. Update this document whenever an implementation slice changes
