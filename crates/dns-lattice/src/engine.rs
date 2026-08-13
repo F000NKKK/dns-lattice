@@ -6,11 +6,13 @@
 //! negative caching (RFC 2308). Stage 0.3 (ADR-0011, `DL-A-12`) replaces
 //! the stage-0.2 crate-private, synchronous `UpstreamBackend` with the
 //! public, async [`crate::upstream::UpstreamBackend`] trait: [`Resolver`]
-//! now holds an ordered list of backends per [`UpstreamGroupId`] (so a
-//! later failover track can iterate without a storage redesign, though this
-//! stage always uses only the first registered backend) and
+//! holds an ordered list of backends per [`UpstreamGroupId`], and
 //! [`Resolver::resolve`] is now an `async fn` — see the module-level
-//! runtime-requirement note on [`crate::upstream`].
+//! runtime-requirement note on [`crate::upstream`]. Track D (ADR-0014,
+//! `DL-A-15`) adds failover: [`Resolver::resolve`] tries a matched group's
+//! backends in registration order, falling over to the next backend on a
+//! retryable error and propagating the last attempted backend's error once
+//! the group is exhausted.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -128,20 +130,26 @@ impl Resolver {
     ///
     /// Extracts the queried name from `query`'s first question, checks the
     /// in-memory answer cache, and on a miss routes the query through the
-    /// configured [`SplitDnsPolicy`] to select an upstream group and
-    /// forwards it to that group's first registered backend (multiple
-    /// backends per group are stored to support a future failover track;
-    /// this stage always uses only the first). Successful (positive or
-    /// negative) answers are cached with a TTL-derived expiry; a cache hit
-    /// never calls the backend again.
+    /// configured [`SplitDnsPolicy`] to select an upstream group, then tries
+    /// that group's registered backends in registration order (ADR-0014,
+    /// `DL-A-15`): the first backend to return `Ok` wins and its answer is
+    /// cached (per the existing TTL rules) and returned immediately. A
+    /// backend failing with [`Error::Timeout`], [`Error::Transport`], or
+    /// [`Error::Tls`] is treated as retryable — resolution moves on to the
+    /// next backend in the group rather than failing the whole call. Once
+    /// every backend in the group has been tried and failed, the *last*
+    /// attempted backend's error is propagated as-is; this exhausted-group
+    /// failure is never cached. A group with exactly one backend behaves
+    /// exactly as before: success or that one backend's own error.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NoRoute`] when no split-DNS rule matches the
     /// queried name and no default upstream group is configured, when no
     /// question is present in `query`, or when the matched group has no
-    /// backend registered. Returns whatever error the selected backend
-    /// produces, propagated as-is (not cached).
+    /// backend registered. Returns the last attempted backend's error,
+    /// propagated as-is (not cached), once every backend in the matched
+    /// group has failed.
     ///
     /// # Runtime requirement
     ///
@@ -171,26 +179,47 @@ impl Resolver {
             .policy
             .resolve_group(&question.name)
             .ok_or(Error::NoRoute)?;
-        let backend = self
-            .backends
-            .get(group)
-            .and_then(|backends| backends.first())
-            .ok_or(Error::NoRoute)?;
-        let answer = backend.resolve(query).await?;
-
-        if let Some(ttl) = cacheable_ttl(&answer) {
-            let mut cache = self.cache.lock().expect("cache mutex poisoned");
-            cache.insert(
-                key,
-                CacheEntry {
-                    answer: answer.clone(),
-                    expires_at: now + ttl,
-                },
-            );
+        let backends = self.backends.get(group).ok_or(Error::NoRoute)?;
+        if backends.is_empty() {
+            return Err(Error::NoRoute);
         }
 
-        Ok(answer)
+        let mut last_err = None;
+        for backend in backends {
+            match backend.resolve(query).await {
+                Ok(answer) => {
+                    if let Some(ttl) = cacheable_ttl(&answer) {
+                        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+                        cache.insert(
+                            key,
+                            CacheEntry {
+                                answer: answer.clone(),
+                                expires_at: now + ttl,
+                            },
+                        );
+                    }
+                    return Ok(answer);
+                }
+                Err(e) if is_retryable(&e) => {
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.expect("at least one backend was tried since backends is non-empty"))
     }
+}
+
+/// Returns whether `err` should cause the failover loop to try the next
+/// backend in the group rather than propagate immediately (ADR-0014,
+/// `DL-A-15` decision 1): all three backend-level failure variants —
+/// [`Error::Timeout`], [`Error::Transport`], and [`Error::Tls`] — are
+/// retryable, since none indicate a client-input problem and a different
+/// backend in the same group may have independent connectivity/TLS
+/// configuration.
+fn is_retryable(err: &Error) -> bool {
+    matches!(err, Error::Timeout | Error::Transport(_) | Error::Tls(_))
 }
 
 /// Determines the [`Duration`] an `answer` should be cached for, or `None`
@@ -241,9 +270,9 @@ pub struct ResolverBuilder {
 impl ResolverBuilder {
     /// Registers an upstream backend used to answer queries routed to
     /// `group`, appended after any backend already registered for that
-    /// group. [`Resolver::resolve`] always uses the first registered
-    /// backend for a group this stage (multiple backends per group support
-    /// a future failover track, not implemented yet).
+    /// group. [`Resolver::resolve`] tries a group's backends in this
+    /// registration order, falling over to the next one on a retryable
+    /// error (ADR-0014, `DL-A-15`).
     ///
     /// `backend` is any [`crate::upstream::UpstreamBackend`] implementation
     /// — e.g. [`crate::upstream::UdpBackend`]/
@@ -467,6 +496,113 @@ mod tests {
             .await
             .expect_err("matched group has no backend registered");
         assert_eq!(err, Error::NoRoute);
+    }
+
+    #[tokio::test]
+    async fn failover_first_backend_succeeds_second_never_called() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = CountingBackend {
+            answer: answer_tagged(2),
+            calls: calls.clone(),
+        };
+        let resolver = Resolver::builder(policy)
+            .backend(UpstreamGroupId::new("g"), fixed_backend(answer_tagged(1)))
+            .backend(UpstreamGroupId::new("g"), second)
+            .build();
+
+        let answer = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("first backend answers");
+        assert_eq!(answer.header.id, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "second backend never called once the first succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_first_backend_fails_second_succeeds() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let resolver = Resolver::builder(policy)
+            .backend(UpstreamGroupId::new("g"), FailingBackend(Error::Timeout))
+            .backend(UpstreamGroupId::new("g"), fixed_backend(answer_tagged(99)))
+            .build();
+
+        let answer = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("second backend answers after first times out");
+        assert_eq!(
+            answer.header.id, 99,
+            "routed answer is the second backend's"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_tls_error_retries_to_next_backend() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let resolver = Resolver::builder(policy)
+            .backend(
+                UpstreamGroupId::new("g"),
+                FailingBackend(Error::Tls("certificate expired".to_string())),
+            )
+            .backend(UpstreamGroupId::new("g"), fixed_backend(answer_tagged(5)))
+            .build();
+
+        let answer = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("tls error on first backend retries to the second");
+        assert_eq!(answer.header.id, 5);
+    }
+
+    #[tokio::test]
+    async fn failover_all_backends_fail_returns_last_error() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let resolver = Resolver::builder(policy)
+            .backend(UpstreamGroupId::new("g"), FailingBackend(Error::Timeout))
+            .backend(
+                UpstreamGroupId::new("g"),
+                FailingBackend(Error::Transport("connection refused".to_string())),
+            )
+            .build();
+
+        let err = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("both backends fail");
+        assert_eq!(
+            err,
+            Error::Transport("connection refused".to_string()),
+            "the last attempted backend's error is returned, not the first's"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_backend_group_still_behaves_as_before() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let resolver = Resolver::builder(policy)
+            .backend(UpstreamGroupId::new("g"), fixed_backend(answer_tagged(11)))
+            .build();
+
+        let answer = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("single-backend group still resolves");
+        assert_eq!(answer.header.id, 11);
     }
 
     #[tokio::test]

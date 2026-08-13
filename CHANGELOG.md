@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query, no 0-RTT. No new `dns_lattice_core::Error` variant — reuses
   `Tls`/`Transport` on the same boundary as `dot`/`doh`. See ADR-0013
   (`DL-A-14`) for the full design rationale.
+- Stage 0.3 Track D (fallback/failover across upstreams within a group):
+  `Resolver::resolve` now tries every backend registered for a matched
+  upstream group in registration order instead of only the first — a
+  backend failing with `Error::Timeout`, `Error::Transport`, or
+  `Error::Tls` falls over to the next backend in the group; the first
+  success is cached and returned as before. Once every backend in a group
+  has failed, the last attempted backend's error is propagated as-is (no
+  new `Error` variant, no synthesized answer, not cached) — this is a
+  purely internal behavioral change, `Resolver::resolve`'s signature is
+  unchanged. See ADR-0014 (`DL-A-15`) for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 
