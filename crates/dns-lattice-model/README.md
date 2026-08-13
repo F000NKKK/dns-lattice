@@ -21,5 +21,5 @@ when implementing a component that needs the DNS model without the rest of
 
 ## Status
 
-Pre-0.1 stage: this crate has no stable API yet. Types may change without
-notice until `dns-lattice` reaches its first stable release.
+Version `0.3.0` is published and this crate remains pre-1.0. Types may
+change without notice until `dns-lattice` reaches its first stable release.

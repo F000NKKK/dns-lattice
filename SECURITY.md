@@ -3,13 +3,13 @@
 ## Supported Versions
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
-published `0.1.x` to reserve their names on crates.io. Development on `main`
-has since completed stages 0.1-0.3; no public API is stable yet. Security fixes
-target the latest `0.1.x` release and the development state on `main`.
+published `0.3.0`. Development on `main` has completed stages 0.1-0.3 and is
+working on stage 0.4; no public API is stable yet. Security fixes target the
+latest `0.3.x` release and the development state on `main`.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | ✅ |
+| 0.3.x   | ✅ |
 
 ## Reporting a Vulnerability
 

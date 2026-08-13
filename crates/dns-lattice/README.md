@@ -4,6 +4,17 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
 
 ## What it provides
 
+For new code, prefer the canonical domain modules:
+
+- `dns_lattice::model` — DNS messages, names, matcher, and split-DNS policy;
+- `dns_lattice::engine` — `Resolver` query orchestration, cache, and
+  upstream failover;
+- `dns_lattice::upstream` — the outbound backend trait and transports;
+- `dns_lattice::server` — inbound listener construction and lifecycle;
+- `dns_lattice::fakeip` — caller-invoked synthetic-address storage.
+
+The existing flat root aliases remain compatible.
+
 - `dns-lattice-model`'s DNS message model (`Message`, `Header`, `Question`,
   `ResourceRecord`, `RData`), zone/domain matcher (`DomainPattern`,
   `DomainMatcher`), and split-DNS policy types (`SplitDnsPolicy`), re-exported
@@ -111,7 +122,7 @@ repository root.
 ## Usage
 
 ```rust
-use dns_lattice::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
+use dns_lattice::model::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
 
 let policy = SplitDnsPolicy::builder()
     .rule(
@@ -127,7 +138,7 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 ```rust
 use std::net::Ipv4Addr;
 
-use dns_lattice::{FakeIpPool, Name};
+use dns_lattice::{fakeip::FakeIpPool, model::Name};
 
 let pool = FakeIpPool::builder()
     .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
@@ -139,11 +150,11 @@ assert_eq!(pool.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?
 
 ## Status
 
-Pre-0.1 stage: this crate has no stable API yet. Stage 0.1 (core model)
+Version `0.3.0` is published and this crate remains pre-1.0: its public API
+may change before the first stable release. Stage 0.1 (core model)
 landed the DNS message/matcher/policy model above; stage 0.2 landed the
 resolver's construct/resolve lifecycle, static split-DNS routing, and its
-in-memory TTL/negative-caching answer cache; stage 0.3 is in final
-verification and has landed
+in-memory TTL/negative-caching answer cache; stage 0.3 landed
 the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
 `dot`/`doh`/`doq` encrypted-transport backends described above, failover
 across a group's registered backends, and the `server` module's

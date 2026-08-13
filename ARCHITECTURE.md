@@ -1,11 +1,10 @@
 # DNS Lattice architecture
 
-Status: draft. Stages 0.1-0.2 have landed the `dns-lattice-core` and
+Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
 `dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
-server listeners below; later stages implement the remaining target shape
-incrementally. Update this document whenever an implementation slice changes
-a public contract; internal design-decision records are tracked separately
-and are not part of this document.
+server listeners. Stage 0.4 is active with a pool-only Fake IP implementation;
+later stages implement the remaining target shape incrementally. Update this
+document whenever an implementation slice changes a public contract.
 
 ## Scope and role in the Lattice ecosystem
 
@@ -116,7 +115,7 @@ yet split into their own crate remains:
 dns-lattice (facade crate)
 ├── server         Inbound listener(s): bind, accept, serve UDP/TCP/DoT/DoH/DoQ (implemented, stage 0.3)
 ├── engine         Resolver: query pipeline, cache, split-DNS routing (implemented, stage 0.2)
-├── fakeip         Fake IP address pool: allocate, reverse-lookup, expire
+├── fakeip         Caller-invoked Fake IP pool: allocate, reverse-lookup, LRU eviction
 ├── upstream       Upstream backend trait + UDP/TCP/DoT/DoH/DoQ implementations (implemented, stage 0.3)
 └── hooks          Dynamic routing hook trait(s) consumed by callers
 ```
@@ -149,8 +148,8 @@ flowchart LR
     Cache -->|no| Upstream[Upstream backend: UDP/TCP/DoT/DoH/DoQ]
     Upstream --> Cache
     Cache --> Answer
-    Answer -->|Fake IP domain| FakeIP[Fake IP pool: allocate/reuse]
-    FakeIP --> Answer
+    Answer --> Host[Host application]
+    Host -->|explicit allocation / reverse lookup| FakeIP[Fake IP pool]
     Answer --> Listener
     Listener --> Client
 ```
@@ -173,7 +172,9 @@ implemented, not in this document.
 
 ## Public API surface (facade)
 
-The `dns-lattice` crate is the only place external crates import from. It
+The `dns-lattice` facade is the recommended external import point. Its
+canonical paths are domain-scoped: `dns_lattice::model`, `engine`, `server`,
+`upstream`, and `fakeip`; compatible flat aliases remain available. It
 re-exports, at minimum:
 
 - `dns-lattice-model`: query/answer types, zone matcher, policy
@@ -187,7 +188,9 @@ re-exports, at minimum:
 - `engine`: the resolver entry point (construct, resolve, shutdown), usable
   standalone (no listener) for applications that only need programmatic
   resolution.
-- `fakeip`: pool configuration and lookup/reverse-lookup types.
+- `fakeip`: caller-invoked pool configuration and lookup/reverse-lookup
+  types. It does not implicitly alter resolver/server answers, synthesize
+  PTR records, expire/persist mappings, or integrate with a tunnel.
 - `upstream`: the backend trait, so callers can implement custom transports.
 - `hooks`: the dynamic routing hook trait.
 

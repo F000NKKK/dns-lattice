@@ -58,10 +58,10 @@ implementation starts.
 
 ## Current status
 
-The `0.1.0` releases reserved the crate names on crates.io; the public API
-remains pre-1.0 and unstable. Stages 0.0 through 0.3 are done; stage 0.3
-delivered the core model, resolver/cache, upstream transports, failover, and
-inbound server listeners. See
+Version `0.3.0` is published; the public API remains pre-1.0 and unstable.
+Stages 0.0 through 0.3 are done; stage 0.3 delivered the core model,
+resolver/cache, upstream transports, failover, and inbound server listeners.
+Stage 0.4 is active with its caller-invoked, data-only Fake IP pool. See
 `CONTRIBUTING.md` and `SUPPORT.md` for current project-status language.
 
 ## Useful commands

@@ -28,7 +28,7 @@ Status: done (this document and `ARCHITECTURE.md` are its output)
 
 ## Stage 0.1 — Core model
 
-Status: active
+Status: done
 
 - DNS message model: query, answer, record types needed by the engine
   (evaluate reuse of an existing DNS protocol crate vs. hand-rolled types;
@@ -83,13 +83,17 @@ Status: done
 
 ## Stage 0.4 — Fake IP pool
 
-Status: planned
+Status: active
 
-- Deterministic allocation of synthetic IPv4/IPv6 addresses per domain.
-- Reverse lookup (address -> domain) and explicit not-found handling.
-- Pool exhaustion policy (LRU eviction, as recorded in `ARCHITECTURE.md`).
-- Integration contract documented for `tunnel-lattice` consumers, without a
-  compile-time dependency on that crate.
+- Implemented: deterministic allocation of synthetic IPv4/IPv6 addresses per
+  domain, reverse lookup (address -> domain), explicit not-found handling,
+  and per-family LRU eviction on pool exhaustion.
+- Current public boundary: caller-invoked, data-only `fakeip` pool. It does
+  not yet rewrite DNS answers, synthesize PTR records, expire or persist
+  mappings, integrate with `Resolver`/`Server`, or depend on
+  `tunnel-lattice`.
+- Remaining release work: API/documentation/package reconciliation and
+  independent review.
 
 ## Stage 0.5 — Dynamic routing hooks
 
