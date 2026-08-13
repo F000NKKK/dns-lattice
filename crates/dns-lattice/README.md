@@ -51,8 +51,18 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   `ServerBuilder::doq_addr(addr, server_config)` adds an inbound
   DNS-over-QUIC (RFC 9250) listener: a `quinn::Endpoint` in server mode
   (ALPN `doq`) answers one query per accepted bidirectional stream,
-  reusing the same framing helpers as `DoqBackend`'s client side. The
-  inbound DoH listener is still planned.
+  reusing the same framing helpers as `DoqBackend`'s client side. Behind
+  the default-off `doh` Cargo feature, `ServerBuilder::doh_addr(addr,
+  tls_config, config)` adds an inbound DNS-over-HTTPS (RFC 8484) listener:
+  it TLS-accepts each connection like `dot_addr`, then serves HTTP/1.1 via
+  `hyper_util`'s protocol-detecting server builder, parsing RFC 8484 GET
+  (`?dns=` base64url query parameter) and POST (`application/dns-message`
+  body) requests. `config` (a `DohListenerConfig`, defaulting to the
+  `/dns-query` path) selects which URI path the listener answers; any
+  other path gets HTTP 404, an unsupported method or undecodable request
+  gets HTTP 400, and everything else is answered HTTP 200 with an
+  `application/dns-message` body — including a synthesized `Rcode::ServFail`
+  on a resolver error, matching every other transport's error policy.
 
 Fake IP and dynamic routing hook capabilities are planned for later
 stages; see `ROADMAP.md` in the repository root.
@@ -106,12 +116,12 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 Pre-0.1 stage: this crate has no stable API yet. Stage 0.1 (core model)
 landed the DNS message/matcher/policy model above; stage 0.2 landed the
 resolver's construct/resolve lifecycle, static split-DNS routing, and its
-in-memory TTL/negative-caching answer cache; stage 0.3 (in progress) has so
-far landed the public async `upstream` trait, baseline UDP/TCP backends,
-the opt-in `dot`/`doh`/`doq` encrypted-transport backends described above,
-failover across a group's registered backends, and the `server` module's
-embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`), plus its
-opt-in `dot`/`doq`-gated inbound DoT/DoQ listeners (`ServerBuilder::dot_addr`/
-`doq_addr`). The inbound DoH server listener, Fake IP, and dynamic routing
-hooks are not implemented yet. Types may change without notice until the
-first stable release.
+in-memory TTL/negative-caching answer cache; stage 0.3 (complete) landed
+the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
+`dot`/`doh`/`doq` encrypted-transport backends described above, failover
+across a group's registered backends, and the `server` module's
+embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`) plus its
+opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
+(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Fake IP and dynamic
+routing hooks are not implemented yet (stage 0.4/0.5). Types may change
+without notice until the first stable release.

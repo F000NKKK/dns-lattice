@@ -95,9 +95,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DoqBackend` already uses on the client side. `Resolver::resolve` errors
   are still answered with a synthesized `Rcode::ServFail`, unchanged from
   the baseline. No existing `ServerBuilder`/`Server` public method
-  signature changes. Only the DoH listener remains as deferred follow-up
-  work under Track E. See ADR-0016 (`DL-A-17`) for the full design
+  signature changes. See ADR-0016 (`DL-A-17`) for the full design
   rationale.
+- Stage 0.3 Track E (inbound server listener, DoH) — the final Track E
+  slice, completing Stage 0.3: new `ServerBuilder::doh_addr(SocketAddr,
+  Arc<rustls::ServerConfig>, DohListenerConfig)` method and new public
+  `DohListenerConfig` type (RFC 8484 request path, defaulting to
+  `/dns-query`), behind the existing default-off `doh` Cargo feature,
+  additive to the UDP/TCP/DoT/DoQ listeners. Binds a TCP listener,
+  TLS-accepts each connection identically to `dot_addr`, then serves
+  HTTP/1.1 via `hyper_util::server::conn::auto::Builder`, parsing RFC 8484
+  GET (`?dns=` base64url query parameter) and POST (`application/
+  dns-message` body) requests. A path mismatch responds HTTP 404; an
+  unsupported method or a request whose bytes cannot be extracted/decoded
+  responds HTTP 400 before `Message::decode` is ever reached; everything
+  that decodes responds HTTP 200 with an `application/dns-message` body,
+  with `Resolver::resolve` errors still answered as a synthesized
+  `Rcode::ServFail` inside that body (not an HTTP error status), matching
+  every other transport's error policy adapted to HTTP's request/response
+  model. `dns-lattice`'s `doh` Cargo feature now additionally requests
+  `hyper`'s `server` feature and `hyper-util`'s `server`/`server-auto`
+  features on its existing dependencies (no new crate). No existing
+  `ServerBuilder`/`Server` public method signature changes. This closes out
+  Track E and Stage 0.3 in full — every planned UDP/TCP/DoT/DoH/DoQ
+  upstream backend and inbound listener for this stage has now landed. See
+  ADR-0016 (`DL-A-17`) for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 

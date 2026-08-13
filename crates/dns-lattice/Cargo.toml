@@ -46,8 +46,8 @@ rustls-pki-types = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["server"] }
+hyper-util = { workspace = true, optional = true, features = ["server", "server-auto"] }
 hyper-rustls = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }

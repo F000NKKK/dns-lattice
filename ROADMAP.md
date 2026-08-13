@@ -56,7 +56,7 @@ Status: done
 
 ## Stage 0.3 — Upstream transport backends and server listener
 
-Status: planned
+Status: done
 
 - `upstream` backend trait stabilized (from `ARCHITECTURE.md`). Done.
 - UDP and TCP upstream backends (baseline, no TLS/QUIC dependency). Done.
@@ -72,7 +72,9 @@ Status: planned
   listeners behind the same Cargo features as their upstream counterparts.
   UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT listener done
   (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoQ listener done
-  (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener remains.
+  (`ServerBuilder::doq_addr`, `doq` Cargo feature); DoH listener done
+  (`ServerBuilder::doh_addr`, `doh` Cargo feature) — Track E, and Stage
+  0.3 as a whole, are now complete.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's
   responsibility, typically via `net-lattice`.
