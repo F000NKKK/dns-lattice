@@ -82,6 +82,9 @@ pub enum Error {
     /// A valid Fake IP TTL could not be represented relative to the pool's
     /// monotonic clock instant.
     FakeIpTtlOutOfRange,
+    /// A caller-provided Fake IP pool snapshot was structurally invalid or
+    /// incompatible with its declared pool configuration.
+    InvalidFakeIpSnapshot,
 }
 
 impl fmt::Display for Error {
@@ -131,6 +134,7 @@ impl fmt::Display for Error {
                     "fake ip ttl cannot be represented by the monotonic clock"
                 )
             }
+            Error::InvalidFakeIpSnapshot => write!(f, "invalid fake ip pool snapshot"),
         }
     }
 }
@@ -207,6 +211,10 @@ mod tests {
             (
                 Error::FakeIpTtlOutOfRange,
                 "fake ip ttl cannot be represented by the monotonic clock",
+            ),
+            (
+                Error::InvalidFakeIpSnapshot,
+                "invalid fake ip pool snapshot",
             ),
         ];
         for (error, expected) in cases {

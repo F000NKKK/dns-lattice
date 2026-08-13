@@ -87,9 +87,10 @@ Status: active
 
 - Implemented: deterministic allocation of synthetic IPv4/IPv6 addresses per
   domain, reverse lookup (address -> domain), explicit not-found handling,
-  and per-family LRU eviction on pool exhaustion.
+  per-family LRU eviction on pool exhaustion, TTL expiry, and caller-owned
+  in-memory snapshot/restore of live mappings.
 - Current public boundary: caller-invoked, data-only `fakeip` pool. It does
-  not yet rewrite DNS answers, synthesize PTR records, expire or persist
+  not yet rewrite DNS answers, synthesize PTR records, durably persist
   mappings, or integrate with `Resolver`/`Server`.
 - Remaining release work: API/documentation/package reconciliation and
   independent review.

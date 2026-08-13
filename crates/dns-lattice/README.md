@@ -25,9 +25,11 @@ The existing flat root aliases remain compatible.
   ranges, allocate or reuse one address per DNS name, and reverse-resolve an
   address to its currently assigned name. Allocation uses a family-salted
   deterministic hash and circular probing; a full family evicts its LRU
-  mapping. The pool is data-only: it performs no DNS answer/PTR rewriting,
-  TTL expiry, persistence, socket I/O, resolver/server integration, or
-  implicit integration with external data planes.
+  mapping. Mappings have a required TTL and caller-owned in-memory snapshots
+  can restore their live entries and LRU order. The pool is data-only: it
+  performs no DNS answer/PTR rewriting, durable persistence, socket I/O,
+  resolver/server integration, or implicit integration with external data
+  planes.
 - An in-process resolver entry point (`Resolver`, `ResolverBuilder`): route
   one query through a `SplitDnsPolicy` to an upstream group, then try that
   group's registered backends in registration order — a backend failing
@@ -146,6 +148,10 @@ let pool = FakeIpPool::builder()
     .build()?;
 let address = pool.allocate_ipv4(Name::from_ascii("service.internal")?)?;
 assert_eq!(pool.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?));
+
+let snapshot = pool.snapshot();
+let restored = FakeIpPool::restore(snapshot)?;
+assert_eq!(restored.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?));
 # Ok::<(), dns_lattice::Error>(())
 ```
 
@@ -162,6 +168,6 @@ across a group's registered backends, and the `server` module's
 embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`) plus its
 opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
 (`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Stage 0.4 added the
-standalone Fake IP pool; resolver/server integration and dynamic routing
-hooks are not implemented yet. Types may change without notice until the
-first stable release.
+standalone Fake IP pool with TTL expiry and in-memory snapshot/restore;
+resolver/server integration and dynamic routing hooks are not implemented
+yet. Types may change without notice until the first stable release.

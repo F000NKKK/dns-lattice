@@ -188,9 +188,10 @@ re-exports, at minimum:
 - `engine`: the resolver entry point (construct, resolve, shutdown), usable
   standalone (no listener) for applications that only need programmatic
   resolution.
-- `fakeip`: caller-invoked pool configuration and lookup/reverse-lookup
-  types. It does not implicitly alter resolver/server answers, synthesize
-  PTR records, or expire/persist mappings.
+- `fakeip`: caller-invoked pool configuration, lookup/reverse-lookup, TTL,
+  and in-memory snapshot/restore types. It does not implicitly alter
+  resolver/server answers, synthesize PTR records, or durably persist
+  mappings.
 - `upstream`: the backend trait, so callers can implement custom transports.
 - `hooks`: the dynamic routing hook trait.
 

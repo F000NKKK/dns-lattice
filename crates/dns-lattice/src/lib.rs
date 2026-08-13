@@ -48,7 +48,10 @@ pub mod upstream;
 
 pub use dns_lattice_core::{Error, Result};
 pub use engine::{Resolver, ResolverBuilder};
-pub use fakeip::{FakeIpPolicy, FakeIpPolicyBuilder, FakeIpPool, FakeIpPoolBuilder};
+pub use fakeip::{
+    FakeIpMappingSnapshot, FakeIpPolicy, FakeIpPolicyBuilder, FakeIpPool, FakeIpPoolBuilder,
+    FakeIpPoolSnapshot,
+};
 pub use model::{
     Class, DomainMatcher, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode,
     RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,

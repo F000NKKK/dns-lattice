@@ -12,10 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthetic address per DNS name, and reverse-resolves active mappings.
   Each family uses a family-salted FNV-1a candidate, circular probing, and
   independent LRU eviction when full. It is a synchronous, concurrent,
-  data-only pool: DNS answer/PTR synthesis, TTL expiry, persistence,
-  and resolver/server integration remain out of scope.
+  data-only pool: DNS answer/PTR synthesis and resolver/server integration
+  remain out of scope. Mappings have a required whole-second TTL and callers
+  may snapshot live mappings (including remaining lifetime and LRU order) and
+  restore them in memory; serialization and durable persistence are not part
+  of the crate.
 - New typed `dns_lattice_core::Error` variants for invalid/unconfigured Fake
-  IP pool configuration and allocation in a disabled family.
+  IP pool configuration, invalid snapshots, and allocation in a disabled
+  family.
 
 ## [0.3.0] - 2026-08-13
 

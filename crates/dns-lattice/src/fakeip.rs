@@ -2,10 +2,12 @@
 //!
 //! [`FakeIpPool`] maps a DNS [`Name`] to one synthetic address in each
 //! configured family. It is a data-only control-plane component: it neither
-//! rewrites DNS messages, performs PTR synthesis, network I/O, persistence,
-//! or integration with an external data plane. Each mapping has the required
-//! pool TTL; expired mappings are removed on pool operations or by an
-//! explicit [`FakeIpPool::purge_expired`] call.
+//! rewrites DNS messages, performs PTR synthesis, network I/O, durable
+//! persistence, or integration with an external data plane. Each mapping has
+//! the required pool TTL; expired mappings are removed on pool operations or
+//! by an explicit [`FakeIpPool::purge_expired`] call. Callers can retain a
+//! [`FakeIpPoolSnapshot`] and restore it into a new pool without this crate
+//! serializing it or writing it to storage.
 //!
 //! Ranges are inclusive. A name's first candidate is selected with a
 //! family-salted FNV-1a hash of its canonical (case-insensitive) labels;
@@ -14,7 +16,7 @@
 //! least-recently-used mapping is evicted before a new one is inserted.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -80,6 +82,42 @@ pub struct FakeIpPool {
     clock: Box<dyn Clock + Send + Sync>,
 }
 
+/// Caller-owned, in-memory representation of a [`FakeIpPool`].
+///
+/// `mappings` is ordered deterministically: all IPv4 mappings first and then
+/// all IPv6 mappings; within a family the order is least-recently-used to
+/// most-recently-used. [`FakeIpPool::restore`] preserves that per-family LRU
+/// order. `remaining_lifetime` is sampled when [`FakeIpPool::snapshot`] is
+/// called. `captured_at` lets restoration subtract time elapsed while the
+/// in-memory snapshot is held, so restoration never extends a mapping's TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeIpPoolSnapshot {
+    /// Monotonic instant at which `remaining_lifetime` values were sampled.
+    ///
+    /// This makes a snapshot process-local in-memory data: it is not a
+    /// serialization format and is not meaningful across process restarts.
+    pub captured_at: Instant,
+    /// The inclusive IPv4 allocation range, if IPv4 is configured.
+    pub ipv4_range: Option<(Ipv4Addr, Ipv4Addr)>,
+    /// The inclusive IPv6 allocation range, if IPv6 is configured.
+    pub ipv6_range: Option<(Ipv6Addr, Ipv6Addr)>,
+    /// The required lifetime configured for new mappings.
+    pub ttl: Duration,
+    /// Live mappings in deterministic per-family LRU order.
+    pub mappings: Vec<FakeIpMappingSnapshot>,
+}
+
+/// One live mapping stored in a [`FakeIpPoolSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeIpMappingSnapshot {
+    /// The canonical DNS name associated with this synthetic address.
+    pub name: Name,
+    /// The synthetic IPv4 or IPv6 address.
+    pub address: IpAddr,
+    /// Lifetime still remaining at the moment the snapshot was taken.
+    pub remaining_lifetime: Duration,
+}
+
 impl FakeIpPool {
     /// Starts building a Fake IP pool with no configured address families.
     pub fn builder() -> FakeIpPoolBuilder {
@@ -97,6 +135,114 @@ impl FakeIpPool {
     /// records, so a client-facing answer cannot outlive its mapping.
     pub fn ttl(&self) -> Duration {
         self.ttl
+    }
+
+    /// Captures the pool's configured ranges, TTL, and currently live
+    /// mappings.
+    ///
+    /// The returned value is caller-owned in-memory data. It performs no
+    /// serialization or I/O. Expired mappings are omitted, and this call does
+    /// not refresh any mapping's LRU recency.
+    pub fn snapshot(&self) -> FakeIpPoolSnapshot {
+        let now = self.clock.now();
+        let mut mappings = Vec::new();
+        let ipv4_range = self.ipv4.as_ref().map(|state| {
+            let mut state = state.lock().expect("fake ip ipv4 mutex poisoned");
+            state.purge_expired(now);
+            mappings.extend(state.snapshot(now, |address| IpAddr::V4(Ipv4Addr::from(address))));
+            (Ipv4Addr::from(state.start), Ipv4Addr::from(state.end))
+        });
+        let ipv6_range = self.ipv6.as_ref().map(|state| {
+            let mut state = state.lock().expect("fake ip ipv6 mutex poisoned");
+            state.purge_expired(now);
+            mappings.extend(state.snapshot(now, |address| IpAddr::V6(Ipv6Addr::from(address))));
+            (Ipv6Addr::from(state.start), Ipv6Addr::from(state.end))
+        });
+        FakeIpPoolSnapshot {
+            captured_at: now,
+            ipv4_range,
+            ipv6_range,
+            ttl: self.ttl,
+            mappings,
+        }
+    }
+
+    /// Restores a new pool from a caller-owned [`FakeIpPoolSnapshot`].
+    ///
+    /// Restoration validates every range, TTL, mapping address, and duplicate
+    /// name/address before returning a pool. A mapping with no remaining
+    /// lifetime after the time held since `captured_at` is omitted. Any other
+    /// invalid snapshot returns
+    /// [`Error::InvalidFakeIpSnapshot`] without producing a partially restored
+    /// pool.
+    pub fn restore(snapshot: FakeIpPoolSnapshot) -> Result<Self> {
+        Self::restore_with_clock(snapshot, Box::new(SystemClock))
+    }
+
+    #[cfg(test)]
+    fn restore_with_test_clock(
+        snapshot: FakeIpPoolSnapshot,
+        clock: impl Clock + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::restore_with_clock(snapshot, Box::new(clock))
+    }
+
+    fn restore_with_clock(
+        snapshot: FakeIpPoolSnapshot,
+        clock: Box<dyn Clock + Send + Sync>,
+    ) -> Result<Self> {
+        validate_ttl(snapshot.ttl).map_err(|_| Error::InvalidFakeIpSnapshot)?;
+        let now = clock.now();
+        let elapsed = now
+            .checked_duration_since(snapshot.captured_at)
+            .ok_or(Error::InvalidFakeIpSnapshot)?;
+        let mut ipv4 = snapshot
+            .ipv4_range
+            .map(|(start, end)| FamilyState::new((u32::from(start), u32::from(end))))
+            .transpose()
+            .map_err(|_| Error::InvalidFakeIpSnapshot)?;
+        let mut ipv6 = snapshot
+            .ipv6_range
+            .map(|(start, end)| FamilyState::new((u128::from(start), u128::from(end))))
+            .transpose()
+            .map_err(|_| Error::InvalidFakeIpSnapshot)?;
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(Error::InvalidFakeIpSnapshot);
+        }
+
+        for mapping in snapshot.mappings {
+            if mapping.remaining_lifetime > snapshot.ttl {
+                return Err(Error::InvalidFakeIpSnapshot);
+            }
+            let Some(remaining_lifetime) = mapping.remaining_lifetime.checked_sub(elapsed) else {
+                continue;
+            };
+            if remaining_lifetime.is_zero() {
+                continue;
+            }
+            let expires_at = now
+                .checked_add(remaining_lifetime)
+                .ok_or(Error::InvalidFakeIpSnapshot)?;
+            match mapping.address {
+                IpAddr::V4(address) => ipv4
+                    .as_mut()
+                    .filter(|state| state.contains(u32::from(address)))
+                    .ok_or(Error::InvalidFakeIpSnapshot)?
+                    .restore(mapping.name, u32::from(address), expires_at)?,
+                IpAddr::V6(address) => ipv6
+                    .as_mut()
+                    .filter(|state| state.contains(u128::from(address)))
+                    .ok_or(Error::InvalidFakeIpSnapshot)?
+                    .restore(mapping.name, u128::from(address), expires_at)?,
+            }
+        }
+
+        Ok(Self {
+            ipv4: ipv4.map(Mutex::new),
+            ipv6: ipv6.map(Mutex::new),
+            ttl: snapshot.ttl,
+            clock,
+        })
     }
 
     /// Allocates or reuses this name's synthetic IPv4 address.
@@ -246,9 +392,7 @@ impl FakeIpPoolBuilder {
     /// range returns [`Error::InvalidFakeIpRange`].
     pub fn build(self) -> Result<FakeIpPool> {
         let ttl = self.ttl.ok_or(Error::InvalidFakeIpTtl)?;
-        if ttl.is_zero() || ttl.subsec_nanos() != 0 {
-            return Err(Error::InvalidFakeIpTtl);
-        }
+        validate_ttl(ttl)?;
         let ipv4 = self.ipv4.map(FamilyState::new).transpose()?;
         let ipv6 = self.ipv6.map(FamilyState::new).transpose()?;
         if ipv4.is_none() && ipv6.is_none() {
@@ -424,6 +568,47 @@ impl<T: Address> FamilyState<T> {
         expired.len()
     }
 
+    fn snapshot<A>(&self, now: Instant, address: impl Fn(T) -> A) -> Vec<FakeIpMappingSnapshot>
+    where
+        A: Into<IpAddr>,
+    {
+        let mut mappings: Vec<_> = self.forward.iter().collect();
+        mappings.sort_by_key(|(_, mapping)| (mapping.recency, mapping.allocation));
+        mappings
+            .into_iter()
+            .filter_map(|(name, mapping)| {
+                mapping
+                    .expires_at
+                    .checked_duration_since(now)
+                    .map(|remaining_lifetime| FakeIpMappingSnapshot {
+                        name: name.clone(),
+                        address: address(mapping.address).into(),
+                        remaining_lifetime,
+                    })
+            })
+            .collect()
+    }
+
+    fn restore(&mut self, name: Name, address: T, expires_at: Instant) -> Result<()> {
+        if self.forward.contains_key(&name) || self.reverse.contains_key(&address) {
+            return Err(Error::InvalidFakeIpSnapshot);
+        }
+        let recency = self.touch();
+        let allocation = self.next_allocation;
+        self.next_allocation = self.next_allocation.wrapping_add(1);
+        self.reverse.insert(address, name.clone());
+        self.forward.insert(
+            name,
+            Mapping {
+                address,
+                recency,
+                allocation,
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
     fn capacity(&self) -> Option<T> {
         T::capacity(self.start, self.end)
     }
@@ -444,6 +629,13 @@ impl<T: Address> FamilyState<T> {
         self.next_recency = self.next_recency.wrapping_add(1);
         recency
     }
+}
+
+fn validate_ttl(ttl: Duration) -> Result<()> {
+    if ttl.is_zero() || ttl.subsec_nanos() != 0 {
+        return Err(Error::InvalidFakeIpTtl);
+    }
+    Ok(())
 }
 
 const IPV4_HASH_SALT: u64 = 0x9B73_9F4A_A5C3_17D1;
@@ -628,6 +820,149 @@ mod tests {
         assert_eq!(pool.lookup_ipv4(live), Some(name("live.test")));
         assert!(!pool.contains_ipv4(Ipv4Addr::new(192, 0, 2, 1)));
         assert!(!pool.contains_ipv6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_live_mappings_ttl_and_lru_order() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(10))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2))
+            .build()
+            .unwrap();
+        let alpha = name("alpha.snapshot.test");
+        let bravo = name("bravo.snapshot.test");
+        let charlie = name("charlie.snapshot.test");
+        let alpha_address = pool.allocate_ipv4(alpha.clone()).unwrap();
+        let bravo_address = pool.allocate_ipv4(bravo.clone()).unwrap();
+        assert_eq!(pool.lookup_ipv4(alpha_address), Some(alpha.clone()));
+        clock.advance(Duration::from_secs(1));
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.ttl, Duration::from_secs(10));
+        assert_eq!(snapshot.mappings.len(), 2);
+        assert_eq!(snapshot.mappings[0].name, bravo);
+        assert_eq!(snapshot.mappings[1].name, alpha);
+        assert!(
+            snapshot
+                .mappings
+                .iter()
+                .all(|mapping| mapping.remaining_lifetime == Duration::from_secs(9))
+        );
+
+        clock.advance(Duration::from_secs(4));
+        let restored = FakeIpPool::restore_with_test_clock(snapshot, clock.clone()).unwrap();
+        let charlie_address = restored.allocate_ipv4(charlie.clone()).unwrap();
+        assert_eq!(restored.lookup_ipv4(bravo_address), Some(charlie));
+        assert_eq!(charlie_address, bravo_address);
+        assert_eq!(restored.lookup_ipv4(alpha_address), Some(alpha));
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(restored.lookup_ipv4(alpha_address), None);
+    }
+
+    #[test]
+    fn snapshot_omits_expired_mappings_and_restore_skips_zero_lifetime_entries() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(2))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+            .build()
+            .unwrap();
+        pool.allocate_ipv4(name("expired.snapshot.test")).unwrap();
+        let held_snapshot = pool.snapshot();
+        clock.advance(Duration::from_secs(2));
+        assert!(pool.snapshot().mappings.is_empty());
+        let restored_held =
+            FakeIpPool::restore_with_test_clock(held_snapshot, clock.clone()).unwrap();
+        assert_eq!(restored_held.lookup_ipv4(Ipv4Addr::LOCALHOST), None);
+
+        let snapshot = FakeIpPoolSnapshot {
+            captured_at: clock.now(),
+            ipv4_range: Some((Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)),
+            ipv6_range: None,
+            ttl: Duration::from_secs(2),
+            mappings: vec![FakeIpMappingSnapshot {
+                name: name("zero.snapshot.test"),
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                remaining_lifetime: Duration::ZERO,
+            }],
+        };
+        let restored = FakeIpPool::restore_with_test_clock(snapshot, clock).unwrap();
+        assert_eq!(restored.lookup_ipv4(Ipv4Addr::LOCALHOST), None);
+    }
+
+    #[test]
+    fn restore_rejects_invalid_ranges_ttls_addresses_and_duplicates() {
+        let valid_mapping = FakeIpMappingSnapshot {
+            name: name("valid.snapshot.test"),
+            address: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            remaining_lifetime: Duration::from_secs(1),
+        };
+        let base = FakeIpPoolSnapshot {
+            captured_at: Instant::now(),
+            ipv4_range: Some((Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2))),
+            ipv6_range: None,
+            ttl: Duration::from_secs(2),
+            mappings: vec![valid_mapping.clone()],
+        };
+        let invalid = [
+            FakeIpPoolSnapshot {
+                ipv4_range: None,
+                ipv6_range: None,
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                ttl: Duration::ZERO,
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                ipv4_range: Some((Ipv4Addr::new(198, 18, 0, 2), Ipv4Addr::new(198, 18, 0, 1))),
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                mappings: vec![FakeIpMappingSnapshot {
+                    address: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    ..valid_mapping.clone()
+                }],
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                mappings: vec![FakeIpMappingSnapshot {
+                    address: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9)),
+                    ..valid_mapping.clone()
+                }],
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                mappings: vec![valid_mapping.clone(), valid_mapping.clone()],
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                mappings: vec![
+                    valid_mapping.clone(),
+                    FakeIpMappingSnapshot {
+                        name: name("second.snapshot.test"),
+                        ..valid_mapping.clone()
+                    },
+                ],
+                ..base.clone()
+            },
+            FakeIpPoolSnapshot {
+                mappings: vec![FakeIpMappingSnapshot {
+                    remaining_lifetime: Duration::from_secs(3),
+                    ..valid_mapping
+                }],
+                ..base
+            },
+        ];
+        for snapshot in invalid {
+            assert!(matches!(
+                FakeIpPool::restore(snapshot),
+                Err(Error::InvalidFakeIpSnapshot)
+            ));
+        }
     }
 
     #[test]

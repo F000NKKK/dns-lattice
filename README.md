@@ -126,7 +126,7 @@ Implemented (`0.3.0` plus the current `0.4` development slice):
 - Inbound DNS-over-QUIC (DoQ, RFC 9250) listener behind the `doq` Cargo feature: `ServerBuilder::doq_addr` accepts a `quinn` QUIC endpoint (ALPN `doq`) and answers one query per bidirectional stream, reusing the same framing helpers as the `DoqBackend` upstream
 - Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: TCP `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s protocol-detecting server builder over TLS 1.2 or 1.3. A dual-protocol deployment configures `h2` and `http/1.1` ALPN identifiers; GET (`?dns=` base64url) and POST (`application/dns-message` body) work on either protocol.
 - HTTP/3 DoH is additive, not a replacement for legacy TCP: `Doh3Backend` and QUIC `ServerBuilder::doh3_addr` use QUIC/UDP with ALPN `h3` and TLS 1.3. Keep TCP `DohBackend`/`doh_addr` for HTTP/1.1 and HTTP/2 clients on TLS 1.2 or 1.3.
-- Caller-invoked `fakeip::FakeIpPool`: deterministic, concurrent IPv4 and/or IPv6 allocation and reverse lookup with inclusive ranges and per-family LRU eviction. It is data-only: it does not rewrite DNS answers, synthesize PTR records, apply TTL expiry, persist mappings, or integrate implicitly with `Resolver` or `Server`.
+- Caller-invoked `fakeip::FakeIpPool`: deterministic, concurrent IPv4 and/or IPv6 allocation and reverse lookup with inclusive ranges and per-family LRU eviction. Mappings have a required TTL and can be captured/restored as caller-owned in-memory snapshots. It is data-only: it does not rewrite DNS answers, synthesize PTR records, durably persist mappings, or integrate implicitly with `Resolver` or `Server`.
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
@@ -211,7 +211,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
 4. **Stage 0.3: Upstream transport backends and server listener** *(completed)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
-5. **Stage 0.4: Fake IP pool** *(active)* — caller-invoked deterministic synthetic address allocation, reverse lookup, and LRU eviction; no implicit DNS rewrite, TTL expiry, or persistence.
+5. **Stage 0.4: Fake IP pool** *(active)* — caller-invoked deterministic synthetic address allocation, reverse lookup, LRU eviction, TTL expiry, and in-memory snapshot/restore; no implicit DNS rewrite, PTR synthesis, or durable persistence.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
 8. **Stage 1.0: Stable public API and first release** — public API frozen, `cargo package`/docs.rs verified, first crates.io release.
