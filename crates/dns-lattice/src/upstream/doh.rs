@@ -443,7 +443,12 @@ mod tests {
         let (_reserved, addr) = reserve_closed_tcp_port().await;
 
         let backend = DohBackend::new(DohBackendConfig {
-            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            // Keep the URI on the same IPv4 loopback address the UDP
+            // reservation uses. `localhost` may resolve to IPv6 first on
+            // Windows, which turns this connection-refused fixture into an
+            // unrelated address-family/DNS-selection test before the DoH
+            // connector reaches its transport-error boundary.
+            uri: Uri::from_str(&format!("https://127.0.0.1:{}/dns-query", addr.port())).unwrap(),
             method: DohMethod::Get,
             tls_config: Arc::new(client_config),
             timeout: Duration::from_secs(2),
