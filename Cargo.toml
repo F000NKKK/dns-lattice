@@ -23,8 +23,15 @@ dns-lattice = { path = "crates/dns-lattice", version = "0.2.0" }
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["net", "time", "rt", "macros", "io-util"] }
 
-# DoT (dns-lattice `dot` feature, RFC 7858)
-rustls = { version = "0.23", default-features = false, features = ["tls12", "std"] }
+# DoT (dns-lattice `dot` feature, RFC 7858). `aws-lc-rs` is enabled
+# directly here (not left to arrive transitively via `doh`'s
+# `hyper-rustls` or `doq`'s `quinn`) so `rustls` has a process-level
+# `CryptoProvider` even when the `dot` Cargo feature is enabled on its
+# own — without it, any TLS handshake panics at runtime with "Could not
+# automatically determine the process-level CryptoProvider" (this
+# workspace already standardizes on `aws-lc-rs`, not `ring`, per
+# `DL-A-14`/ADR-0013's rationale for `doq`'s matching choice).
+rustls = { version = "0.23", default-features = false, features = ["tls12", "std", "aws-lc-rs"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 webpki-roots = "1"
