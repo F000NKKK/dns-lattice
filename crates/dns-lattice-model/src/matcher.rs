@@ -1,5 +1,26 @@
 //! A zone/domain matcher with deterministic exact/suffix/wildcard
-//! precedence (see ADR-0006).
+//! precedence.
+//!
+//! # Precedence
+//!
+//! Matching is case-insensitive. An exact rule beats every suffix and
+//! wildcard rule. Between suffix rules, or between wildcard rules, the rule
+//! with the most labels wins. Equal kind and label-count ties retain
+//! insertion order: the first inserted rule wins.
+//!
+//! ```
+//! use dns_lattice_model::{DomainMatcher, DomainPattern, Name};
+//!
+//! let mut matcher = DomainMatcher::new();
+//! matcher.insert(DomainPattern::wildcard(Name::from_ascii("example.com")?), "wildcard");
+//! matcher.insert(DomainPattern::suffix(Name::from_ascii("example.com")?), "suffix");
+//! matcher.insert(DomainPattern::suffix(Name::from_ascii("api.example.com")?), "specific suffix");
+//! matcher.insert(DomainPattern::exact(Name::from_ascii("api.example.com")?), "exact");
+//!
+//! assert_eq!(matcher.resolve(&Name::from_ascii("API.EXAMPLE.COM")?), Some(&"exact"));
+//! assert_eq!(matcher.resolve(&Name::from_ascii("v1.api.example.com")?), Some(&"specific suffix"));
+//! # Ok::<(), dns_lattice_core::Error>(())
+//! ```
 
 use dns_lattice_core::{Error, Result};
 
@@ -77,7 +98,7 @@ impl DomainPattern {
 }
 
 /// A precedence-ordered collection of domain patterns mapped to a payload
-/// `T`. Precedence rules are recorded in ADR-0006:
+/// `T`. Matching is case-insensitive and precedence is:
 ///
 /// 1. Exact beats suffix beats wildcard beats no match.
 /// 2. Within the same kind, a longer (more specific) match wins.

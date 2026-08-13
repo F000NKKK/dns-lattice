@@ -1,18 +1,16 @@
-//! In-process resolver entry point: construct-from-config, resolve one
-//! query, and route it via static split-DNS matching (stage 0.1's
-//! [`SplitDnsPolicy`]) to an upstream group.
+//! Query orchestration for decoded DNS messages.
 //!
-//! Stage 0.2 added an in-memory, TTL-respecting answer cache including
-//! negative caching (RFC 2308). Stage 0.3 (ADR-0011, `DL-A-12`) replaces
-//! the stage-0.2 crate-private, synchronous `UpstreamBackend` with the
-//! public, async [`crate::upstream::UpstreamBackend`] trait: [`Resolver`]
-//! holds an ordered list of backends per [`UpstreamGroupId`], and
-//! [`Resolver::resolve`] is now an `async fn` — see the module-level
-//! runtime-requirement note on [`crate::upstream`]. Track D (ADR-0014,
-//! `DL-A-15`) adds failover: [`Resolver::resolve`] tries a matched group's
-//! backends in registration order, falling over to the next backend on a
-//! retryable error and propagating the last attempted backend's error once
-//! the group is exhausted.
+//! [`Resolver`] accepts a decoded [`Message`], selects an upstream group by
+//! static [`SplitDnsPolicy`] routing, reads and writes its in-memory
+//! TTL/negative cache, and invokes registered [`crate::upstream::UpstreamBackend`]
+//! values in registration order with retryable-error failover.
+//!
+//! It does **not** own inbound server lifecycle, socket binding, wire
+//! framing, TLS/HTTP/QUIC protocol handling, Fake IP allocation, dynamic
+//! hooks, operating-system DNS configuration, or TUN/TAP integration. Those
+//! responsibilities belong respectively to [`crate::server`],
+//! [`crate::upstream`], caller-invoked [`crate::fakeip`], future hook APIs,
+//! and composing applications.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,11 +25,11 @@ use crate::upstream::UpstreamBackend;
 
 /// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
 /// response carries no SOA record in its authority section to derive a
-/// `minimum` from. Not user-configurable in this stage (ADR-0010 point 4).
+/// `minimum` from. It is not user-configurable.
 const NEGATIVE_CACHE_FLOOR: Duration = Duration::from_secs(60);
 
 /// A source of the current time, abstracted so tests can advance it
-/// deterministically instead of relying on real `sleep` (ADR-0010 point 5).
+/// deterministically instead of relying on real `sleep`.
 ///
 /// Crate-private: no external caller needs to inject a clock in this stage;
 /// [`Resolver::builder`] always defaults to [`SystemClock`].
@@ -83,7 +81,7 @@ impl Clock for FakeClock {
 
 /// Cache key: the fields that identify a question's matching intent,
 /// equivalent to a [`dns_lattice_model::Question`]'s name/type/class but
-/// independent of that struct's exact field set (ADR-0010 point 1).
+/// independent of that struct's exact field set.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     name: Name,
@@ -92,14 +90,20 @@ struct CacheKey {
 }
 
 /// A cached answer plus its absolute expiry instant, computed at insert
-/// time (ADR-0010 point 2).
+/// time.
 struct CacheEntry {
     answer: Message,
     expires_at: Instant,
 }
 
-/// An in-process DNS resolver: construct from a split-DNS policy and one or
-/// more upstream backends per group, then resolve queries against it.
+/// An in-process DNS query orchestrator.
+///
+/// Construct it from a split-DNS policy and one or more upstream backends
+/// per group, then resolve decoded queries against it. It owns policy
+/// selection, caching, and upstream failover, but not server lifecycle or
+/// transport protocol implementation; see the [module documentation].
+///
+/// [module documentation]: self
 ///
 /// # Lifecycle
 ///
@@ -131,8 +135,8 @@ impl Resolver {
     /// Extracts the queried name from `query`'s first question, checks the
     /// in-memory answer cache, and on a miss routes the query through the
     /// configured [`SplitDnsPolicy`] to select an upstream group, then tries
-    /// that group's registered backends in registration order (ADR-0014,
-    /// `DL-A-15`): the first backend to return `Ok` wins and its answer is
+    /// that group's registered backends in registration order: the first
+    /// backend to return `Ok` wins and its answer is
     /// cached (per the existing TTL rules) and returned immediately. A
     /// backend failing with [`Error::Timeout`], [`Error::Transport`], or
     /// [`Error::Tls`] is treated as retryable — resolution moves on to the
@@ -212,8 +216,8 @@ impl Resolver {
 }
 
 /// Returns whether `err` should cause the failover loop to try the next
-/// backend in the group rather than propagate immediately (ADR-0014,
-/// `DL-A-15` decision 1): all three backend-level failure variants —
+/// backend in the group rather than propagate immediately: all three
+/// backend-level failure variants —
 /// [`Error::Timeout`], [`Error::Transport`], and [`Error::Tls`] — are
 /// retryable, since none indicate a client-input problem and a different
 /// backend in the same group may have independent connectivity/TLS
@@ -226,10 +230,10 @@ fn is_retryable(err: &Error) -> bool {
 /// if it should not be cached at all.
 ///
 /// Positive answers (`NoError` with at least one answer record) use the
-/// minimum `ttl` across their answer records (ADR-0010 point 3). Negative
+/// minimum `ttl` across their answer records. Negative
 /// answers (`NxDomain`, or `NoError` with an empty answer section) use the
 /// `minimum` field of an SOA record in the authority section when present
-/// (RFC 2308 §5), else [`NEGATIVE_CACHE_FLOOR`] (ADR-0010 point 4).
+/// (RFC 2308 §5), else [`NEGATIVE_CACHE_FLOOR`].
 fn cacheable_ttl(answer: &Message) -> Option<Duration> {
     let is_negative = matches!(answer.header.rcode, Rcode::NxDomain)
         || (matches!(answer.header.rcode, Rcode::NoError) && answer.answers.is_empty());
@@ -272,7 +276,7 @@ impl ResolverBuilder {
     /// `group`, appended after any backend already registered for that
     /// group. [`Resolver::resolve`] tries a group's backends in this
     /// registration order, falling over to the next one on a retryable
-    /// error (ADR-0014, `DL-A-15`).
+    /// error.
     ///
     /// `backend` is any [`crate::upstream::UpstreamBackend`] implementation
     /// — e.g. [`crate::upstream::UdpBackend`]/
@@ -291,8 +295,7 @@ impl ResolverBuilder {
     }
 
     /// Substitutes the clock used to compute and check cache expiry.
-    /// Crate-private: no public API for clock injection in this stage
-    /// (ADR-0010 point 5).
+    /// Crate-private: no public API for clock injection.
     #[cfg(test)]
     pub(crate) fn clock(mut self, clock: impl Clock + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
@@ -628,7 +631,7 @@ mod tests {
     }
 
     // --- Dedicated fake upstream backend + cache test suite (deferred from
-    // the routing slice, ADR-0009/ADR-0010) -------------------------------
+    // the routing and cache slice -----------------------------------------
 
     use std::net::Ipv4Addr;
     use std::sync::Arc;

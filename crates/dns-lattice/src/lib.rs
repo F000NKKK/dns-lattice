@@ -1,10 +1,10 @@
 //! Programmable Rust DNS control plane for the Lattice networking stack:
 //! split DNS, Fake IP, address pools, and dynamic routing hooks.
 //!
-//! # Example
+//! # Canonical module imports
 //!
 //! ```
-//! use dns_lattice::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
+//! use dns_lattice::model::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
 //!
 //! let policy = SplitDnsPolicy::builder()
 //!     .rule(
@@ -19,37 +19,40 @@
 //!
 //! # Facade design
 //!
-//! Re-exports the DNS message, matcher, and policy types from
-//! `dns-lattice-model`, and the shared `Error`/`Result` pair from
-//! `dns-lattice-core`. Stage 0.1 implemented the `model` layer; stage 0.2
-//! added the [`engine`] module's [`Resolver`] (construct/resolve, static
-//! split-DNS routing, and an in-memory TTL/negative-caching answer cache).
-//! Stage 0.3 adds the [`upstream`] module's public, async
-//! [`UpstreamBackend`] trait plus baseline [`UdpBackend`]/[`TcpBackend`]
-//! transport implementations, plus DNS-over-TLS/DNS-over-HTTPS/
-//! DNS-over-QUIC backends behind the default-off `dot`/`doh`/`doq` Cargo
-//! features, and the [`server`] module's [`Server`]/[`ServerBuilder`]
-//! inbound UDP/TCP baseline plus DoT/DoH/DoQ listeners, completing the
-//! embeddable-DNS-server-engine goal for this stage (ADR-0015; DoT/DoH/DoQ
-//! per ADR-0016). Stage 0.4 adds the [`fakeip`] module's [`FakeIpPool`]: a
-//! pure, concurrent data store that allocates and reverse-resolves synthetic
-//! IPv4/IPv6 addresses. It deliberately does not integrate with
-//! [`Resolver`], [`Server`], DNS message rewriting, or a tunnel. Later work
-//! adds `hooks` behind this same facade. See `ARCHITECTURE.md` for the full
-//! module layout.
+//! The canonical imports are domain-scoped: [`model`] for message, matcher,
+//! and policy types; [`engine`] for query orchestration; [`upstream`] for
+//! outbound transports; [`server`] for inbound listeners; and [`fakeip`] for
+//! caller-invoked synthetic-address storage. `Error` and `Result` are shared
+//! across those domains.
+//!
+//! Existing flat aliases such as [`Name`], [`Resolver`], and [`UdpBackend`]
+//! remain supported for compatibility. New code should prefer the canonical
+//! module paths above, which make ownership and responsibility explicit.
 
 pub mod engine;
 pub mod fakeip;
+/// DNS message, domain-matching, and split-DNS policy types.
+///
+/// This is the canonical facade path for types supplied by
+/// `dns-lattice-model`; for example, import [`Name`] as
+/// `dns_lattice::model::Name`. The flat root aliases remain supported for
+/// compatibility.
+pub mod model {
+    pub use dns_lattice_model::{
+        Class, DomainMatcher, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode,
+        RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
+    };
+}
 pub mod server;
 pub mod upstream;
 
 pub use dns_lattice_core::{Error, Result};
-pub use dns_lattice_model::{
+pub use engine::{Resolver, ResolverBuilder};
+pub use fakeip::{FakeIpPool, FakeIpPoolBuilder};
+pub use model::{
     Class, DomainMatcher, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode,
     RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
 };
-pub use engine::{Resolver, ResolverBuilder};
-pub use fakeip::{FakeIpPool, FakeIpPoolBuilder};
 pub use server::{Server, ServerBuilder};
 #[cfg(feature = "doh")]
 pub use upstream::{DohBackend, DohBackendConfig, DohMethod};
@@ -58,3 +61,16 @@ pub use upstream::{DoqBackend, DoqBackendConfig};
 #[cfg(feature = "dot")]
 pub use upstream::{DotBackend, DotBackendConfig};
 pub use upstream::{TcpBackend, TcpBackendConfig, UdpBackend, UdpBackendConfig, UpstreamBackend};
+
+#[cfg(test)]
+mod facade_path_tests {
+    use super::{DomainMatcher, DomainPattern, Name, Resolver, ResolverBuilder, model};
+
+    #[test]
+    fn canonical_model_paths_and_flat_aliases_name_the_same_types() {
+        let _: model::Name = Name::root();
+        let _: Option<model::DomainMatcher<()>> = Some(DomainMatcher::new());
+        let _: fn(model::Name) -> model::DomainPattern = DomainPattern::suffix;
+        let _: fn(model::SplitDnsPolicy) -> ResolverBuilder = Resolver::builder;
+    }
+}
