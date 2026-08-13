@@ -17,6 +17,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  feature-matrix:
+    name: feature matrix (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            cargo_args: --no-default-features
+          - name: dot
+            cargo_args: --no-default-features --features dot
+          - name: doh
+            cargo_args: --no-default-features --features doh
+          - name: doq
+            cargo_args: --no-default-features --features doq
+          - name: all-features
+            cargo_args: --all-features
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      - name: cargo check -p dns-lattice ${{ matrix.cargo_args }}
+        run: cargo check -p dns-lattice ${{ matrix.cargo_args }}
+
+      - name: cargo test -p dns-lattice ${{ matrix.cargo_args }}
+        run: cargo test -p dns-lattice ${{ matrix.cargo_args }}
+
   ci:
     name: ci (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
