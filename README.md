@@ -63,7 +63,7 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (stage 0.1-0.2, plus stage 0.3 Tracks A and B):
+Implemented (stage 0.1-0.2, plus stage 0.3 Tracks A, B, and C):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -72,10 +72,11 @@ Implemented (stage 0.1-0.2, plus stage 0.3 Tracks A and B):
 - In-process, async `Resolver`: construct from a `SplitDnsPolicy`, route one query to an upstream group, and resolve it through a registered backend, with an in-memory TTL-respecting answer cache including RFC 2308 negative caching
 - Public, async `upstream` module (`UpstreamBackend` trait, `UdpBackend`, `TcpBackend`): baseline UDP and TCP upstream transports over `tokio`, no EDNS0/OPT yet (UDP falls back to TCP on a truncated response)
 - DoT (`DotBackend`, RFC 7858) and DoH (`DohBackend`, RFC 8484) upstream backends, each behind its own default-off `dot`/`doh` Cargo feature, over `rustls`/`tokio-rustls`/`hyper`/`hyper-rustls`
+- DoQ (`DoqBackend`, RFC 9250) upstream backend behind its own default-off `doq` Cargo feature, over `quinn` (QUIC transport, TLS 1.3 embedded via `rustls`); a fresh QUIC connection per query in this stage, no connection pooling/reuse yet
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
-- DoQ upstream backend behind a Cargo feature, upstream failover, and the inbound server listener (rest of stage 0.3)
+- Upstream failover and the inbound server listener (rest of stage 0.3)
 - Fake IP address pool with reverse lookup (stage 0.4)
 - Dynamic routing hooks for caller-driven policy (stage 0.5)
 - Cross-platform CI matrix, fuzz/property tests, observability sink (stage 0.6)
@@ -89,7 +90,7 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 
 ## Current Status
 
-Stages 0.1-0.2 plus stage 0.3 Tracks A and B of the [architecture](ARCHITECTURE.md)'s
+Stages 0.1-0.2 plus stage 0.3 Tracks A, B, and C of the [architecture](ARCHITECTURE.md)'s
 module layout is covered by deterministic unit/doc tests, `clippy -D
 warnings`, and verified `cargo package` listings for all three crates:
 
@@ -98,12 +99,13 @@ warnings`, and verified `cargo package` listings for all three crates:
 - the `dns-lattice` facade's `engine` module (`Resolver`, `ResolverBuilder`): in-process, async construct/resolve, static split-DNS routing, and an in-memory TTL-respecting/negative-caching answer cache
 - the `dns-lattice` facade's `upstream` module (`UpstreamBackend`, `UdpBackend`, `TcpBackend`): baseline UDP/TCP upstream transports over `tokio`, no EDNS0/OPT yet
 - the `dns-lattice` facade's `upstream` module's opt-in `dot`/`doh` Cargo features (`DotBackend`, `DohBackend`): DNS-over-TLS/DNS-over-HTTPS transports over `rustls`/`hyper`, tested against loopback TLS/HTTPS fixtures with a locally generated self-signed certificate
+- the `dns-lattice` facade's `upstream` module's opt-in `doq` Cargo feature (`DoqBackend`): DNS-over-QUIC transport over `quinn`/`rustls`, tested against a loopback `quinn` QUIC server fixture with a locally generated self-signed certificate
 
 This gives a complete, tested DNS message model, a deterministic
-zone/domain matcher, and an in-process resolver with real UDP/TCP/DoT/DoH
-upstream transport usable standalone today, ahead of DoQ, upstream
-failover, and the inbound server listener. No Fake IP exists yet — see
-Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
+zone/domain matcher, and an in-process resolver with real UDP/TCP/DoT/DoH/
+DoQ upstream transport usable standalone today, ahead of upstream failover
+and the inbound server listener. No Fake IP exists yet — see Non-Goals for
+stage 0.2 in [ROADMAP.md](ROADMAP.md).
 
 | Capability | Status |
 |---|:---:|
@@ -114,7 +116,8 @@ Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 | Resolver engine / answer cache | ✅ |
 | UDP/TCP upstream backends | ✅ |
 | DoT/DoH upstream backends (`dot`/`doh` Cargo features) | ✅ |
-| DoQ upstream + failover + server listener | planned (0.3) |
+| DoQ upstream backend (`doq` Cargo feature) | ✅ |
+| Upstream failover + server listener | planned (0.3) |
 | Fake IP pool | planned (0.4) |
 | Dynamic routing hooks | planned (0.5) |
 
@@ -137,7 +140,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
-4. **Stage 0.3: Upstream transport backends and server listener** *(Tracks A and B complete)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH behind `dot`/`doh` Cargo features; DoQ behind a Cargo feature, fallback/failover across upstreams, and the inbound UDP/TCP/DoT/DoH/DoQ server listener remain.
+4. **Stage 0.3: Upstream transport backends and server listener** *(Tracks A, B, and C complete)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features; fallback/failover across upstreams and the inbound UDP/TCP/DoT/DoH/DoQ server listener remain.
 5. **Stage 0.4: Fake IP pool** — deterministic synthetic address allocation, reverse lookup, LRU eviction, documented `tunnel-lattice` integration contract.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.

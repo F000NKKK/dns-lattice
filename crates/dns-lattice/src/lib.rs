@@ -26,10 +26,10 @@
 //! split-DNS routing, and an in-memory TTL/negative-caching answer cache).
 //! Stage 0.3 adds the [`upstream`] module's public, async
 //! [`UpstreamBackend`] trait plus baseline [`UdpBackend`]/[`TcpBackend`]
-//! transport implementations, plus DNS-over-TLS/DNS-over-HTTPS backends
-//! behind the default-off `dot`/`doh` Cargo features. Later stages add
-//! `server`, `fakeip`, and `hooks` behind this same facade. See
-//! `ARCHITECTURE.md` for the full module layout.
+//! transport implementations, plus DNS-over-TLS/DNS-over-HTTPS/
+//! DNS-over-QUIC backends behind the default-off `dot`/`doh`/`doq` Cargo
+//! features. Later stages add `server`, `fakeip`, and `hooks` behind this
+//! same facade. See `ARCHITECTURE.md` for the full module layout.
 
 pub mod engine;
 pub mod upstream;
@@ -42,6 +42,8 @@ pub use dns_lattice_model::{
 pub use engine::{Resolver, ResolverBuilder};
 #[cfg(feature = "doh")]
 pub use upstream::{DohBackend, DohBackendConfig, DohMethod};
+#[cfg(feature = "doq")]
+pub use upstream::{DoqBackend, DoqBackendConfig};
 #[cfg(feature = "dot")]
 pub use upstream::{DotBackend, DotBackendConfig};
 pub use upstream::{TcpBackend, TcpBackendConfig, UdpBackend, UdpBackendConfig, UpstreamBackend};

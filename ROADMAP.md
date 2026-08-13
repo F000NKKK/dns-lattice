@@ -58,12 +58,13 @@ Status: done
 
 Status: planned
 
-- `upstream` backend trait stabilized (from `ARCHITECTURE.md`).
-- UDP and TCP upstream backends (baseline, no TLS/QUIC dependency).
-- DoT and DoH upstream backends behind explicit Cargo features.
+- `upstream` backend trait stabilized (from `ARCHITECTURE.md`). Done.
+- UDP and TCP upstream backends (baseline, no TLS/QUIC dependency). Done.
+- DoT and DoH upstream backends behind explicit Cargo features. Done.
 - DoQ upstream backend behind an explicit Cargo feature, if a maintained
   QUIC/HTTP-3 dependency is available for all target platforms; otherwise
-  record the gap as an ADR and defer.
+  record the gap as an ADR and defer. Done — `quinn` cleared the bar; the
+  `doq` Cargo feature landed (`DoqBackend`/`DoqBackendConfig`).
 - Fallback/failover across upstreams within a group (see the failure-flow
   diagram in `ARCHITECTURE.md`).
 - `server` inbound listener: UDP and TCP first, matching the crate's

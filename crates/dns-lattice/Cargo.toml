@@ -31,6 +31,9 @@ doh = [
     "dep:bytes",
     "dep:base64",
 ]
+# DNS-over-QUIC (RFC 9250) upstream backend. Default off, independent of
+# `dot`/`doh`. See `DL-A-14` (ADR-0013).
+doq = ["dep:quinn", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 
 [dependencies]
 dns-lattice-core = { workspace = true }
@@ -50,6 +53,8 @@ http = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+
+quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }

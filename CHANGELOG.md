@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dns_lattice_core::Error::Tls(String)` variant for TLS handshake/
   certificate/hostname-verification failures, distinct from `Transport`.
   See ADR-0012 (`DL-A-13`) for the full design rationale.
+- Stage 0.3 Track C (upstream transport, part 3): new default-off `doq`
+  Cargo feature on `dns-lattice` adding `DoqBackend`/`DoqBackendConfig`
+  (DNS-over-QUIC, RFC 9250) over `quinn` (TLS 1.3 embedded in QUIC via
+  `rustls`, sharing the workspace's `aws-lc-rs` crypto provider with
+  `dot`/`doh`). Independent of `dot`/`doh`; opens a fresh QUIC connection
+  per query in this stage (no pooling/reuse), one bidirectional stream per
+  query, no 0-RTT. No new `dns_lattice_core::Error` variant — reuses
+  `Tls`/`Transport` on the same boundary as `dot`/`doh`. See ADR-0013
+  (`DL-A-14`) for the full design rationale.
 
 ## [0.2.0] - 2026-08-02
 

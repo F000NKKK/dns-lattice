@@ -15,21 +15,28 @@
 //! server whenever a UDP response arrives with the `TC` (truncated) bit
 //! set, rather than negotiating a larger UDP payload size.
 //!
-//! # DoT and DoH (feature-gated)
+//! # DoT, DoH, and DoQ (feature-gated)
 //!
-//! Two additional backends land in this module, each behind its own
+//! Three additional backends land in this module, each behind its own
 //! default-off Cargo feature so the baseline UDP/TCP build carries no
-//! TLS/HTTP dependency weight, per ADR-0012 (`DL-A-13`):
+//! TLS/HTTP/QUIC dependency weight, per ADR-0012 (`DL-A-13`) and ADR-0013
+//! (`DL-A-14`):
 //!
 //! - `dot` (`#[cfg(feature = "dot")]`): `DotBackend`/`DotBackendConfig`,
 //!   DNS-over-TLS (RFC 7858) over `rustls`/`tokio-rustls`.
 //! - `doh` (`#[cfg(feature = "doh")]`): `DohBackend`/`DohBackendConfig`,
 //!   DNS-over-HTTPS (RFC 8484) over `hyper`/`hyper-rustls`.
+//! - `doq` (`#[cfg(feature = "doq")]`): `DoqBackend`/`DoqBackendConfig`,
+//!   DNS-over-QUIC (RFC 9250) over `quinn` (TLS 1.3 embedded in QUIC via
+//!   `rustls`). Opens a fresh QUIC connection per query in this stage (no
+//!   pooling/reuse), reusing the same length-prefixed framing helper as
+//!   [`TcpBackend`]/`dot::DotBackend` on one bidirectional stream.
 //!
-//! Both follow the same `Config` + `Backend` +
+//! All three follow the same `Config` + `Backend` +
 //! `#[async_trait] impl UpstreamBackend` pattern as [`UdpBackend`]/
-//! [`TcpBackend`]; TLS/HTTP-specific fields (SNI server name, TLS client
-//! config, HTTP method) live on the new config structs, not the trait.
+//! [`TcpBackend`]; TLS/HTTP/QUIC-specific fields (SNI server name, TLS
+//! client config, HTTP method) live on the new config structs, not the
+//! trait.
 //!
 //! # Runtime requirement
 //!
@@ -59,6 +66,11 @@ mod doh;
 #[cfg(feature = "doh")]
 pub use doh::{DohBackend, DohBackendConfig, DohMethod};
 
+#[cfg(feature = "doq")]
+mod doq;
+#[cfg(feature = "doq")]
+pub use doq::{DoqBackend, DoqBackendConfig};
+
 /// Maximum size, in bytes, of a UDP response this baseline backend accepts
 /// without EDNS0 payload-size negotiation (RFC 1035 §4.2.1's 512-byte
 /// standard UDP message size). A larger answer arrives with `TC=1` set and
@@ -75,7 +87,7 @@ const UDP_MAX_RESPONSE_LEN: usize = 512;
 /// timeout/retry policy via their transport-specific config — this trait
 /// does not accept a timeout argument.
 ///
-/// Custom transports (e.g. DoT/DoH/DoQ, planned for a later stage) can
+/// Custom transports (e.g. DoT/DoH/DoQ, or any future transport) can
 /// implement this trait directly and register with
 /// [`crate::ResolverBuilder::backend`] alongside [`UdpBackend`]/
 /// [`TcpBackend`].
@@ -462,12 +474,16 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_backend_transport_error_on_connect_failure() {
-        // A server socket that is bound-then-dropped frees the port but is
-        // very likely to have nothing listening; connecting to an address
-        // with no listener yields a transport error rather than success.
-        let placeholder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = placeholder.local_addr().unwrap();
-        drop(placeholder);
+        // Reserve a loopback port via a UDP socket that is never a TCP
+        // listener, so a TCP `connect()` to it fails immediately and
+        // deterministically on every platform. Binding then dropping a
+        // *TCP* listener is not reliable for this across platforms: on
+        // Windows, a `connect()` racing the just-closed listener's
+        // teardown can transiently succeed instead of failing immediately
+        // (see the identical fix applied to `upstream::dot`/`upstream::doh`
+        // tests, which is exactly this Windows CI failure mode).
+        let reserved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserved.local_addr().unwrap();
 
         let backend = TcpBackend::new(TcpBackendConfig {
             server: addr,

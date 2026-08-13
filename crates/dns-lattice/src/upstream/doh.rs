@@ -188,10 +188,21 @@ mod tests {
     use dns_lattice_model::{Class, Header, Name, Opcode, Question, Rcode, RecordType};
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+
+    /// Reserves a loopback port with no TCP listener ever bound to it, for
+    /// a deterministic "connection refused" test case — see the identical
+    /// helper's doc comment in `upstream::dot::tests` for why bind-then-
+    /// drop of a TCP listener is not reliable across platforms (Windows in
+    /// particular).
+    async fn reserve_closed_tcp_port() -> (UdpSocket, std::net::SocketAddr) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
+    }
 
     fn query_for(name: &str) -> Message {
         Message {
@@ -429,9 +440,7 @@ mod tests {
     async fn doh_backend_transport_error_on_connect_failure() {
         let (_server_config, client_config) = self_signed_fixture();
 
-        let placeholder = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = placeholder.local_addr().unwrap();
-        drop(placeholder);
+        let (_reserved, addr) = reserve_closed_tcp_port().await;
 
         let backend = DohBackend::new(DohBackendConfig {
             uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),

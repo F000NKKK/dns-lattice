@@ -20,12 +20,15 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   support yet (`UdpBackend` falls back to a TCP query when a response's
   `TC` bit is set). Failover across upstreams within a group and the
   inbound server listener are still planned.
-- Two opt-in, default-off Cargo features adding encrypted upstream
+- Three opt-in, default-off Cargo features adding encrypted upstream
   transports to the same `upstream` module: `dot` (`DotBackend`/
-  `DotBackendConfig`, DNS-over-TLS, RFC 7858, over `rustls`/`tokio-rustls`)
-  and `doh` (`DohBackend`/`DohBackendConfig`/`DohMethod`, DNS-over-HTTPS,
-  RFC 8484, GET and POST wire formats, over `hyper`/`hyper-rustls`). A DoQ
-  backend is still planned.
+  `DotBackendConfig`, DNS-over-TLS, RFC 7858, over `rustls`/`tokio-rustls`),
+  `doh` (`DohBackend`/`DohBackendConfig`/`DohMethod`, DNS-over-HTTPS,
+  RFC 8484, GET and POST wire formats, over `hyper`/`hyper-rustls`), and
+  `doq` (`DoqBackend`/`DoqBackendConfig`, DNS-over-QUIC, RFC 9250, over
+  `quinn`, with TLS 1.3 embedded in QUIC via `rustls`). `doq` opens a fresh
+  QUIC connection per query in this stage — no connection pooling/reuse
+  yet.
 
 Server, Fake IP, and dynamic routing hook capabilities are planned for
 later stages; see `ROADMAP.md` in the repository root.
@@ -43,11 +46,19 @@ later stages; see `ROADMAP.md` in the repository root.
   `base64` as dependencies. Independent of `dot`; enable only this feature
   to use `DohBackend` without pulling in raw TLS-over-TCP framing you don't
   use directly.
-- Both `dot` and `doh` use `rustls` (pure-Rust TLS, no OpenSSL/platform-TLS
-  dependency) uniformly on Linux, Windows, and macOS — no platform-specific
-  behavior. Cross-platform: no `cfg`-gated logic in either backend.
-- Neither feature requires elevated privileges; both perform ordinary
-  outbound TLS/HTTPS client connections.
+- `doq` feature: adds `rustls`, `rustls-pki-types`, `webpki-roots`, and
+  `quinn` as dependencies. Independent of `dot`/`doh`; enable only this
+  feature to use `DoqBackend` without pulling in `tokio-rustls`/`hyper`.
+  `quinn`'s `rustls` crypto-provider feature is set to `rustls-aws-lc-rs`,
+  sharing the same `aws-lc-rs` provider `doh`'s `hyper-rustls` dependency
+  already pulls in, rather than compiling in a second (`ring`-based)
+  provider.
+- `dot`, `doh`, and `doq` all use `rustls` (pure-Rust TLS, no OpenSSL/
+  platform-TLS dependency) uniformly on Linux, Windows, and macOS — no
+  platform-specific behavior. Cross-platform: no `cfg`-gated logic in any
+  backend.
+- None of the three features require elevated privileges; all perform
+  ordinary outbound TLS/HTTPS/QUIC client connections.
 
 ## Usage
 
@@ -72,7 +83,7 @@ landed the DNS message/matcher/policy model above; stage 0.2 landed the
 resolver's construct/resolve lifecycle, static split-DNS routing, and its
 in-memory TTL/negative-caching answer cache; stage 0.3 (in progress) has so
 far landed the public async `upstream` trait, baseline UDP/TCP backends,
-and the opt-in `dot`/`doh` encrypted-transport backends described above. A
-DoQ backend, upstream failover, the inbound server listener, Fake IP, and
+and the opt-in `dot`/`doh`/`doq` encrypted-transport backends described
+above. Upstream failover, the inbound server listener, Fake IP, and
 dynamic routing hooks are not implemented yet. Types may change without
 notice until the first stable release.

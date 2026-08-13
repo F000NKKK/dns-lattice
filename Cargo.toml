@@ -38,6 +38,14 @@ http-body-util = "0.1"
 bytes = "1"
 base64 = "0.23"
 
+# DoQ (dns-lattice `doq` feature, RFC 9250). `rustls-aws-lc-rs` shares this
+# workspace's already-pinned `rustls`/`aws-lc-rs` crypto-provider line
+# (pulled in by `doh`'s `hyper-rustls` dependency) rather than also
+# compiling in `ring` via quinn's default `rustls-ring` feature. See
+# `DL-A-14` (ADR-0013).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+
 # Test-only: generates a self-signed certificate/key pair for the loopback
-# DoT/DoH TLS test fixtures (dns-lattice `dot`/`doh` feature tests).
+# DoT/DoH/DoQ TLS test fixtures (dns-lattice `dot`/`doh`/`doq` feature
+# tests).
 rcgen = "0.14"
