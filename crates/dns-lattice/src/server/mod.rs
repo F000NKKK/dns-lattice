@@ -924,12 +924,13 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use dns_lattice_model::{
-        Class, Header, Name, Opcode, Question, RData, RecordType, ResourceRecord, SplitDnsPolicy,
-        UpstreamGroupId,
+        Class, DomainPattern, Header, Name, Opcode, Question, RData, RecordType, ResourceRecord,
+        SplitDnsPolicy, UpstreamGroupId,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
+    use crate::fakeip::{FakeIpPolicy, FakeIpPool};
     use crate::upstream::UpstreamBackend;
 
     fn query_for(name: &str, id: u16) -> Message {
@@ -1027,6 +1028,86 @@ mod tests {
         )
     }
 
+    fn resolver_with_fake_ip(backend: impl UpstreamBackend + 'static) -> Arc<Resolver> {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let pool = Arc::new(
+            FakeIpPool::builder()
+                .ipv4_range("198.18.0.1".parse().unwrap(), "198.18.0.2".parse().unwrap())
+                .ipv6_range(
+                    "2001:db8::1".parse().unwrap(),
+                    "2001:db8::2".parse().unwrap(),
+                )
+                .ttl(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        );
+        let fake_ip_policy = FakeIpPolicy::builder()
+            .rule(DomainPattern::suffix(
+                Name::from_ascii("fake.test").unwrap(),
+            ))
+            .build();
+        Arc::new(
+            Resolver::builder(policy)
+                .backend(UpstreamGroupId::new("g"), backend)
+                .fake_ip(pool, fake_ip_policy)
+                .build(),
+        )
+    }
+
+    fn query_for_type(name: &str, qtype: RecordType, id: u16) -> Message {
+        let mut query = query_for(name, id);
+        query.questions[0].qtype = qtype;
+        query
+    }
+
+    fn ipv4_reverse_name(address: std::net::Ipv4Addr) -> String {
+        let octets = address.octets();
+        format!(
+            "{}.{}.{}.{}.in-addr.arpa",
+            octets[3], octets[2], octets[1], octets[0]
+        )
+    }
+
+    fn ipv6_reverse_name(address: std::net::Ipv6Addr) -> String {
+        address
+            .octets()
+            .iter()
+            .rev()
+            .flat_map(|byte| [format!("{:x}", byte & 0x0f), format!("{:x}", byte >> 4)])
+            .collect::<Vec<_>>()
+            .join(".")
+            + ".ip6.arpa"
+    }
+
+    async fn tcp_round_trip(stream: &mut TcpStream, query: &Message) -> Message {
+        let payload = query.encode().unwrap();
+        let len: u16 = payload.len().try_into().unwrap();
+        stream.write_all(&len.to_be_bytes()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let response_len = u16::from_be_bytes(len_buf) as usize;
+        let mut response_buf = vec![0u8; response_len];
+        stream.read_exact(&mut response_buf).await.unwrap();
+        Message::decode(&response_buf).unwrap()
+    }
+
+    async fn udp_round_trip(client: &UdpSocket, addr: SocketAddr, query: &Message) -> Message {
+        client
+            .send_to(&query.encode().unwrap(), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("response arrives in time")
+            .unwrap();
+        Message::decode(&buf[..len]).unwrap()
+    }
+
     #[tokio::test]
     async fn udp_round_trip_success() {
         let resolver = resolver_with(FixedBackend(answer_with_a(
@@ -1067,6 +1148,62 @@ mod tests {
         assert_eq!(response.header.id, 42);
         assert_eq!(response.header.rcode, Rcode::NoError);
         assert_eq!(response.answers.len(), 1);
+
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_fake_ip_a_and_ptr_are_synthesized_while_policy_miss_uses_upstream() {
+        let resolver = resolver_with_fake_ip(FixedBackend(answer_with_a(
+            "upstream.test",
+            0,
+            "203.0.113.80".parse().unwrap(),
+        )));
+        let server = ServerBuilder::new(resolver)
+            .udp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds udp");
+        let addr = server.udp_sockets[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let synthetic = udp_round_trip(&client, addr, &query_for("www.fake.test", 61)).await;
+        assert_eq!(synthetic.header.id, 61);
+        assert_eq!(synthetic.answers.len(), 1);
+        assert_eq!(
+            synthetic.answers[0].rdata,
+            RData::A("198.18.0.1".parse().unwrap())
+        );
+
+        let reverse = ipv4_reverse_name("198.18.0.1".parse().unwrap());
+        let ptr = udp_round_trip(
+            &client,
+            addr,
+            &query_for_type(&reverse, RecordType::Ptr, 62),
+        )
+        .await;
+        assert_eq!(ptr.header.id, 62);
+        assert_eq!(ptr.header.rcode, Rcode::NoError);
+        assert_eq!(
+            ptr.answers[0].rdata,
+            RData::Ptr(Name::from_ascii("www.fake.test").unwrap())
+        );
+
+        let fallback = udp_round_trip(&client, addr, &query_for("upstream.test", 63)).await;
+        assert_eq!(fallback.header.id, 63);
+        assert_eq!(
+            fallback.answers[0].rdata,
+            RData::A("203.0.113.80".parse().unwrap())
+        );
 
         shutdown_tx.send(()).unwrap();
         serve_task.await.unwrap().unwrap();
@@ -1121,6 +1258,62 @@ mod tests {
             assert!(response.header.qr);
             assert_eq!(response.header.id, id);
         }
+
+        drop(stream);
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_fake_ip_aaaa_and_ptr_are_synthesized_while_policy_miss_uses_upstream() {
+        let resolver = resolver_with_fake_ip(FixedBackend(answer_with_a(
+            "upstream.test",
+            0,
+            "203.0.113.81".parse().unwrap(),
+        )));
+        let server = ServerBuilder::new(resolver)
+            .tcp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds tcp");
+        let addr = server.tcp_listeners[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let synthetic = tcp_round_trip(
+            &mut stream,
+            &query_for_type("www.fake.test", RecordType::Aaaa, 71),
+        )
+        .await;
+        assert_eq!(synthetic.header.id, 71);
+        assert_eq!(synthetic.answers.len(), 1);
+        assert_eq!(
+            synthetic.answers[0].rdata,
+            RData::Aaaa("2001:db8::1".parse().unwrap())
+        );
+
+        let reverse = ipv6_reverse_name("2001:db8::1".parse().unwrap());
+        let ptr = tcp_round_trip(&mut stream, &query_for_type(&reverse, RecordType::Ptr, 72)).await;
+        assert_eq!(ptr.header.id, 72);
+        assert_eq!(ptr.header.rcode, Rcode::NoError);
+        assert_eq!(
+            ptr.answers[0].rdata,
+            RData::Ptr(Name::from_ascii("www.fake.test").unwrap())
+        );
+
+        let fallback = tcp_round_trip(&mut stream, &query_for("upstream.test", 73)).await;
+        assert_eq!(fallback.header.id, 73);
+        assert_eq!(
+            fallback.answers[0].rdata,
+            RData::A("203.0.113.81".parse().unwrap())
+        );
 
         drop(stream);
         shutdown_tx.send(()).unwrap();
