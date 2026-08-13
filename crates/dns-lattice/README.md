@@ -42,7 +42,12 @@ Programmable Rust DNS control plane for the Lattice networking stack: split DNS,
   truncated with `TC=1` set at the existing 512-byte boundary; a
   `Resolver::resolve` error is answered with a synthesized
   `Rcode::ServFail` response instead of being dropped or crashing the
-  listener. DoT/DoH/DoQ inbound listeners are still planned.
+  listener. Behind the default-off `dot` Cargo feature,
+  `ServerBuilder::dot_addr(addr, tls_config)` adds an inbound DNS-over-TLS
+  (RFC 7858) listener: it TLS-accepts each connection via
+  `tokio_rustls::TlsAcceptor` (caller-supplied `rustls::ServerConfig`) and
+  then reuses the exact same length-prefixed read/write loop as the plain
+  TCP listener. DoH/DoQ inbound listeners are still planned.
 
 Fake IP and dynamic routing hook capabilities are planned for later
 stages; see `ROADMAP.md` in the repository root.
@@ -99,7 +104,8 @@ in-memory TTL/negative-caching answer cache; stage 0.3 (in progress) has so
 far landed the public async `upstream` trait, baseline UDP/TCP backends,
 the opt-in `dot`/`doh`/`doq` encrypted-transport backends described above,
 failover across a group's registered backends, and the `server` module's
-embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`). The inbound
-DoT/DoH/DoQ server listeners, Fake IP, and dynamic routing hooks are not
+embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`), plus its
+opt-in `dot`-gated inbound DoT listener (`ServerBuilder::dot_addr`). The
+inbound DoH/DoQ server listeners, Fake IP, and dynamic routing hooks are not
 implemented yet. Types may change without notice until the first stable
 release.

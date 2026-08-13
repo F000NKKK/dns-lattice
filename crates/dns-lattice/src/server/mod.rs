@@ -1,10 +1,14 @@
-//! Inbound DNS server listener: binds UDP/TCP (baseline) and hands decoded
-//! queries to [`crate::engine::Resolver`], fulfilling the embeddable-
-//! server-engine goal named in `ARCHITECTURE.md`.
+//! Inbound DNS server listener: binds UDP/TCP (baseline) and, behind the
+//! `dot` Cargo feature, DNS-over-TLS (RFC 7858), handing decoded queries to
+//! [`crate::engine::Resolver`], fulfilling the embeddable-server-engine goal
+//! named in `ARCHITECTURE.md`.
 //!
-//! Per ADR-0015 (`DL-A-16`), this module is scoped to the UDP/TCP baseline
-//! only in this stage; DoT/DoH/DoQ inbound listeners are separate follow-up
-//! work behind the same `dot`/`doh`/`doq` Cargo features their `upstream`
+//! Per ADR-0015 (`DL-A-16`), the UDP/TCP baseline landed first; per
+//! ADR-0016 (`DL-A-17`), the DoT listener ([`ServerBuilder::dot_addr`])
+//! extends the same `ServerBuilder`/`Server` types behind the `dot` Cargo
+//! feature, reusing the baseline TCP per-connection loop unchanged once the
+//! TLS handshake completes. DoH/DoQ inbound listeners remain separate
+//! follow-up work behind the `doh`/`doq` Cargo features their `upstream`
 //! counterparts already use.
 //!
 //! # Lifecycle
@@ -43,7 +47,15 @@ use std::time::Duration;
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{Message, Rcode};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use tokio::net::TcpStream;
+use tokio::net::{TcpListener, UdpSocket};
+
+#[cfg(feature = "dot")]
+use tokio_rustls::TlsAcceptor;
+#[cfg(feature = "dot")]
+use tokio_rustls::rustls::ServerConfig;
 
 use crate::Resolver;
 use crate::upstream::{UDP_MAX_RESPONSE_LEN, read_framed, write_framed};
@@ -65,6 +77,8 @@ pub struct ServerBuilder {
     resolver: Arc<Resolver>,
     udp_addrs: Vec<SocketAddr>,
     tcp_addrs: Vec<SocketAddr>,
+    #[cfg(feature = "dot")]
+    dot_addrs: Vec<(SocketAddr, Arc<ServerConfig>)>,
 }
 
 impl ServerBuilder {
@@ -79,6 +93,8 @@ impl ServerBuilder {
             resolver,
             udp_addrs: Vec::new(),
             tcp_addrs: Vec::new(),
+            #[cfg(feature = "dot")]
+            dot_addrs: Vec::new(),
         }
     }
 
@@ -93,6 +109,22 @@ impl ServerBuilder {
     /// multiple TCP addresses.
     pub fn tcp_addr(mut self, addr: SocketAddr) -> Self {
         self.tcp_addrs.push(addr);
+        self
+    }
+
+    /// Adds a DNS-over-TLS (RFC 7858) address to bind, with `tls_config`
+    /// used to accept the TLS session on every connection to that address
+    /// (ADR-0016, `DL-A-17` decision 1). May be called more than once to
+    /// bind multiple DoT addresses, each with its own `tls_config`.
+    ///
+    /// This crate does not source certificate material itself (`DL-19`'s
+    /// stated non-goal, reaffirmed by `DL-A-17`) — the caller supplies a
+    /// fully configured `Arc<rustls::ServerConfig>`, exactly like
+    /// [`crate::upstream::DotBackendConfig`]'s existing
+    /// `Arc<ClientConfig>` ownership pattern on the client side.
+    #[cfg(feature = "dot")]
+    pub fn dot_addr(mut self, addr: SocketAddr, tls_config: Arc<ServerConfig>) -> Self {
+        self.dot_addrs.push((addr, tls_config));
         self
     }
 
@@ -126,10 +158,22 @@ impl ServerBuilder {
             tcp_listeners.push(listener);
         }
 
+        #[cfg(feature = "dot")]
+        let mut dot_listeners = Vec::with_capacity(self.dot_addrs.len());
+        #[cfg(feature = "dot")]
+        for (addr, tls_config) in self.dot_addrs {
+            let listener = TcpListener::bind(addr)
+                .await
+                .map_err(|err| Error::Transport(err.to_string()))?;
+            dot_listeners.push((listener, TlsAcceptor::from(tls_config)));
+        }
+
         Ok(Server {
             resolver: self.resolver,
             udp_sockets,
             tcp_listeners,
+            #[cfg(feature = "dot")]
+            dot_listeners,
         })
     }
 }
@@ -141,6 +185,8 @@ pub struct Server {
     resolver: Arc<Resolver>,
     udp_sockets: Vec<UdpSocket>,
     tcp_listeners: Vec<TcpListener>,
+    #[cfg(feature = "dot")]
+    dot_listeners: Vec<(TcpListener, TlsAcceptor)>,
 }
 
 impl Server {
@@ -174,6 +220,8 @@ impl Server {
             resolver,
             udp_sockets,
             tcp_listeners,
+            #[cfg(feature = "dot")]
+            dot_listeners,
         } = self;
 
         let udp_sockets: Vec<Arc<UdpSocket>> = udp_sockets.into_iter().map(Arc::new).collect();
@@ -186,6 +234,11 @@ impl Server {
         for listener in tcp_listeners {
             let resolver = resolver.clone();
             loops.spawn(async move { serve_tcp(listener, resolver).await });
+        }
+        #[cfg(feature = "dot")]
+        for (listener, acceptor) in dot_listeners {
+            let resolver = resolver.clone();
+            loops.spawn(async move { serve_dot(listener, acceptor, resolver).await });
         }
 
         tokio::pin!(shutdown);
@@ -291,11 +344,50 @@ async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) -> Result<()>
     }
 }
 
-/// Serves one accepted TCP connection: repeatedly reads a length-prefixed
-/// query and writes back a length-prefixed response until the connection
-/// closes or a read/write error occurs, so a single connection can carry
-/// multiple back-to-back queries (RFC 1035 §4.2.2).
-async fn handle_tcp_connection(mut stream: TcpStream, resolver: &Resolver) {
+/// Runs `listener`'s DoT (RFC 7858) accept loop forever, mirroring
+/// [`serve_tcp`]: one `tokio::task` per accepted connection (ADR-0016,
+/// `DL-A-17` decision 2). The TLS accept itself happens *inside* the
+/// spawned per-connection task, not in this accept loop, so a single
+/// slow/hostile handshake cannot stall accepting the next connection — same
+/// non-blocking-accept-loop principle as `serve_tcp`. A handshake failure
+/// ends that connection's task without a response (no reliable peer
+/// identity/session to answer on a failed handshake, matching the
+/// undecodable-datagram policy).
+#[cfg(feature = "dot")]
+async fn serve_dot(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    resolver: Arc<Resolver>,
+) -> Result<()> {
+    loop {
+        let (stream, _peer) = listener
+            .accept()
+            .await
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        let acceptor = acceptor.clone();
+        let resolver = resolver.clone();
+        tokio::spawn(async move {
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            handle_tcp_connection(tls_stream, &resolver).await;
+        });
+    }
+}
+
+/// Serves one accepted TCP (or TLS-wrapped TCP, for DoT) connection:
+/// repeatedly reads a length-prefixed query and writes back a
+/// length-prefixed response until the connection closes or a read/write
+/// error occurs, so a single connection can carry multiple back-to-back
+/// queries (RFC 1035 §4.2.2). Generic over `S: AsyncRead + AsyncWrite +
+/// Unpin` so the baseline TCP listener and the DoT listener
+/// (ADR-0016, `DL-A-17` decision 2) share this exact loop body unchanged —
+/// a `tokio_rustls::server::TlsStream<TcpStream>` implements the same
+/// bound as a plain `TcpStream`.
+async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    resolver: &Resolver,
+) {
     loop {
         let query = match read_framed(&mut stream, TCP_IO_TIMEOUT).await {
             Ok(query) => query,
@@ -768,5 +860,183 @@ mod tests {
             .await
             .expect("serve_until with no bound sockets still returns on shutdown");
         assert!(result.unwrap().is_ok());
+    }
+
+    #[cfg(feature = "dot")]
+    mod dot_tests {
+        use super::*;
+        use rcgen::{CertifiedKey, generate_simple_self_signed};
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+        /// Generates a self-signed loopback certificate and matching
+        /// server/client `rustls` configs, mirroring
+        /// `upstream::dot::tests::self_signed_fixture` — fully offline and
+        /// deterministic per `@.claude/rules/ci.md`.
+        fn self_signed_fixture() -> (ServerConfig, ClientConfig, ServerName<'static>) {
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let cert_der: CertificateDer<'static> = cert.der().clone();
+            let key_der: PrivateKeyDer<'static> =
+                PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
+
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .unwrap();
+
+            let mut roots = RootCertStore::empty();
+            roots.add(cert_der).unwrap();
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+
+            let server_name = ServerName::try_from("localhost").unwrap();
+            (server_config, client_config, server_name)
+        }
+
+        async fn dot_query(
+            connector: &TlsConnector,
+            server_name: ServerName<'static>,
+            addr: SocketAddr,
+            query: &Message,
+        ) -> Message {
+            let tcp_stream = TcpStream::connect(addr).await.unwrap();
+            let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+            let payload = query.encode().unwrap();
+            let len: u16 = payload.len().try_into().unwrap();
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&len.to_be_bytes());
+            framed.extend_from_slice(&payload);
+            tls_stream.write_all(&framed).await.unwrap();
+
+            let mut len_buf = [0u8; 2];
+            tls_stream.read_exact(&mut len_buf).await.unwrap();
+            let response_len = u16::from_be_bytes(len_buf) as usize;
+            let mut response_buf = vec![0u8; response_len];
+            tls_stream.read_exact(&mut response_buf).await.unwrap();
+            Message::decode(&response_buf).unwrap()
+        }
+
+        #[tokio::test]
+        async fn dot_round_trip_success() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 10),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .dot_addr("127.0.0.1:0".parse().unwrap(), Arc::new(server_config))
+                .bind()
+                .await
+                .expect("binds dot");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.dot_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let query = query_for("example.com", 21);
+            let response = dot_query(&connector, server_name, addr, &query).await;
+            assert!(response.header.qr);
+            assert_eq!(response.header.id, 21);
+            assert_eq!(response.header.rcode, Rcode::NoError);
+            assert_eq!(response.answers.len(), 1);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn dot_multiple_queries_over_one_tls_connection() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 11),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .dot_addr("127.0.0.1:0".parse().unwrap(), Arc::new(server_config))
+                .bind()
+                .await
+                .expect("binds dot");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.dot_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let tcp_stream = TcpStream::connect(addr).await.unwrap();
+            let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+            for id in [1u16, 2u16, 3u16] {
+                let query = query_for(&format!("q{id}.example.com"), id);
+                let payload = query.encode().unwrap();
+                let len: u16 = payload.len().try_into().unwrap();
+                let mut framed = Vec::new();
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&payload);
+                tls_stream.write_all(&framed).await.unwrap();
+
+                let mut len_buf = [0u8; 2];
+                tls_stream.read_exact(&mut len_buf).await.unwrap();
+                let response_len = u16::from_be_bytes(len_buf) as usize;
+                let mut response_buf = vec![0u8; response_len];
+                tls_stream.read_exact(&mut response_buf).await.unwrap();
+                let response = Message::decode(&response_buf).unwrap();
+                assert!(response.header.qr);
+                assert_eq!(response.header.id, id);
+            }
+
+            drop(tls_stream);
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn dot_servfail_synthesized_on_resolver_error() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FailingBackend);
+            let server = ServerBuilder::new(resolver)
+                .dot_addr("127.0.0.1:0".parse().unwrap(), Arc::new(server_config))
+                .bind()
+                .await
+                .expect("binds dot");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.dot_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let query = query_for("nope.example.com", 33);
+            let response = dot_query(&connector, server_name, addr, &query).await;
+            assert_eq!(response.header.rcode, Rcode::ServFail);
+            assert_eq!(response.header.id, 33);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
     }
 }

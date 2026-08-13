@@ -57,5 +57,5 @@ base64 = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 rcgen = { workspace = true }

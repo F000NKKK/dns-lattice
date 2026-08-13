@@ -74,10 +74,11 @@ Implemented (stage 0.1-0.2, plus stage 0.3 Tracks A, B, C, and E's UDP/TCP basel
 - DoT (`DotBackend`, RFC 7858) and DoH (`DohBackend`, RFC 8484) upstream backends, each behind its own default-off `dot`/`doh` Cargo feature, over `rustls`/`tokio-rustls`/`hyper`/`hyper-rustls`
 - DoQ (`DoqBackend`, RFC 9250) upstream backend behind its own default-off `doq` Cargo feature, over `quinn` (QUIC transport, TLS 1.3 embedded via `rustls`); a fresh QUIC connection per query in this stage, no connection pooling/reuse yet
 - Public, async `server` module (`Server`, `ServerBuilder`): embeddable inbound UDP/TCP DNS listener over an `Arc<Resolver>` — construct/bind/serve/shutdown lifecycle, one task per UDP datagram and one task per TCP connection (looping over multiple length-prefixed queries per RFC 1035 §4.2.2), oversized UDP answers truncated with `TC=1`, and `Rcode::ServFail` synthesis when the resolver returns an error
+- Inbound DNS-over-TLS (DoT, RFC 7858) listener behind the `dot` Cargo feature: `ServerBuilder::dot_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor` and reuses the same length-prefixed read/write loop as the TCP listener
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
-- DoT/DoH/DoQ inbound server listeners (rest of stage 0.3)
+- Inbound DoH/DoQ server listeners (rest of stage 0.3)
 - Fake IP address pool with reverse lookup (stage 0.4)
 - Dynamic routing hooks for caller-driven policy (stage 0.5)
 - Cross-platform CI matrix, fuzz/property tests, observability sink (stage 0.6)
@@ -91,8 +92,8 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 
 ## Current Status
 
-Stages 0.1-0.2 plus stage 0.3 Tracks A, B, C, D, and E's UDP/TCP baseline of
-the [architecture](ARCHITECTURE.md)'s module layout is covered by
+Stages 0.1-0.2 plus stage 0.3 Tracks A, B, C, D, and E's UDP/TCP/DoT baseline
+of the [architecture](ARCHITECTURE.md)'s module layout is covered by
 deterministic unit/doc tests, `clippy -D warnings`, and verified `cargo
 package` listings for all three crates:
 
@@ -103,12 +104,13 @@ package` listings for all three crates:
 - the `dns-lattice` facade's `upstream` module's opt-in `dot`/`doh` Cargo features (`DotBackend`, `DohBackend`): DNS-over-TLS/DNS-over-HTTPS transports over `rustls`/`hyper`, tested against loopback TLS/HTTPS fixtures with a locally generated self-signed certificate
 - the `dns-lattice` facade's `upstream` module's opt-in `doq` Cargo feature (`DoqBackend`): DNS-over-QUIC transport over `quinn`/`rustls`, tested against a loopback `quinn` QUIC server fixture with a locally generated self-signed certificate
 - the `dns-lattice` facade's `server` module (`Server`, `ServerBuilder`): inbound UDP/TCP listener over an in-process fake `Resolver` fixture, covering round-trip resolution over both transports, UDP truncation/`TC=1` behavior, `Rcode::ServFail` synthesis on a resolver error, and graceful shutdown via `serve_until`
+- the `dns-lattice` facade's `server` module's opt-in `dot` Cargo feature (`ServerBuilder::dot_addr`): inbound DNS-over-TLS listener, tested against a loopback TLS client with a locally generated self-signed certificate, covering round-trip resolution, multiple queries over one TLS connection, and `Rcode::ServFail` synthesis on a resolver error
 
 This gives a complete, tested DNS message model, a deterministic
 zone/domain matcher, an in-process resolver with real UDP/TCP/DoT/DoH/DoQ
 upstream transport and failover across a group's backends, and an
-embeddable inbound UDP/TCP DNS server listener, all usable standalone
-today, ahead of the DoT/DoH/DoQ inbound listeners. No Fake IP exists yet —
+embeddable inbound UDP/TCP/DoT DNS server listener, all usable standalone
+today, ahead of the inbound DoH/DoQ listeners. No Fake IP exists yet —
 see Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 
 | Capability | Status |
@@ -123,7 +125,8 @@ see Non-Goals for stage 0.2 in [ROADMAP.md](ROADMAP.md).
 | DoQ upstream backend (`doq` Cargo feature) | ✅ |
 | Upstream failover across a group's backends | ✅ |
 | Inbound UDP/TCP server listener | ✅ |
-| Inbound DoT/DoH/DoQ server listeners | planned (0.3) |
+| Inbound DoT server listener (`dot` Cargo feature) | ✅ |
+| Inbound DoH/DoQ server listeners | planned (0.3) |
 | Fake IP pool | planned (0.4) |
 | Dynamic routing hooks | planned (0.5) |
 
@@ -146,7 +149,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
-4. **Stage 0.3: Upstream transport backends and server listener** *(Tracks A, B, C, D, and E's UDP/TCP baseline complete)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP server listener (`Server`/`ServerBuilder`); the inbound DoT/DoH/DoQ server listeners remain.
+4. **Stage 0.3: Upstream transport backends and server listener** *(Tracks A, B, C, D, and E's UDP/TCP/DoT complete)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT server listener (`Server`/`ServerBuilder`); the inbound DoH/DoQ server listeners remain.
 5. **Stage 0.4: Fake IP pool** — deterministic synthetic address allocation, reverse lookup, LRU eviction, documented `tunnel-lattice` integration contract.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.

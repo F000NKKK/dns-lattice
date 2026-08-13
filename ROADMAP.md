@@ -70,7 +70,8 @@ Status: planned
 - `server` inbound listener: UDP and TCP first, matching the crate's
   Kestrel-style embeddable-server goal from `ARCHITECTURE.md`; DoT/DoH/DoQ
   listeners behind the same Cargo features as their upstream counterparts.
-  UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT/DoH/DoQ listeners
+  UDP/TCP baseline done (`Server`/`ServerBuilder`); DoT listener done
+  (`ServerBuilder::dot_addr`, `dot` Cargo feature); DoH/DoQ listeners
   remain.
 - Non-goal: no platform-specific privileged transport (e.g. raw sockets,
   binding privileged ports) — that stays the composing application's

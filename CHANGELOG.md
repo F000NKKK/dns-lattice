@@ -72,6 +72,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DoT/DoH/DoQ inbound listeners are deferred to follow-up work behind the
   same `dot`/`doh`/`doq` Cargo features their `upstream` counterparts use.
   See ADR-0015 (`DL-A-16`) for the full design rationale.
+- Stage 0.3 Track E (inbound server listener, DoT): new
+  `ServerBuilder::dot_addr(SocketAddr, Arc<rustls::ServerConfig>)` method,
+  behind the existing default-off `dot` Cargo feature, additive to the
+  UDP/TCP baseline. Binds a TCP listener, TLS-accepts each connection via
+  `tokio_rustls::TlsAcceptor` (caller-supplied `rustls::ServerConfig` — this
+  crate does not source certificate material), then reuses the same
+  length-prefixed read/write loop the baseline TCP listener uses once the
+  handshake completes, so a DoT connection can carry multiple back-to-back
+  queries exactly like plain TCP; a TLS handshake failure ends that
+  connection without a response, matching the existing undecodable-message
+  policy. `Resolver::resolve` errors are still answered with a synthesized
+  `Rcode::ServFail`, unchanged from the baseline. No existing `ServerBuilder`/
+  `Server` public method signature changes. See ADR-0016 (`DL-A-17`) for the
+  full design rationale (also covers deferred DoH/DoQ listener design).
 
 ## [0.2.0] - 2026-08-02
 
