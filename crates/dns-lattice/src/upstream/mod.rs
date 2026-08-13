@@ -1,16 +1,15 @@
 //! Public async upstream DNS backend trait plus baseline UDP and TCP
 //! transport implementations.
 //!
-//! Stage 0.3 replaces stage 0.2's crate-private, fully synchronous
-//! `engine::UpstreamBackend` (ADR-0009) with the public, async
-//! [`UpstreamBackend`] trait defined here, per ADR-0011
-//! (`DL-A-12`): async via `async_trait` (native `async fn` in traits is not
+//! The public, async [`UpstreamBackend`] trait replaces the earlier
+//! crate-private synchronous backend seam. It uses `async_trait` because
+//! native `async fn` in traits is not
 //! `dyn`-safe and this trait is stored as `Box<dyn UpstreamBackend>`), no
 //! per-call timeout parameter (each backend's own config owns its
 //! timeout(s)), and one dedicated config struct per transport rather than a
 //! shared enum.
 //!
-//! No EDNS0/OPT support this stage (ADR-0011 point 5): [`UdpBackend`] sends
+//! [`UdpBackend`] does not support EDNS0/OPT: it sends
 //! queries with no OPT record and falls back to a TCP query to the same
 //! server whenever a UDP response arrives with the `TC` (truncated) bit
 //! set, rather than negotiating a larger UDP payload size.
@@ -19,8 +18,7 @@
 //!
 //! Three additional backends land in this module, each behind its own
 //! default-off Cargo feature so the baseline UDP/TCP build carries no
-//! TLS/HTTP/QUIC dependency weight, per ADR-0012 (`DL-A-13`) and ADR-0013
-//! (`DL-A-14`):
+//! TLS/HTTP/QUIC dependency weight:
 //!
 //! - `dot` (`#[cfg(feature = "dot")]`): `DotBackend`/`DotBackendConfig`,
 //!   DNS-over-TLS (RFC 7858) over `rustls`/`tokio-rustls`.
@@ -69,7 +67,7 @@ pub use doh::{Doh3Backend, Doh3BackendConfig, DohBackend, DohBackendConfig, DohM
 #[cfg(feature = "doq")]
 mod doq;
 /// `pub(crate)` (not exported from the crate root) so `crate::server`'s DoQ
-/// listener (ADR-0016, `DL-A-17` decision 4) can reuse the client-side
+/// listener can reuse the client-side
 /// `QuicStream` `AsyncRead`/`AsyncWrite` adapter unchanged, mirroring how
 /// `read_framed`/`write_framed` are already shared between `upstream` and
 /// `server`.
@@ -82,11 +80,11 @@ pub use doq::{DoqBackend, DoqBackendConfig};
 /// without EDNS0 payload-size negotiation (RFC 1035 §4.2.1's 512-byte
 /// standard UDP message size). A larger answer arrives with `TC=1` set and
 /// is size-truncated by the responding server itself; [`UdpBackend`] then
-/// falls back to a TCP query per ADR-0011 point 5.
+/// falls back to a TCP query.
 ///
 /// `pub(crate)` (not private) so `crate::server`'s UDP listener can reuse
 /// the same boundary when deciding whether to truncate an outbound response
-/// and set `TC=1`, per ADR-0015 (`DL-A-16`) point 3 — the baseline server
+/// and set `TC=1` — the baseline server
 /// has no larger negotiated payload size to honor either, so it shares this
 /// exact constant rather than redefining an equivalent one.
 pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
@@ -94,9 +92,7 @@ pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
 /// A public, async, object-safe upstream DNS backend seam: given a query
 /// [`Message`], resolve it against this backend and return the answer.
 ///
-/// Replaces stage 0.2's crate-private `engine::UpstreamBackend` (ADR-0009);
-/// see the module-level docs and ADR-0011 (`DL-A-12`) for the full
-/// rationale behind this shape. Implementations own their own
+/// Implementations own their own
 /// timeout/retry policy via their transport-specific config — this trait
 /// does not accept a timeout argument.
 ///
@@ -128,7 +124,7 @@ pub struct UdpBackendConfig {
 }
 
 /// Baseline UDP upstream backend (RFC 1035 §4.2.1). No EDNS0/OPT support
-/// (ADR-0011 point 5): falls back to a TCP query to the same server when a
+/// and falls back to a TCP query to the same server when a
 /// response arrives with the `TC` (truncated) bit set.
 pub struct UdpBackend {
     config: UdpBackendConfig,
@@ -272,8 +268,8 @@ async fn tcp_query(
 /// and, behind the `dot` feature, `dot::DotBackend` (the same framing over
 /// an established TLS stream).
 ///
-/// Implemented in terms of [`write_framed`] and [`read_framed`] (ADR-0015,
-/// `DL-A-16` point 5) — this one-shot write-then-read shape stays as the
+/// Implemented in terms of [`write_framed`] and [`read_framed`] — this
+/// one-shot write-then-read shape stays as the
 /// client-role helper; `crate::server`'s read-many/respond-many TCP loop
 /// calls the two halves directly instead of this function.
 pub(crate) async fn framed_query<S>(
@@ -292,7 +288,7 @@ where
 /// length-prefixed framing (a 2-byte length prefix followed by the encoded
 /// message), bounded by `budget`.
 ///
-/// One half of the `framed_query` split (ADR-0015, `DL-A-16` point 5):
+/// One half of the `framed_query` split:
 /// shared by [`framed_query`] (client-side, one write per call) and
 /// `crate::server`'s TCP listener (one write per response, potentially many
 /// per connection).
@@ -324,7 +320,7 @@ where
 /// Reads one RFC 1035 §4.2.2 length-prefixed message from `stream`, bounded
 /// by `budget`.
 ///
-/// One half of the `framed_query` split (ADR-0015, `DL-A-16` point 5):
+/// One half of the `framed_query` split:
 /// shared by [`framed_query`] (client-side, one read per call) and
 /// `crate::server`'s TCP listener (one read per inbound request,
 /// potentially many per connection). Returns [`Error::Timeout`] if the

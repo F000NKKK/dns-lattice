@@ -507,8 +507,8 @@ pub(crate) fn decode_name(buf: &[u8], pos: &mut usize) -> Result<Name> {
 }
 
 /// Encodes a DNS name without compression (RFC 1035 §4.1.4 compression is
-/// a size optimization for messages this crate builds itself and is
-/// deferred; see ADR-0005).
+/// a size optimization for messages this crate builds itself and is not
+/// implemented here).
 pub(crate) fn encode_name(name: &Name, buf: &mut Vec<u8>) -> Result<()> {
     name.check_total_length()?;
     for label in &name.0 {

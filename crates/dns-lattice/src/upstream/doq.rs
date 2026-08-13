@@ -1,5 +1,5 @@
 //! DNS-over-QUIC upstream backend (RFC 9250), behind the `doq` Cargo
-//! feature. Per ADR-0013 (`DL-A-14`): QUIC transport via `quinn`, TLS 1.3
+//! feature. QUIC transport uses `quinn`, with TLS 1.3
 //! (embedded in QUIC itself) via `rustls`, one fresh `quinn::Endpoint` +
 //! `quinn::Connection` per query (no connection pooling/reuse this stage),
 //! reusing [`super::framed_query`]'s RFC 1035 §4.2.2 2-byte length-prefixed
@@ -85,17 +85,16 @@ impl DoqBackendConfig {
 /// DNS-over-QUIC upstream backend (RFC 9250), gated behind the `doq` Cargo
 /// feature. Follows the same `Config` + `Backend` +
 /// `#[async_trait] impl UpstreamBackend` pattern as [`super::UdpBackend`]/
-/// [`super::TcpBackend`]/[`super::DotBackend`] (ADR-0011); this backend
+/// [`super::TcpBackend`]/[`super::DotBackend`]; this backend
 /// adds no fields or methods to the [`UpstreamBackend`] trait itself.
 ///
 /// Opens a fresh `quinn::Endpoint` and `quinn::Connection` per
 /// [`UpstreamBackend::resolve`] call — no connection pooling/reuse this
 /// stage, matching [`super::DotBackend`]'s own per-call TCP+TLS connect
-/// precedent (ADR-0013 decision 2). A pre-handshake QUIC/UDP-layer failure
+/// precedent. A pre-handshake QUIC/UDP-layer failure
 /// (endpoint bind, `Endpoint::connect`, or a post-handshake QUIC transport/
 /// stream failure) maps to [`Error::Transport`]; a failure attributable to
-/// the QUIC connection's embedded TLS 1.3 handshake maps to [`Error::Tls`]
-/// (ADR-0013 decision 4).
+/// the QUIC connection's embedded TLS 1.3 handshake maps to [`Error::Tls`].
 pub struct DoqBackend {
     config: DoqBackendConfig,
 }
@@ -151,10 +150,10 @@ impl UpstreamBackend for DoqBackend {
 /// Combines a `quinn` bidirectional stream's independent send/receive
 /// halves into a single type implementing `tokio::io::{AsyncRead,
 /// AsyncWrite} + Unpin`, satisfying [`framed_query`]'s generic bound
-/// without any change to `framed_query` itself (ADR-0013 decision 3).
+/// without any change to `framed_query` itself.
 ///
 /// `pub(crate)` (not private) so `crate::server`'s DoQ listener
-/// (ADR-0016, `DL-A-17` decision 4) can reuse this exact adapter for its
+/// can reuse this exact adapter for its
 /// per-stream `read_framed`/`write_framed` calls instead of reimplementing
 /// it — same sharing precedent as [`super::read_framed`]/
 /// [`super::write_framed`] themselves.
@@ -202,7 +201,7 @@ fn unspecified_like(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Classifies a post-`connect_with` [`ConnectionError`] onto the
-/// `Error::Tls`/`Error::Transport` boundary (ADR-0013 decision 4).
+/// `Error::Tls`/`Error::Transport` boundary.
 ///
 /// `quinn`/`quinn-proto` do not expose a dedicated "this failure was the
 /// embedded TLS handshake" variant on [`ConnectionError`] — a certificate/

@@ -63,13 +63,13 @@ pub struct DohBackendConfig {
 /// DNS-over-HTTPS upstream backend (RFC 8484), gated behind the `doh`
 /// Cargo feature. Follows the same `Config` + `Backend` +
 /// `#[async_trait] impl UpstreamBackend` pattern as [`super::UdpBackend`]/
-/// [`super::TcpBackend`]/`DotBackend` (ADR-0011/ADR-0012); adds no fields
+/// [`super::TcpBackend`]/`DotBackend`; adds no fields
 /// or methods to the [`UpstreamBackend`] trait itself.
 ///
 /// TLS-layer failures during the underlying HTTPS connection map to
 /// [`Error::Tls`]; HTTP-level failures (non-2xx status, malformed
 /// `application/dns-message` body, or a connection-level failure below
-/// TLS as surfaced by `hyper`) map to [`Error::Transport`] (ADR-0012).
+/// TLS as surfaced by `hyper`) map to [`Error::Transport`].
 pub struct DohBackend {
     config: DohBackendConfig,
 }
@@ -306,9 +306,9 @@ fn map_quinn_connection_error(err: quinn::ConnectionError) -> Error {
 }
 
 /// Maps a `hyper_util` client error to [`Error::Tls`] if it stemmed from
-/// the TLS layer, or [`Error::Transport`] otherwise (ADR-0012's DoH
-/// mapping: "the HTTP client crate's own error taxonomy determines exactly
-/// which category a given failure falls into").
+/// the TLS layer, or [`Error::Transport`] otherwise. The HTTP client
+/// crate's error taxonomy determines which category a given failure falls
+/// into.
 fn map_hyper_error<E: std::error::Error + 'static>(err: E) -> Error {
     if error_chain_is_tls(&err) {
         Error::Tls(err.to_string())

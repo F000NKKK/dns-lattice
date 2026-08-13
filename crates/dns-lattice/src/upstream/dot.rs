@@ -1,5 +1,5 @@
 //! DNS-over-TLS upstream backend (RFC 7858), behind the `dot` Cargo
-//! feature. Per ADR-0012 (`DL-A-13`): TLS via `rustls`/`tokio-rustls`
+//! feature. TLS uses `rustls`/`tokio-rustls`
 //! (pure-Rust, no platform-native TLS dependency), reusing the same
 //! RFC 1035 §4.2.2 2-byte length-prefixed framing as [`super::TcpBackend`]
 //! once the TLS handshake completes.
@@ -71,14 +71,14 @@ impl DotBackendConfig {
 /// DNS-over-TLS upstream backend (RFC 7858), gated behind the `dot` Cargo
 /// feature. Follows the same `Config` + `Backend` +
 /// `#[async_trait] impl UpstreamBackend` pattern as [`super::UdpBackend`]/
-/// [`super::TcpBackend`] (ADR-0011); this backend adds no fields or
+/// [`super::TcpBackend`]; this backend adds no fields or
 /// methods to the [`UpstreamBackend`] trait itself.
 ///
 /// An underlying TCP failure before a TLS session is established (including
 /// a peer closing the connection) maps to [`Error::Transport`], matching
 /// [`super::TcpBackend`]'s own connection-failure mapping. A failure that
 /// `rustls` reports during TLS negotiation or certificate/hostname
-/// verification maps to [`Error::Tls`] (ADR-0012).
+/// verification maps to [`Error::Tls`].
 pub struct DotBackend {
     config: DotBackendConfig,
 }

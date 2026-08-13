@@ -3,12 +3,11 @@
 //! [`crate::engine::Resolver`], fulfilling the embeddable-server-engine goal
 //! named in `ARCHITECTURE.md`.
 //!
-//! Per ADR-0015, the UDP/TCP baseline landed first; per ADR-0016, the DoT
-//! listener (`ServerBuilder::dot_addr`), DoQ
+//! The UDP/TCP baseline is extended by the DoT listener
+//! (`ServerBuilder::dot_addr`), DoQ
 //! listener (`ServerBuilder::doq_addr`), and DoH listener
 //! (`ServerBuilder::doh_addr`) extend the same `ServerBuilder`/`Server`
-//! types behind the `dot`/`doq`/`doh` Cargo features, closing out Track E
-//! and Stage 0.3 entirely. DoT reuses the baseline TCP
+//! types behind the `dot`/`doq`/`doh` Cargo features. DoT reuses the baseline TCP
 //! per-connection loop unchanged once the TLS handshake completes; DoQ (RFC
 //! 9250) instead accepts one fresh bidirectional QUIC stream per query (RFC
 //! 9250 §4.2), reusing the same `read_framed`/`write_framed` framing helpers
@@ -112,7 +111,7 @@ const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// addresses.
 ///
 /// Mirrors [`crate::ResolverBuilder`]'s construct-then-build shape, split
-/// into a fallible `bind` step (per ADR-0015, `DL-A-16` decision 2) since
+/// into a fallible `bind` step since
 /// binding a socket is the first point actual I/O/OS errors can occur.
 pub struct ServerBuilder {
     resolver: Arc<Resolver>,
@@ -134,7 +133,7 @@ pub struct ServerBuilder {
 /// a mandated one — this crate does not hardcode it).
 ///
 /// Any request whose path does not match `path` gets an HTTP 404 response,
-/// entirely outside `Message`/`Resolver` (ADR-0016, decision 3, point 1).
+/// entirely outside `Message`/`Resolver`.
 #[cfg(feature = "doh")]
 #[derive(Debug, Clone)]
 pub struct DohListenerConfig {
@@ -159,7 +158,7 @@ impl ServerBuilder {
     /// Takes `Arc<Resolver>` (not `Resolver` by value or `&Resolver`)
     /// because the resolver must outlive, and be shared across, every
     /// concurrently spawned per-connection/per-datagram `tokio::task`
-    /// (ADR-0015, `DL-A-16` decision 2 and its "alternatives considered").
+    /// so each task can hold an independent handle.
     pub fn new(resolver: Arc<Resolver>) -> Self {
         ServerBuilder {
             resolver,
@@ -192,11 +191,10 @@ impl ServerBuilder {
 
     /// Adds a DNS-over-TLS (RFC 7858) address to bind, with `tls_config`
     /// used to accept the TLS session on every connection to that address
-    /// (ADR-0016, `DL-A-17` decision 1). May be called more than once to
+    /// May be called more than once to
     /// bind multiple DoT addresses, each with its own `tls_config`.
     ///
-    /// This crate does not source certificate material itself (`DL-19`'s
-    /// stated non-goal, reaffirmed by `DL-A-17`) — the caller supplies a
+    /// This crate does not source certificate material itself — the caller supplies a
     /// fully configured `Arc<rustls::ServerConfig>`, exactly like
     /// [`crate::upstream::DotBackendConfig`]'s existing
     /// `Arc<ClientConfig>` ownership pattern on the client side.
@@ -208,8 +206,7 @@ impl ServerBuilder {
 
     /// Adds a DNS-over-HTTPS (RFC 8484) address to bind, with `tls_config`
     /// used to accept the TLS session on every connection to that address
-    /// and `config` selecting the URI path answered (ADR-0016, decision
-    /// 1/3). May be called more than once to bind multiple DoH
+    /// and `config` selecting the URI path answered. May be called more than once to bind multiple DoH
     /// addresses, each with its own `tls_config`/`config`.
     ///
     /// This crate does not source certificate material itself — the caller
@@ -250,12 +247,11 @@ impl ServerBuilder {
 
     /// Adds a DNS-over-QUIC (RFC 9250) address to bind, with `server_config`
     /// used to establish every QUIC connection's embedded TLS 1.3 session on
-    /// that address (ADR-0016, `DL-A-17` decision 1). May be called more
+    /// that address. May be called more
     /// than once to bind multiple DoQ addresses, each with its own
     /// `server_config`.
     ///
-    /// This crate does not source certificate material itself (`DL-19`'s
-    /// stated non-goal, reaffirmed by `DL-A-17`), and it does not
+    /// This crate does not source certificate material itself, and it does not
     /// special-case ALPN negotiation inside the listener — `server_config`'s
     /// embedded `rustls` crypto config MUST already advertise the `doq` ALPN
     /// protocol identifier (RFC 9250 §4.1.1); this is the caller's
@@ -271,8 +267,7 @@ impl ServerBuilder {
     /// [`Server`], ready to [`Server::serve`].
     ///
     /// Binding a privileged port (e.g. `0.0.0.0:53` on Unix) is the
-    /// composing application's responsibility, not this crate's (`DL-19`'s
-    /// stated non-goal) — a permission-denied OS error surfaces here as an
+    /// composing application's responsibility, not this crate's — a permission-denied OS error surfaces here as an
     /// ordinary [`Error::Transport`], exactly like `upstream`'s existing
     /// bind/connect error mapping, with no special-cased privilege check.
     ///
@@ -464,7 +459,7 @@ impl Server {
 }
 
 /// Runs `socket`'s UDP receive loop forever: one `tokio::task` is spawned
-/// per received datagram (ADR-0015, `DL-A-16` decision 3) so one slow
+/// per received datagram so one slow
 /// resolution never stalls receiving the next datagram. Only returns (with
 /// `Err`) if `recv_from` itself fails, which is treated as unrecoverable
 /// for this socket.
@@ -527,7 +522,7 @@ async fn handle_udp_datagram(
 }
 
 /// Runs `listener`'s TCP accept loop forever: one `tokio::task` per
-/// accepted connection (ADR-0015, `DL-A-16` decision 4), each looping over
+/// accepted connection, each looping over
 /// as many length-prefixed queries as the client sends on that connection.
 /// Only returns (with `Err`) if `accept` itself fails, which is treated as
 /// unrecoverable for this listener.
@@ -545,8 +540,7 @@ async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) -> Result<()>
 }
 
 /// Runs `listener`'s DoT (RFC 7858) accept loop forever, mirroring
-/// [`serve_tcp`]: one `tokio::task` per accepted connection (ADR-0016,
-/// `DL-A-17` decision 2). The TLS accept itself happens *inside* the
+/// [`serve_tcp`]: one `tokio::task` per accepted connection. The TLS accept itself happens *inside* the
 /// spawned per-connection task, not in this accept loop, so a single
 /// slow/hostile handshake cannot stall accepting the next connection — same
 /// non-blocking-accept-loop principle as `serve_tcp`. A handshake failure
@@ -625,7 +619,7 @@ async fn serve_doh(
 /// query parameter or POST's `application/dns-message` body), decodes,
 /// resolves, and re-encodes the answer, following the same
 /// `Result`-to-response pattern as [`handle_tcp_connection`]/
-/// [`handle_doq_stream`] (ADR-0016, decision 3/5).
+/// [`handle_doq_stream`].
 ///
 /// See the module-level "Error handling" docs for exactly which failures map
 /// to which HTTP status: a path mismatch is HTTP 404; an unsupported method
@@ -795,7 +789,7 @@ fn extract_doh3_query_bytes(request: &http::Request<()>, body: Vec<u8>) -> Optio
 }
 
 /// Runs `endpoint`'s DoQ (RFC 9250) accept loop forever: one `tokio::task`
-/// per accepted QUIC connection (ADR-0016, `DL-A-17` decision 4), mirroring
+/// per accepted QUIC connection, mirroring
 /// the non-blocking-accept-loop principle `serve_tcp`/`serve_dot` already
 /// establish — a single slow/hostile handshake cannot stall accepting the
 /// next connection. Once a connection's handshake completes, the task loops
@@ -840,8 +834,7 @@ async fn serve_doq(endpoint: quinn::Endpoint, resolver: Arc<Resolver>) -> Result
 /// length-prefixed response (RFC 9250 §4.2's one-stream-per-query framing,
 /// distinct from DoT/TCP's one-connection-many-queries loop in
 /// [`handle_tcp_connection`]). Wraps `send`/`recv` in [`QuicStream`]
-/// (`crate::upstream`'s existing client-side adapter, reused unchanged per
-/// ADR-0016, `DL-A-17` decision 4) so the same [`read_framed`]/
+/// (`crate::upstream`'s existing client-side adapter) so the same [`read_framed`]/
 /// [`write_framed`] helpers apply. A decode/resolve/write failure ends the
 /// stream without a response, same undecodable-message policy as UDP/TCP/
 /// DoT.
@@ -878,7 +871,7 @@ async fn handle_doq_stream(send: quinn::SendStream, recv: quinn::RecvStream, res
 /// error occurs, so a single connection can carry multiple back-to-back
 /// queries (RFC 1035 §4.2.2). Generic over `S: AsyncRead + AsyncWrite +
 /// Unpin` so the baseline TCP listener and the DoT listener
-/// (ADR-0016, `DL-A-17` decision 2) share this exact loop body unchanged —
+/// share this exact loop body unchanged —
 /// a `tokio_rustls::server::TlsStream<TcpStream>` implements the same
 /// bound as a plain `TcpStream`.
 async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
@@ -910,7 +903,7 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Synthesizes an [`Rcode::ServFail`] response echoing `query`'s `id` and
-/// question section (ADR-0015, `DL-A-16` decision 6), used whenever
+/// question section, used whenever
 /// [`Resolver::resolve`](crate::Resolver::resolve) returns `Err(_)` for a
 /// query that *did* decode successfully.
 fn servfail_response(query: &Message) -> Message {
@@ -1632,8 +1625,7 @@ mod tests {
         }
 
         /// A minimal manual HTTP/1.1-over-TLS client used in the test's
-        /// client role (per `DL-50`'s scope: "a bare hyper client or manual
-        /// HTTP/1.1 request construction ... in the client role here").
+        /// client role, using manual HTTP/1.1 request construction.
         /// Sends `request_line`/`headers`/`body` and returns
         /// `(status_code, body_bytes)`.
         async fn send_http_request(

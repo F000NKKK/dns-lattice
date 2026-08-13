@@ -2,7 +2,7 @@
 //! fake upstream backend per group, then resolves the same name twice to
 //! show the second call is served from the in-memory answer cache.
 //!
-//! `Resolver::resolve` is `async fn` (stage 0.3, ADR-0011, `DL-A-12`), so
+//! `Resolver::resolve` is `async fn`, so
 //! this example runs inside a `tokio` runtime even though the fake
 //! backends below do no real socket I/O.
 //!
