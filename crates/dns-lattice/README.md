@@ -136,12 +136,13 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 ```
 
 ```rust
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, time::Duration};
 
 use dns_lattice::{fakeip::FakeIpPool, model::Name};
 
 let pool = FakeIpPool::builder()
     .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
+    .ttl(Duration::from_secs(60))
     .build()?;
 let address = pool.allocate_ipv4(Name::from_ascii("service.internal")?)?;
 assert_eq!(pool.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?));

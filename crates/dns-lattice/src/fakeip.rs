@@ -2,8 +2,10 @@
 //!
 //! [`FakeIpPool`] maps a DNS [`Name`] to one synthetic address in each
 //! configured family. It is a data-only control-plane component: it neither
-//! rewrites DNS messages nor performs PTR synthesis, TTL handling, network
-//! I/O, persistence, or integration with an external data plane.
+//! rewrites DNS messages, performs PTR synthesis, network I/O, persistence,
+//! or integration with an external data plane. Each mapping has the required
+//! pool TTL; expired mappings are removed on pool operations or by an
+//! explicit [`FakeIpPool::purge_expired`] call.
 //!
 //! Ranges are inclusive. A name's first candidate is selected with a
 //! family-salted FNV-1a hash of its canonical (case-insensitive) labels;
@@ -14,9 +16,56 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
-use dns_lattice_model::Name;
+use dns_lattice_model::{DomainMatcher, DomainPattern, Name};
+
+/// Selects the domain names for which a future resolver integration should
+/// synthesize Fake IP answers.
+///
+/// This policy only answers whether a name matches. It does not allocate an
+/// address or alter DNS messages; those remain separate responsibilities.
+#[derive(Debug, Clone, Default)]
+pub struct FakeIpPolicy {
+    matcher: DomainMatcher<()>,
+}
+
+impl FakeIpPolicy {
+    /// Starts building a policy with no matching rules.
+    pub fn builder() -> FakeIpPolicyBuilder {
+        FakeIpPolicyBuilder {
+            matcher: DomainMatcher::new(),
+        }
+    }
+
+    /// Returns whether `name` matches the policy under [`DomainMatcher`]'s
+    /// documented exact/suffix/wildcard precedence rules.
+    pub fn matches(&self, name: &Name) -> bool {
+        self.matcher.resolve(name).is_some()
+    }
+}
+
+/// Builder for [`FakeIpPolicy`].
+#[must_use]
+pub struct FakeIpPolicyBuilder {
+    matcher: DomainMatcher<()>,
+}
+
+impl FakeIpPolicyBuilder {
+    /// Adds a domain pattern that selects Fake IP behavior.
+    pub fn rule(mut self, pattern: DomainPattern) -> Self {
+        self.matcher.insert(pattern, ());
+        self
+    }
+
+    /// Builds the policy. An empty policy matches no names.
+    pub fn build(self) -> FakeIpPolicy {
+        FakeIpPolicy {
+            matcher: self.matcher,
+        }
+    }
+}
 
 /// A concurrent pool of synthetic IPv4 and/or IPv6 addresses keyed by DNS
 /// name.
@@ -27,6 +76,8 @@ use dns_lattice_model::Name;
 pub struct FakeIpPool {
     ipv4: Option<Mutex<FamilyState<u32>>>,
     ipv6: Option<Mutex<FamilyState<u128>>>,
+    ttl: Duration,
+    clock: Box<dyn Clock + Send + Sync>,
 }
 
 impl FakeIpPool {
@@ -35,7 +86,17 @@ impl FakeIpPool {
         FakeIpPoolBuilder {
             ipv4: None,
             ipv6: None,
+            ttl: None,
+            clock: Box::new(SystemClock),
         }
+    }
+
+    /// Returns the lifetime assigned to each mapping.
+    ///
+    /// Resolver integrations use this value as the TTL of synthetic DNS
+    /// records, so a client-facing answer cannot outlive its mapping.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
     }
 
     /// Allocates or reuses this name's synthetic IPv4 address.
@@ -44,11 +105,12 @@ impl FakeIpPool {
     /// configured. Reusing an existing mapping refreshes its LRU recency.
     pub fn allocate_ipv4(&self, name: Name) -> Result<Ipv4Addr> {
         let state = self.ipv4.as_ref().ok_or(Error::FakeIpFamilyDisabled)?;
+        let now = self.clock.now();
         Ok(Ipv4Addr::from(
             state
                 .lock()
                 .expect("fake ip ipv4 mutex poisoned")
-                .allocate(name, IPV4_HASH_SALT),
+                .allocate(name, IPV4_HASH_SALT, now, self.ttl)?,
         ))
     }
 
@@ -58,11 +120,12 @@ impl FakeIpPool {
     /// configured. Reusing an existing mapping refreshes its LRU recency.
     pub fn allocate_ipv6(&self, name: Name) -> Result<Ipv6Addr> {
         let state = self.ipv6.as_ref().ok_or(Error::FakeIpFamilyDisabled)?;
+        let now = self.clock.now();
         Ok(Ipv6Addr::from(
             state
                 .lock()
                 .expect("fake ip ipv6 mutex poisoned")
-                .allocate(name, IPV6_HASH_SALT),
+                .allocate(name, IPV6_HASH_SALT, now, self.ttl)?,
         ))
     }
 
@@ -72,11 +135,12 @@ impl FakeIpPool {
     /// unknown addresses all return `None`. A successful lookup refreshes
     /// the mapping's LRU recency.
     pub fn lookup_ipv4(&self, address: Ipv4Addr) -> Option<Name> {
+        let now = self.clock.now();
         self.ipv4
             .as_ref()?
             .lock()
             .expect("fake ip ipv4 mutex poisoned")
-            .lookup(u32::from(address))
+            .lookup(u32::from(address), now)
     }
 
     /// Returns the name currently mapped to `address` in the IPv6 pool.
@@ -85,11 +149,53 @@ impl FakeIpPool {
     /// unknown addresses all return `None`. A successful lookup refreshes
     /// the mapping's LRU recency.
     pub fn lookup_ipv6(&self, address: Ipv6Addr) -> Option<Name> {
+        let now = self.clock.now();
         self.ipv6
             .as_ref()?
             .lock()
             .expect("fake ip ipv6 mutex poisoned")
-            .lookup(u128::from(address))
+            .lookup(u128::from(address), now)
+    }
+
+    /// Returns whether `address` lies in this pool's configured IPv4 range.
+    /// A disabled IPv4 family returns `false`.
+    pub fn contains_ipv4(&self, address: Ipv4Addr) -> bool {
+        self.ipv4.as_ref().is_some_and(|state| {
+            state
+                .lock()
+                .expect("fake ip ipv4 mutex poisoned")
+                .contains(u32::from(address))
+        })
+    }
+
+    /// Returns whether `address` lies in this pool's configured IPv6 range.
+    /// A disabled IPv6 family returns `false`.
+    pub fn contains_ipv6(&self, address: Ipv6Addr) -> bool {
+        self.ipv6.as_ref().is_some_and(|state| {
+            state
+                .lock()
+                .expect("fake ip ipv6 mutex poisoned")
+                .contains(u128::from(address))
+        })
+    }
+
+    /// Removes every mapping whose TTL has expired and returns the number
+    /// removed. Allocation and reverse lookup also perform this cleanup.
+    pub fn purge_expired(&self) -> usize {
+        let now = self.clock.now();
+        let ipv4 = self.ipv4.as_ref().map_or(0, |state| {
+            state
+                .lock()
+                .expect("fake ip ipv4 mutex poisoned")
+                .purge_expired(now)
+        });
+        let ipv6 = self.ipv6.as_ref().map_or(0, |state| {
+            state
+                .lock()
+                .expect("fake ip ipv6 mutex poisoned")
+                .purge_expired(now)
+        });
+        ipv4 + ipv6
     }
 }
 
@@ -98,6 +204,8 @@ impl FakeIpPool {
 pub struct FakeIpPoolBuilder {
     ipv4: Option<(u32, u32)>,
     ipv6: Option<(u128, u128)>,
+    ttl: Option<Duration>,
+    clock: Box<dyn Clock + Send + Sync>,
 }
 
 impl FakeIpPoolBuilder {
@@ -115,11 +223,32 @@ impl FakeIpPoolBuilder {
         self
     }
 
+    /// Sets the lifetime of every allocation. It must be a non-zero whole
+    /// number of seconds, matching the TTL a future DNS answer will advertise
+    /// for the mapping.
+    ///
+    /// This is required as of the pre-1.0 0.4 API revision; callers of the
+    /// earlier pool-only API must explicitly choose their desired lifetime.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    #[cfg(test)]
+    fn clock(mut self, clock: impl Clock + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
     /// Validates the configured ranges and builds the pool.
     ///
     /// At least one address family must be configured. An invalid inclusive
     /// range returns [`Error::InvalidFakeIpRange`].
     pub fn build(self) -> Result<FakeIpPool> {
+        let ttl = self.ttl.ok_or(Error::InvalidFakeIpTtl)?;
+        if ttl.is_zero() || ttl.subsec_nanos() != 0 {
+            return Err(Error::InvalidFakeIpTtl);
+        }
         let ipv4 = self.ipv4.map(FamilyState::new).transpose()?;
         let ipv6 = self.ipv6.map(FamilyState::new).transpose()?;
         if ipv4.is_none() && ipv6.is_none() {
@@ -128,6 +257,8 @@ impl FakeIpPoolBuilder {
         Ok(FakeIpPool {
             ipv4: ipv4.map(Mutex::new),
             ipv6: ipv6.map(Mutex::new),
+            ttl,
+            clock: self.clock,
         })
     }
 }
@@ -145,6 +276,19 @@ struct Mapping<T> {
     address: T,
     recency: u64,
     allocation: u64,
+    expires_at: Instant,
+}
+
+trait Clock {
+    fn now(&self) -> Instant;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 trait Address: Copy + Eq + Ord + std::hash::Hash {
@@ -208,12 +352,14 @@ impl<T: Address> FamilyState<T> {
         })
     }
 
-    fn allocate(&mut self, name: Name, salt: u64) -> T {
+    fn allocate(&mut self, name: Name, salt: u64, now: Instant, ttl: Duration) -> Result<T> {
+        let expires_at = now.checked_add(ttl).ok_or(Error::FakeIpTtlOutOfRange)?;
+        self.purge_expired(now);
         if self.forward.contains_key(&name) {
             let recency = self.touch();
             let mapping = self.forward.get_mut(&name).expect("mapping checked above");
             mapping.recency = recency;
-            return mapping.address;
+            return Ok(mapping.address);
         }
         if self
             .capacity()
@@ -239,13 +385,15 @@ impl<T: Address> FamilyState<T> {
                 address,
                 recency,
                 allocation,
+                expires_at,
             },
         );
-        address
+        Ok(address)
     }
 
-    fn lookup(&mut self, address: T) -> Option<Name> {
-        if address < self.start || address > self.end {
+    fn lookup(&mut self, address: T, now: Instant) -> Option<Name> {
+        self.purge_expired(now);
+        if !self.contains(address) {
             return None;
         }
         let name = self.reverse.get(&address)?.clone();
@@ -256,6 +404,24 @@ impl<T: Address> FamilyState<T> {
 
     fn candidate(&self, hash: u64) -> T {
         T::candidate(self.start, self.end, hash)
+    }
+
+    fn contains(&self, address: T) -> bool {
+        address >= self.start && address <= self.end
+    }
+
+    fn purge_expired(&mut self, now: Instant) -> usize {
+        let expired: Vec<_> = self
+            .forward
+            .iter()
+            .filter(|(_, mapping)| mapping.expires_at <= now)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &expired {
+            let mapping = self.forward.remove(name).expect("mapping selected above");
+            self.reverse.remove(&mapping.address);
+        }
+        expired.len()
     }
 
     fn capacity(&self) -> Option<T> {
@@ -306,20 +472,72 @@ mod tests {
         Name::from_ascii(value).unwrap()
     }
 
+    fn pool_builder() -> FakeIpPoolBuilder {
+        FakeIpPool::builder().ttl(Duration::from_secs(30))
+    }
+
+    #[derive(Clone)]
+    struct FakeClock(Arc<Mutex<Instant>>);
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.0.lock().expect("fake clock mutex poisoned");
+            *now += duration;
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().expect("fake clock mutex poisoned")
+        }
+    }
+
+    #[test]
+    fn policy_uses_domain_matcher_precedence_case_insensitively() {
+        let policy = FakeIpPolicy::builder()
+            .rule(DomainPattern::wildcard(name("example.test")))
+            .rule(DomainPattern::suffix(name("example.test")))
+            .rule(DomainPattern::exact(name("api.example.test")))
+            .build();
+
+        assert!(policy.matches(&name("API.EXAMPLE.TEST")));
+        assert!(policy.matches(&name("worker.example.test")));
+        assert!(!policy.matches(&name("example.invalid")));
+        assert!(
+            !FakeIpPolicy::builder()
+                .build()
+                .matches(&name("example.test"))
+        );
+    }
+
+    #[test]
+    fn pool_exposes_the_mapping_ttl_for_synthetic_dns_answers() {
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(42))
+            .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+            .build()
+            .unwrap();
+        assert_eq!(pool.ttl(), Duration::from_secs(42));
+    }
+
     #[test]
     fn validates_configuration_and_disabled_families() {
         assert!(matches!(
             FakeIpPool::builder().build(),
-            Err(Error::FakeIpPoolUnconfigured)
+            Err(Error::InvalidFakeIpTtl)
         ));
         assert!(matches!(
-            FakeIpPool::builder()
+            pool_builder()
                 .ipv4_range(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1))
                 .build(),
             Err(Error::InvalidFakeIpRange)
         ));
 
-        let pool = FakeIpPool::builder()
+        let pool = pool_builder()
             .ipv4_range(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2))
             .build()
             .unwrap();
@@ -328,11 +546,93 @@ mod tests {
             Error::FakeIpFamilyDisabled
         );
         assert_eq!(pool.lookup_ipv6(Ipv6Addr::LOCALHOST), None);
+
+        assert!(matches!(
+            FakeIpPool::builder()
+                .ttl(Duration::ZERO)
+                .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+                .build(),
+            Err(Error::InvalidFakeIpTtl)
+        ));
+        assert!(matches!(
+            FakeIpPool::builder()
+                .ttl(Duration::from_millis(1))
+                .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+                .build(),
+            Err(Error::InvalidFakeIpTtl)
+        ));
+    }
+
+    #[test]
+    fn unrepresentable_whole_second_ttl_returns_a_typed_error_without_panicking() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(u64::MAX))
+            .clock(clock)
+            .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            pool.allocate_ipv4(name("overflow.test")),
+            Err(Error::FakeIpTtlOutOfRange)
+        );
+
+        assert!(matches!(
+            FakeIpPool::builder()
+                .ttl(Duration::MAX)
+                .ipv4_range(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+                .build(),
+            Err(Error::InvalidFakeIpTtl)
+        ));
+    }
+
+    #[test]
+    fn expiry_is_exact_and_removes_forward_and_reverse_mappings() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(5))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2))
+            .build()
+            .unwrap();
+        let address = pool.allocate_ipv4(name("expired.test")).unwrap();
+
+        clock.advance(Duration::from_secs(4));
+        assert_eq!(pool.lookup_ipv4(address), Some(name("expired.test")));
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(pool.lookup_ipv4(address), None);
+        assert_eq!(pool.purge_expired(), 0);
+        assert_eq!(pool.allocate_ipv4(name("expired.test")).unwrap(), address);
+    }
+
+    #[test]
+    fn explicit_purge_frees_capacity_before_lru_eviction() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(2))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 2))
+            .build()
+            .unwrap();
+        let expired = pool.allocate_ipv4(name("expired.test")).unwrap();
+        clock.advance(Duration::from_secs(1));
+        let live = pool.allocate_ipv4(name("live.test")).unwrap();
+
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(pool.purge_expired(), 1);
+        assert_eq!(pool.lookup_ipv4(expired), None);
+        assert_eq!(pool.lookup_ipv4(live), Some(name("live.test")));
+        let fresh = pool.allocate_ipv4(name("fresh.test")).unwrap();
+        assert!(pool.contains_ipv4(fresh));
+        assert_eq!(pool.lookup_ipv4(live), Some(name("live.test")));
+        assert!(!pool.contains_ipv4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!pool.contains_ipv6(Ipv6Addr::LOCALHOST));
     }
 
     #[test]
     fn allocation_is_case_insensitive_reusable_and_reversible() {
-        let pool = FakeIpPool::builder()
+        let pool = pool_builder()
             .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 16))
             .ipv6_range("fd00::1".parse().unwrap(), "fd00::10".parse().unwrap())
             .build()
@@ -350,7 +650,7 @@ mod tests {
     #[test]
     fn allocation_is_deterministic_for_the_same_pool_state() {
         let make_pool = || {
-            FakeIpPool::builder()
+            pool_builder()
                 .ipv4_range(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 16))
                 .build()
                 .unwrap()
@@ -369,10 +669,7 @@ mod tests {
     fn known_hash_collision_uses_circular_probe_with_inclusive_bounds() {
         let start = Ipv4Addr::new(198, 18, 0, 10);
         let end = Ipv4Addr::new(198, 18, 0, 12);
-        let pool = FakeIpPool::builder()
-            .ipv4_range(start, end)
-            .build()
-            .unwrap();
+        let pool = pool_builder().ipv4_range(start, end).build().unwrap();
 
         // Both canonical names have an IPv4-salted FNV-1a hash that maps to
         // the inclusive range's final address (their hashes end in `54` and
@@ -385,7 +682,7 @@ mod tests {
         assert_eq!(pool.allocate_ipv4(name("bravo.test")).unwrap(), start);
         assert_eq!(pool.lookup_ipv4(Ipv4Addr::new(198, 18, 0, 11)), None);
 
-        let singleton = FakeIpPool::builder()
+        let singleton = pool_builder()
             .ipv6_range("fd00::42".parse().unwrap(), "fd00::42".parse().unwrap())
             .build()
             .unwrap();
@@ -398,7 +695,7 @@ mod tests {
     #[test]
     fn concurrent_allocations_reuse_and_reverse_lookup_in_each_family() {
         let pool = Arc::new(
-            FakeIpPool::builder()
+            pool_builder()
                 .ipv4_range(Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 64))
                 .ipv6_range("fd00::1".parse().unwrap(), "fd00::40".parse().unwrap())
                 .build()
@@ -436,7 +733,7 @@ mod tests {
 
     #[test]
     fn full_family_evicts_the_least_recently_used_mapping() {
-        let pool = FakeIpPool::builder()
+        let pool = pool_builder()
             .ipv4_range(Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 2))
             .build()
             .unwrap();

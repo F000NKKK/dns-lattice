@@ -76,6 +76,12 @@ pub enum Error {
     /// An operation requested an address family not configured on a Fake IP
     /// pool.
     FakeIpFamilyDisabled,
+    /// A Fake IP pool mapping lifetime was zero or did not contain a whole
+    /// positive number of seconds.
+    InvalidFakeIpTtl,
+    /// A valid Fake IP TTL could not be represented relative to the pool's
+    /// monotonic clock instant.
+    FakeIpTtlOutOfRange,
 }
 
 impl fmt::Display for Error {
@@ -116,6 +122,15 @@ impl fmt::Display for Error {
                 write!(f, "fake ip pool requires an ipv4 or ipv6 range")
             }
             Error::FakeIpFamilyDisabled => write!(f, "fake ip address family is not configured"),
+            Error::InvalidFakeIpTtl => {
+                write!(f, "fake ip ttl must be a non-zero whole number of seconds")
+            }
+            Error::FakeIpTtlOutOfRange => {
+                write!(
+                    f,
+                    "fake ip ttl cannot be represented by the monotonic clock"
+                )
+            }
         }
     }
 }
@@ -184,6 +199,14 @@ mod tests {
             (
                 Error::FakeIpFamilyDisabled,
                 "fake ip address family is not configured",
+            ),
+            (
+                Error::InvalidFakeIpTtl,
+                "fake ip ttl must be a non-zero whole number of seconds",
+            ),
+            (
+                Error::FakeIpTtlOutOfRange,
+                "fake ip ttl cannot be represented by the monotonic clock",
             ),
         ];
         for (error, expected) in cases {
