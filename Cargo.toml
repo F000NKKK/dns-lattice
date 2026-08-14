@@ -14,11 +14,11 @@ categories = ["network-programming", "os"]
 keywords = ["cross-platform","rust","networking","dns","systems"]
 
 [workspace.dependencies]
-dns-lattice-core = { path = "crates/dns-lattice-core", version = "0.3.0" }
+dns-lattice-core = { path = "crates/dns-lattice-core", version = "0.4.0" }
 
-dns-lattice-model = { path = "crates/dns-lattice-model", version = "0.3.0" }
+dns-lattice-model = { path = "crates/dns-lattice-model", version = "0.4.0" }
 
-dns-lattice = { path = "crates/dns-lattice", version = "0.3.0" }
+dns-lattice = { path = "crates/dns-lattice", version = "0.4.0" }
 
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["net", "time", "rt", "macros", "io-util"] }
