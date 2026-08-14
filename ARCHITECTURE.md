@@ -106,7 +106,7 @@ it does not itself hold implementation modules beyond that re-export layer.
 dns-lattice-core     Error/Result shared across the workspace (implemented, stage 0.1)
 dns-lattice-model    DNS message types, zones/domain matchers, policy types (implemented, stage 0.1)
 dns-lattice-platform Cross-platform provider trait(s), once a stage needs OS-facing behavior (target, not yet implemented)
-dns-lattice          Facade crate: re-exports model/core/engine/server/upstream (and later fakeip/hooks) as the crate's stable public surface
+dns-lattice          Facade crate: re-exports model/core/engine/server/upstream/fakeip (and later hooks) as the crate's stable public surface
 ```
 
 Within `dns-lattice` itself, the target module layout for capabilities not

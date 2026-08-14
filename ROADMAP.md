@@ -120,15 +120,13 @@ Status: planned
 - Full documentation sync: rustdoc, crate README, root EN/RU docs,
   CHANGELOG, SECURITY, SUPPORT, CONTRIBUTING.
 
-## Stage 1.0 — Stable public API and first release
+## Stage 1.0 — Stable public API and first stable release
 
 Status: planned
 
 - Public API frozen; SemVer commitment recorded.
 - `cargo package` verified for the crate; docs.rs build verified.
-- First published release on crates.io.
-- `index.md` and this roadmap updated to reflect the released stage instead
-  of "no release has been published yet".
+- First stable release on crates.io.
 
 ## Explicitly out of scope for this crate's roadmap
 

@@ -7,7 +7,8 @@
   0.0-0.2, `DL-2`) predates per-stage Sprint tracking and does not itself
   imply a `0.1.x` release line beyond what already shipped.
 - DNS Lattice is pre-1.0 (`ROADMAP.md` gates 1.0 behind the stage 1.0
-  milestone; no crate has published a release yet). Before 1.0, a Sprint's
+  milestone; crates through 0.4.0 are published, while 1.0 is the first
+  stable release). Before 1.0, a Sprint's
   release is allowed to change the public API meaningfully as normal
   roadmap evolution, provided the change is recorded in an ADR (see
   `rules/youtrack.md`) and in `CHANGELOG.md`. Do not treat a pre-1.0 minor

@@ -5,9 +5,8 @@ use super::message::Name;
 
 /// An opaque identifier for an upstream group.
 ///
-/// The upstream module (a later stage) owns what a group actually
-/// contains; this stage only needs something hashable and comparable to
-/// route to.
+/// The resolver/upstream layer owns what a group actually contains; the
+/// model only needs something hashable and comparable to route to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpstreamGroupId(String);
 

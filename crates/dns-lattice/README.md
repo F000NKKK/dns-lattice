@@ -51,7 +51,8 @@ The existing flat root aliases remain compatible.
   transports to the same `upstream` module: `dot` (`DotBackend`/
   `DotBackendConfig`, DNS-over-TLS, RFC 7858, over `rustls`/`tokio-rustls`),
   `doh` (`DohBackend`/`DohBackendConfig`/`DohMethod`, DNS-over-HTTPS,
-  RFC 8484, GET and POST wire formats, over `hyper`/`hyper-rustls`), and
+  RFC 8484, GET and POST wire formats, over `hyper`/`hyper-rustls`, plus
+  `Doh3Backend`/`Doh3BackendConfig` for HTTP/3 over QUIC), and
   `doq` (`DoqBackend`/`DoqBackendConfig`, DNS-over-QUIC, RFC 9250, over
   `quinn`, with TLS 1.3 embedded in QUIC via `rustls`). `doq` opens a fresh
   QUIC connection per query in this stage — no connection pooling/reuse
@@ -106,10 +107,11 @@ repository root.
   `webpki-roots` as dependencies. Independent of `doh`; enable only this
   feature to use `DotBackend` without pulling in an HTTP client.
 - `doh` feature: adds `rustls`, `rustls-pki-types`, `tokio-rustls`, `hyper`,
-  `hyper-util`, `hyper-rustls`, `http`, `http-body-util`, `bytes`, and
-  `base64` as dependencies. Independent of `dot`; enable only this feature
-  to use `DohBackend` without pulling in raw TLS-over-TCP framing you don't
-  use directly.
+  `hyper-util`, `hyper-rustls`, `http`, `http-body-util`, `bytes`, `base64`,
+  `h3`, `h3-quinn`, and `quinn` as dependencies. It deliberately includes
+  both TCP DoH and HTTP/3-over-QUIC (`Doh3Backend`/
+  `ServerBuilder::doh3_addr`). Independent of `dot`; enable only this feature
+  to use DoH without raw TLS-over-TCP framing you do not use directly.
 - `doq` feature: adds `rustls`, `rustls-pki-types`, `webpki-roots`, and
   `quinn` as dependencies. Independent of `dot`/`doh`; enable only this
   feature to use `DoqBackend`/`ServerBuilder::doq_addr` without pulling in

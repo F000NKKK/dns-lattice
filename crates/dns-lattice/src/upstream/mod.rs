@@ -23,12 +23,17 @@
 //! - `dot` (`#[cfg(feature = "dot")]`): `DotBackend`/`DotBackendConfig`,
 //!   DNS-over-TLS (RFC 7858) over `rustls`/`tokio-rustls`.
 //! - `doh` (`#[cfg(feature = "doh")]`): `DohBackend`/`DohBackendConfig`,
-//!   DNS-over-HTTPS (RFC 8484) over `hyper`/`hyper-rustls`.
+//!   DNS-over-HTTPS (RFC 8484) over `hyper`/`hyper-rustls`, plus
+//!   `Doh3Backend`/`Doh3BackendConfig` for HTTP/3 over QUIC. This feature
+//!   deliberately includes the `h3`/`h3-quinn`/`quinn` dependency footprint.
 //! - `doq` (`#[cfg(feature = "doq")]`): `DoqBackend`/`DoqBackendConfig`,
 //!   DNS-over-QUIC (RFC 9250) over `quinn` (TLS 1.3 embedded in QUIC via
 //!   `rustls`). Opens a fresh QUIC connection per query in this stage (no
 //!   pooling/reuse), reusing the same length-prefixed framing helper as
 //!   [`TcpBackend`]/`dot::DotBackend` on one bidirectional stream.
+//!
+//! `doq` remains independent of `doh`, so an application that needs only
+//! DNS-over-QUIC can avoid the HTTP dependencies.
 //!
 //! All three follow the same `Config` + `Backend` +
 //! `#[async_trait] impl UpstreamBackend` pattern as [`UdpBackend`]/

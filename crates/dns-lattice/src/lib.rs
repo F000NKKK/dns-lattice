@@ -1,6 +1,64 @@
 //! Programmable Rust DNS control plane for the Lattice networking stack:
 //! split DNS, Fake IP, address pools, and dynamic routing hooks.
 //!
+//! # Quick start
+//!
+//! The usual inbound path is `Server` → `Resolver` → static split-DNS
+//! policy → `UpstreamBackend`. This `no_run` example uses the baseline UDP
+//! transport; it needs a Tokio runtime, an available local listen address,
+//! and a reachable upstream to run.
+//!
+//! ```no_run
+//! use std::{net::SocketAddr, sync::Arc, time::Duration};
+//!
+//! use dns_lattice::{
+//!     engine::Resolver,
+//!     model::{SplitDnsPolicy, UpstreamGroupId},
+//!     server::ServerBuilder,
+//!     upstream::{UdpBackend, UdpBackendConfig},
+//! };
+//!
+//! # async fn run() -> dns_lattice::Result<()> {
+//! let group = UpstreamGroupId::new("default");
+//! let policy = SplitDnsPolicy::builder().default_group(group.clone()).build();
+//! let resolver = Arc::new(
+//!     Resolver::builder(policy)
+//!         .backend(
+//!             group,
+//!             UdpBackend::new(UdpBackendConfig {
+//!                 server: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+//!                 timeout: Duration::from_secs(5),
+//!                 bind_addr: None,
+//!             }),
+//!         )
+//!         .build(),
+//! );
+//! let server = ServerBuilder::new(resolver)
+//!     .udp_addr("127.0.0.1:5353".parse().unwrap())
+//!     .bind()
+//!     .await?;
+//! server.serve().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Fake IP
+//!
+//! [`fakeip::FakeIpPool`] and [`fakeip::FakeIpPolicy`] are opt-in through
+//! [`engine::ResolverBuilder::fake_ip`]. Matching IN A/AAAA and canonical,
+//! in-range IN PTR questions receive local synthetic answers that bypass the
+//! ordinary cache and upstreams. The emitted DNS TTL never exceeds the
+//! mapping's remaining lifetime; pools remain caller-owned and have no
+//! durable persistence built in.
+//!
+//! # Transport features
+//!
+//! UDP and TCP are available without Cargo features. The default-off `dot`,
+//! `doh`, and `doq` features respectively add DNS-over-TLS,
+//! DNS-over-HTTPS (including HTTP/3 over QUIC), and DNS-over-QUIC. `doh`
+//! therefore includes HTTP/3/QUIC dependencies; `doq` remains an independent
+//! feature for DNS-over-QUIC without the HTTP stack.
+//!
 //! # Canonical module imports
 //!
 //! ```

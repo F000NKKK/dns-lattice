@@ -142,7 +142,7 @@ has no compile-time dependency on any sibling crate.
 ## Philosophy
 
 - **Strong typing over raw bytes.** Consumers work with typed messages, names, and records — never manual byte-offset arithmetic.
-- **Protocol/policy separate from transport.** The message model, zone matcher, and policy types have no network I/O; transport is layered on top in a later stage behind an explicit backend trait.
+- **Protocol/policy separate from transport.** The message model, zone matcher, and policy types have no network I/O. Outbound transport is isolated behind `UpstreamBackend`, while inbound framing and listener lifecycle belong to `Server`.
 - **Deterministic by design.** Zone/domain matching precedence is a documented, tested contract (see [ARCHITECTURE.md](ARCHITECTURE.md)), not incidental iteration order.
 - **Typed errors, never panics.** Every fallible operation returns `Result<T, Error>`; malformed wire input is rejected, not undefined behavior.
 - **Incremental, well-considered growth.** Each roadmap stage ships a bounded, fully tested slice rather than a large, under-tested surface.
@@ -184,9 +184,11 @@ Planned (see [ROADMAP.md](ROADMAP.md)):
 ## Transport features
 
 UDP and TCP are available in the default build. Encrypted transports are
-opt-in and independent: enable `dot` for DoT, `doh` for DoH (including
-HTTP/3 support), and `doq` for DoQ. They are default-off so applications
-that only need UDP/TCP do not inherit TLS, HTTP, or QUIC dependencies.
+opt-in: enable `dot` for DoT, `doh` for DoH (including HTTP/3 over QUIC),
+and `doq` for DoQ. The `doh` feature deliberately includes its HTTP/3/QUIC
+dependencies; `doq` remains independent for DNS-over-QUIC without the HTTP
+stack. All are default-off, so applications that only need UDP/TCP do not
+inherit TLS, HTTP, or QUIC dependencies.
 
 ## Non-Goals
 
@@ -265,7 +267,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
    matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
 6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
-8. **Stage 1.0: Stable public API and first release** — public API frozen, `cargo package`/docs.rs verified, first crates.io release.
+8. **Stage 1.0: Stable public API and first stable release** — public API frozen, `cargo package`/docs.rs verified, first stable crates.io release.
 
 Stages are delivery boundaries, not a promise of one release per heading;
 see [ROADMAP.md](ROADMAP.md) for the full non-goal list per stage.
