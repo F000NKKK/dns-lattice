@@ -211,7 +211,7 @@ impl Resolver {
             if let Some(entry) = cache.get(&key)
                 && entry.expires_at > now
             {
-                return Ok(entry.answer.clone());
+                return Ok(cache_hit_response(query, &entry.answer));
             }
         }
 
@@ -273,6 +273,21 @@ impl Resolver {
         }
         Ok((group, backends))
     }
+}
+
+/// Projects the transaction-specific parts of `query` onto a cached DNS
+/// response.
+///
+/// Cache entries represent reusable answer content, not a prior client's DNS
+/// transaction. The cache key intentionally covers only the first question's
+/// matching fields and effective upstream group, while a response must echo
+/// the current request's transaction ID and question section. All cached
+/// response flags and record sections remain unchanged.
+fn cache_hit_response(query: &Message, cached: &Message) -> Message {
+    let mut response = cached.clone();
+    response.header.id = query.header.id;
+    response.questions = query.questions.clone();
+    response
 }
 
 /// Returns a locally synthesized Fake IP response when `query` is handled by
@@ -1104,6 +1119,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hit_preserves_the_current_query_identity_and_questions() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            a_answer("example.com", 300),
+            FakeClock::new(),
+        );
+        let first = query_for_type("example.com", RecordType::A, Class::In, 91);
+        let mut second = query_for_type("example.com", RecordType::A, Class::In, 92);
+        second.questions.push(Question {
+            name: n("extra.example.com"),
+            qtype: RecordType::Aaaa,
+            qclass: Class::In,
+        });
+
+        resolver
+            .resolve(&first)
+            .await
+            .expect("first resolve populates cache");
+        let cached = resolver
+            .resolve(&second)
+            .await
+            .expect("second resolve is served from cache");
+
+        assert_eq!(cached.header.id, 92);
+        assert_eq!(cached.questions, second.questions);
+        assert_eq!(
+            cached.answers[0].rdata,
+            RData::A(Ipv4Addr::new(203, 0, 113, 1))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second query is a cache hit"
+        );
+    }
+
+    #[tokio::test]
     async fn cache_entry_still_hit_just_before_ttl_elapses() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))
@@ -1480,16 +1536,30 @@ mod tests {
             })
             .build();
 
-        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
-        let second = resolver.resolve(&query_for("example.com")).await.unwrap();
-        let cached_first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        let first = resolver
+            .resolve(&query_for_type("example.com", RecordType::A, Class::In, 41))
+            .await
+            .unwrap();
+        let second = resolver
+            .resolve(&query_for_type("example.com", RecordType::A, Class::In, 42))
+            .await
+            .unwrap();
+        let cached_first = resolver
+            .resolve(&query_for_type("example.com", RecordType::A, Class::In, 43))
+            .await
+            .unwrap();
 
         assert_eq!(first.answers[0].ttl, 300);
         assert_eq!(
             second.header.id, 8,
             "second route cannot reuse first route cache"
         );
-        assert_eq!(cached_first, first, "first route has its own cache hit");
+        assert_eq!(cached_first.header.id, 43);
+        assert_eq!(cached_first.questions, query_for("example.com").questions);
+        assert_eq!(
+            cached_first.answers, first.answers,
+            "first route has its own cache hit"
+        );
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
     }
