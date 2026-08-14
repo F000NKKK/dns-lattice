@@ -12,8 +12,13 @@ use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use dns_lattice::{
-    Class, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode, RecordType,
-    Resolver, ResourceRecord, SplitDnsPolicy, UpstreamBackend, UpstreamGroupId,
+    core::{Error, Result},
+    engine::Resolver,
+    model::{
+        Class, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode, RecordType,
+        ResourceRecord, SplitDnsPolicy, UpstreamGroupId,
+    },
+    upstream::UpstreamBackend,
 };
 
 /// A minimal in-process fake [`UpstreamBackend`] that always answers with
@@ -26,7 +31,7 @@ struct FixedAddrBackend {
 
 #[async_trait]
 impl UpstreamBackend for FixedAddrBackend {
-    async fn resolve(&self, query: &Message) -> dns_lattice::Result<Message> {
+    async fn resolve(&self, query: &Message) -> Result<Message> {
         answer_for(query, self.addr, self.ttl)
     }
 }
@@ -54,7 +59,7 @@ fn query_for(name: &Name) -> Message {
     }
 }
 
-fn answer_for(query: &Message, addr: Ipv4Addr, ttl: u32) -> dns_lattice::Result<Message> {
+fn answer_for(query: &Message, addr: Ipv4Addr, ttl: u32) -> Result<Message> {
     let question = query.questions[0].clone();
     Ok(Message {
         header: Header {
@@ -128,7 +133,7 @@ async fn main() {
     let no_default_policy = SplitDnsPolicy::builder().build();
     let no_default_resolver = Resolver::builder(no_default_policy).build();
     match no_default_resolver.resolve(&unrouted_query).await {
-        Err(dns_lattice::Error::NoRoute) => println!("unrouted query -> Error::NoRoute (expected)"),
+        Err(Error::NoRoute) => println!("unrouted query -> Error::NoRoute (expected)"),
         other => panic!("expected Error::NoRoute, got {other:?}"),
     }
 }

@@ -43,19 +43,20 @@ upstream lookup. Canonical IN reverse PTR questions inside a pool range are
 also local: a live mapping yields PTR and an unmapped address yields NXDOMAIN.
 Every other question follows the path above.
 
-Use domain-scoped imports for new code. Flat root aliases remain compatible.
+Use domain-scoped imports. The facade deliberately has no flat root aliases.
 
 ```rust,no_run
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use dns_lattice::{
+    core::Result,
     engine::Resolver,
     model::{SplitDnsPolicy, UpstreamGroupId},
     server::ServerBuilder,
     upstream::{UdpBackend, UdpBackendConfig},
 };
 
-# async fn run() -> dns_lattice::Result<()> {
+# async fn run() -> Result<()> {
 let group = UpstreamGroupId::new("default");
 let policy = SplitDnsPolicy::builder().default_group(group.clone()).build();
 let resolver = Arc::new(
@@ -94,6 +95,65 @@ receive a resolver, backend, client metadata, or OS-side-effect capability.
 They own timeout/retry/cancellation cleanup and must not re-enter the same
 resolver.
 
+### Dynamic route hook
+
+The hook path is fully in-process and does not require a network transport.
+For every ordinary query, `Resolver` obtains the static candidate, invokes at
+most one hook, validates the effective group, checks that group's cache scope,
+then runs its registered upstream failover. A Fake IP local answer is terminal
+before all of those steps. Add `async-trait` to an application's dependencies
+when implementing `RouteHook`.
+
+```rust,no_run
+use async_trait::async_trait;
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest},
+    model::{Message, SplitDnsPolicy, UpstreamGroupId},
+    upstream::UpstreamBackend,
+};
+
+struct PreferFiltered;
+
+#[async_trait]
+impl RouteHook for PreferFiltered {
+    async fn select(
+        &self,
+        request: RouteRequest<'_>,
+    ) -> std::result::Result<RouteDecision, RouteHookError> {
+        let _question = request.question();
+        let _static_candidate = request.static_group();
+        Ok(RouteDecision::Use(UpstreamGroupId::new("filtered")))
+    }
+}
+
+struct InProcessBackend;
+
+#[async_trait]
+impl UpstreamBackend for InProcessBackend {
+    async fn resolve(&self, query: &Message) -> Result<Message> {
+        Ok(query.clone())
+    }
+}
+
+let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+    .backend(UpstreamGroupId::new("filtered"), InProcessBackend)
+    .route_hook(PreferFiltered)
+    .build();
+# let _ = resolver;
+```
+
+`Use` must name a registered nonempty group; `Abstain` keeps the static
+candidate. A hook error, an unknown group, or an empty group returns a resolver
+error without static fallback, cache access, or upstream execution. The cache
+key includes the validated effective group, preventing answers selected to
+different groups from being shared. A dropped `Resolver::resolve` future drops
+the in-flight hook call; implementations own cancellation cleanup, timeout,
+and retry. They must not call the same resolver directly or indirectly, and
+they cannot use DNS Lattice to perform OS/network side effects—compose those
+actions in the host application or an external layer.
+
 To opt into Fake IP synthesis, configure the same resolver that is passed to
 the server. A pool is shared explicitly, so the host can also inspect,
 snapshot, or restore its mappings:
@@ -120,7 +180,7 @@ let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
     .fake_ip(pool, policy)
     .build();
 # let _ = resolver;
-# Ok::<(), dns_lattice::Error>(())
+# Ok::<(), dns_lattice::core::Error>(())
 ```
 
 ## Workspace crates

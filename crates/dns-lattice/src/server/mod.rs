@@ -19,7 +19,7 @@
 //!
 //! # Lifecycle
 //!
-//! [`ServerBuilder::new`] takes a shared [`Arc<Resolver>`](crate::Resolver)
+//! [`ServerBuilder::new`] takes a shared [`Arc<Resolver>`](crate::engine::Resolver)
 //! (required so every concurrently spawned per-connection/per-datagram task
 //! can hold an independent `'static` handle to it), configure one or more
 //! listen addresses, then [`ServerBuilder::bind`] performs the actual
@@ -29,7 +29,7 @@
 //! same loops but also stops as soon as a caller-supplied future resolves,
 //! for graceful, in-process shutdown. Ordinary `Drop` releases the bound
 //! sockets — there is no separate explicit shutdown method, matching
-//! [`crate::Resolver`]'s existing no-explicit-shutdown precedent extended
+//! [`crate::engine::Resolver`]'s existing no-explicit-shutdown precedent extended
 //! to also cover the additional socket resources this module owns.
 //!
 //! # Error handling
@@ -37,7 +37,7 @@
 //! A query that fails to *decode* at all (malformed inbound bytes) is
 //! dropped without a response — RFC 1035 gives the server no reliable
 //! `id`/question to echo back in that case. A query that decodes but whose
-//! [`Resolver::resolve`](crate::Resolver::resolve) call returns `Err(_)` is
+//! [`Resolver::resolve`](crate::engine::Resolver::resolve) call returns `Err(_)` is
 //! answered with a synthesized [`Rcode::ServFail`] response instead, so a
 //! client is never left silently unanswered or hanging.
 //!
@@ -95,7 +95,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 #[cfg(feature = "doh")]
 use hyper_util::server::conn::auto;
 
-use crate::Resolver;
+use crate::engine::Resolver;
 #[cfg(feature = "doq")]
 use crate::upstream::QuicStream;
 use crate::upstream::{UDP_MAX_RESPONSE_LEN, read_framed, write_framed};
@@ -110,7 +110,7 @@ const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Builds a [`Server`] from a shared [`Resolver`] and one or more listen
 /// addresses.
 ///
-/// Mirrors [`crate::ResolverBuilder`]'s construct-then-build shape, split
+/// Mirrors [`crate::engine::ResolverBuilder`]'s construct-then-build shape, split
 /// into a fallible `bind` step since
 /// binding a socket is the first point actual I/O/OS errors can occur.
 pub struct ServerBuilder {
@@ -903,7 +903,7 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Synthesizes an [`Rcode::ServFail`] response echoing `query`'s `id` and
 /// question section, used whenever
-/// [`Resolver::resolve`](crate::Resolver::resolve) returns `Err(_)` for a
+/// [`Resolver::resolve`](crate::engine::Resolver::resolve) returns `Err(_)` for a
 /// query that *did* decode successfully.
 fn servfail_response(query: &Message) -> Message {
     let mut header = query.header;

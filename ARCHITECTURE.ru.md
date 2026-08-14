@@ -188,9 +188,9 @@ flowchart LR
 ## Публичная поверхность API (фасад)
 
 Фасад `dns-lattice` — рекомендуемая точка импорта для внешних крейтов. Его
-канонические пути разделены по доменам: `dns_lattice::model`, `engine`,
-`server`, `upstream` и `fakeip`; совместимые плоские aliases остаются
-доступны. Он как минимум реэкспортирует:
+канонические пути разделены по доменам: `dns_lattice::model`, `core`,
+`engine`, `server`, `upstream`, `fakeip` и `hooks`; плоских aliases нет. Он
+как минимум реэкспортирует:
 
 - `dns-lattice-model`: типы запроса/ответа, зональный матчер, конфигурацию
   политики (`Message`, `Header`, `Question`, `ResourceRecord`,

@@ -1,7 +1,7 @@
 //! Caller-supplied dynamic upstream-group selection.
 //!
 //! [`RouteHook`](crate::hooks::RouteHook) is a deliberately narrow extension point: it receives the
-//! first DNS [`Question`] and the upstream group tentatively selected by the
+//! first DNS [`crate::model::Question`] and the upstream group tentatively selected by the
 //! static split-DNS policy. It can authoritatively choose a registered group
 //! with [`RouteDecision::Use`](crate::hooks::RouteDecision::Use) or preserve
 //! the static candidate with
@@ -88,7 +88,7 @@ pub enum RouteDecision {
 
 /// A routing failure reported by a [`RouteHook`].
 ///
-/// Resolver integration maps this error to the shared [`crate::Error::Hook`]
+/// Resolver integration maps this error to the shared [`crate::core::Error::Hook`]
 /// variant. It is not a request to fall back to static routing, retry an
 /// upstream, or cache a result.
 #[derive(Debug, Clone, PartialEq, Eq)]

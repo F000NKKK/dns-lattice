@@ -54,6 +54,6 @@ canonical in-range IN PTR synthesis, or their TTL/expiry handling are also in
 scope. Development on `main` additionally implements dynamic route-selection
 hooks before their first release: reports of a hook leaking a query through an
 unintended static fallback, sharing cache entries across effective upstream
-groups, bypassing terminal Fake IP handling, or failing to cancel cleanly are
-in scope for that development state. The published `0.4.0` release does not
-yet contain hooks.
+groups, bypassing terminal Fake IP handling, failing to cancel cleanly, or
+permitting same-resolver re-entry are in scope for that development state. The
+published `0.4.0` release does not yet contain hooks.

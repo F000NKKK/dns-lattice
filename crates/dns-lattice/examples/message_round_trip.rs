@@ -5,7 +5,7 @@
 
 use std::net::Ipv4Addr;
 
-use dns_lattice::{
+use dns_lattice::model::{
     Class, Header, Message, Name, Opcode, Question, RData, Rcode, RecordType, ResourceRecord,
 };
 

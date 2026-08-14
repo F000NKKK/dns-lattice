@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo run -p dns-lattice --example split_dns_policy`
 
-use dns_lattice::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
+use dns_lattice::model::{DomainPattern, Name, SplitDnsPolicy, UpstreamGroupId};
 
 fn main() {
     let policy = SplitDnsPolicy::builder()

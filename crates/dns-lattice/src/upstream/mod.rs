@@ -46,7 +46,7 @@
 //! Both [`UdpBackend`] and [`TcpBackend`] perform real socket I/O via
 //! `tokio` (`tokio::net`, `tokio::time::timeout`) — callers must invoke
 //! [`UpstreamBackend::resolve`] (and therefore
-//! [`crate::Resolver::resolve`], once a backend of this kind is
+//! [`crate::engine::Resolver::resolve`], once a backend of this kind is
 //! registered) from inside a `tokio` runtime context.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -103,7 +103,7 @@ pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
 ///
 /// Custom transports (e.g. DoT/DoH/DoQ, or any future transport) can
 /// implement this trait directly and register with
-/// [`crate::ResolverBuilder::backend`] alongside [`UdpBackend`]/
+/// [`crate::engine::ResolverBuilder::backend`] alongside [`UdpBackend`]/
 /// [`TcpBackend`].
 #[async_trait]
 pub trait UpstreamBackend: Send + Sync {

@@ -41,20 +41,21 @@ DNS-клиент → Server → Resolver → Fake IP (terminal при совпа
 диапазона пула также локальны: живое отображение даёт PTR, а незанятый адрес —
 NXDOMAIN. Все остальные запросы идут обычным путём выше.
 
-В новом коде используйте domain-scoped imports. Плоские aliases в корне
-остаются совместимыми.
+В новом коде используйте импорты из доменных модулей. У facade намеренно нет
+плоских aliases в корне.
 
 ```rust,no_run
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use dns_lattice::{
+    core::Result,
     engine::Resolver,
     model::{SplitDnsPolicy, UpstreamGroupId},
     server::ServerBuilder,
     upstream::{UdpBackend, UdpBackendConfig},
 };
 
-# async fn run() -> dns_lattice::Result<()> {
+# async fn run() -> Result<()> {
 let group = UpstreamGroupId::new("default");
 let policy = SplitDnsPolicy::builder().default_group(group.clone()).build();
 let resolver = Arc::new(
@@ -93,6 +94,65 @@ server.serve().await?;
 побочных действий с ОС. Timeout/retry/очистка при отмене принадлежат хуку; он
 не должен повторно входить в тот же резолвер.
 
+### Динамический route hook
+
+Путь hook полностью внутрипроцессный и не требует сетевого транспорта. Для
+каждого обычного запроса `Resolver` получает статический кандидат, вызывает не
+более одного hook, проверяет эффективную группу, проверяет область кэша этой
+группы и затем запускает failover её зарегистрированных апстримов. Локальный
+ответ Fake IP terminal и выполняется раньше всех этих шагов. При реализации
+`RouteHook` добавьте `async-trait` в зависимости приложения.
+
+```rust,no_run
+use async_trait::async_trait;
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest},
+    model::{Message, SplitDnsPolicy, UpstreamGroupId},
+    upstream::UpstreamBackend,
+};
+
+struct PreferFiltered;
+
+#[async_trait]
+impl RouteHook for PreferFiltered {
+    async fn select(
+        &self,
+        request: RouteRequest<'_>,
+    ) -> std::result::Result<RouteDecision, RouteHookError> {
+        let _question = request.question();
+        let _static_candidate = request.static_group();
+        Ok(RouteDecision::Use(UpstreamGroupId::new("filtered")))
+    }
+}
+
+struct InProcessBackend;
+
+#[async_trait]
+impl UpstreamBackend for InProcessBackend {
+    async fn resolve(&self, query: &Message) -> Result<Message> {
+        Ok(query.clone())
+    }
+}
+
+let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+    .backend(UpstreamGroupId::new("filtered"), InProcessBackend)
+    .route_hook(PreferFiltered)
+    .build();
+# let _ = resolver;
+```
+
+`Use` должен назвать зарегистрированную непустую группу; `Abstain` сохраняет
+статический кандидат. Ошибка hook, неизвестная или пустая группа возвращает
+ошибку resolver без static fallback, обращения к кэшу или запуска апстрима.
+Ключ кэша содержит проверенную эффективную группу, поэтому ответы для разных
+выбранных групп не смешиваются. Отмена `Resolver::resolve` уничтожает текущий
+вызов hook; cleanup отмены, timeout и retry принадлежат реализации. Она не
+должна прямо или косвенно вызывать тот же resolver и не может выполнять через
+DNS Lattice побочные действия ОС/сети — такие действия компонуются в host
+application либо во внешнем слое.
+
 Чтобы включить синтез Fake IP, настройте тот же резолвер, который передаётся
 серверу. Пул передаётся явно, поэтому приложение также может просматривать,
 снимать snapshot или восстанавливать его отображения:
@@ -119,7 +179,7 @@ let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
     .fake_ip(pool, policy)
     .build();
 # let _ = resolver;
-# Ok::<(), dns_lattice::Error>(())
+# Ok::<(), dns_lattice::core::Error>(())
 ```
 
 ## Крейты workspace

@@ -178,8 +178,8 @@ implemented, not in this document.
 ## Public API surface (facade)
 
 The `dns-lattice` facade is the recommended external import point. Its
-canonical paths are domain-scoped: `dns_lattice::model`, `engine`, `server`,
-`upstream`, and `fakeip`; compatible flat aliases remain available. It
+canonical paths are domain-scoped: `dns_lattice::model`, `core`, `engine`,
+`server`, `upstream`, `fakeip`, and `hooks`; no flat aliases are available. It
 re-exports, at minimum:
 
 - `dns-lattice-model`: query/answer types, zone matcher, policy

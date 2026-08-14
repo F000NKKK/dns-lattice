@@ -12,9 +12,10 @@ For new code, prefer the canonical domain modules:
 - `dns_lattice::upstream` — the outbound backend trait and transports;
 - `dns_lattice::server` — inbound listener construction and lifecycle;
 - `dns_lattice::fakeip` — synthetic-address pool, policy, and snapshots;
-- `dns_lattice::hooks` — caller-supplied dynamic upstream-group selection.
+- `dns_lattice::hooks` — caller-supplied dynamic upstream-group selection;
+- `dns_lattice::core` — shared `Error` and `Result` types.
 
-The existing flat root aliases remain compatible.
+The facade deliberately exposes no flat root aliases.
 
 - `dns-lattice-model`'s DNS message model (`Message`, `Header`, `Question`,
   `ResourceRecord`, `RData`), zone/domain matcher (`DomainPattern`,
@@ -107,6 +108,65 @@ Hooks own timeout, retry, and cancellation cleanup, and must not re-enter the
 same resolver. They are selection-only: they receive neither resolver/backend
 handles nor client metadata or side-effect capabilities.
 
+## Dynamic route hook
+
+For an ordinary query, the resolver obtains the static split-DNS candidate,
+calls at most one hook, validates the effective group, checks that group's
+cache scope, and only then executes ordered upstream failover. Local Fake IP
+answers are terminal before this path. This example is entirely in-process and
+opens no socket. Applications implementing `RouteHook` should add
+`async-trait` to their dependencies.
+
+```rust,no_run
+use async_trait::async_trait;
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest},
+    model::{Message, SplitDnsPolicy, UpstreamGroupId},
+    upstream::UpstreamBackend,
+};
+
+struct PreferFiltered;
+
+#[async_trait]
+impl RouteHook for PreferFiltered {
+    async fn select(
+        &self,
+        request: RouteRequest<'_>,
+    ) -> std::result::Result<RouteDecision, RouteHookError> {
+        let _question = request.question();
+        let _static_candidate = request.static_group();
+        Ok(RouteDecision::Use(UpstreamGroupId::new("filtered")))
+    }
+}
+
+struct InProcessBackend;
+
+#[async_trait]
+impl UpstreamBackend for InProcessBackend {
+    async fn resolve(&self, query: &Message) -> Result<Message> {
+        Ok(query.clone())
+    }
+}
+
+let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+    .backend(UpstreamGroupId::new("filtered"), InProcessBackend)
+    .route_hook(PreferFiltered)
+    .build();
+# let _ = resolver;
+```
+
+`Use` must choose a registered, nonempty group; `Abstain` preserves the static
+candidate. A hook error, unknown group, or empty group returns a resolver error
+without static fallback, cache access, or an upstream call. Cache entries are
+scoped by the validated effective group, so equal questions routed differently
+cannot share an answer. Dropping `Resolver::resolve` drops the in-flight hook
+future; hook implementations own timeout, retry, and cancellation cleanup and
+must not re-enter the same resolver. Hooks receive no resolver/backend handle,
+client metadata, or OS/network side-effect capability. Compose side effects in
+the host application or another external layer.
+
 ## Feature/platform constraints
 
 - Default build: no Cargo features enabled. Carries no TLS/HTTP dependency
@@ -155,7 +215,7 @@ assert_eq!(policy.resolve_group(&name), Some(&UpstreamGroupId::new("corp")));
 ```rust
 use std::{net::Ipv4Addr, time::Duration};
 
-use dns_lattice::{fakeip::FakeIpPool, model::Name};
+use dns_lattice::{core::Error, fakeip::FakeIpPool, model::Name};
 
 let pool = FakeIpPool::builder()
     .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
@@ -167,7 +227,7 @@ assert_eq!(pool.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?
 let snapshot = pool.snapshot();
 let restored = FakeIpPool::restore(snapshot)?;
 assert_eq!(restored.lookup_ipv4(address), Some(Name::from_ascii("service.internal")?));
-# Ok::<(), dns_lattice::Error>(())
+# Ok::<(), Error>(())
 ```
 
 ```rust
@@ -190,7 +250,7 @@ let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
     .fake_ip(pool, fake_ip_policy)
     .build();
 # let _ = resolver;
-# Ok::<(), dns_lattice::Error>(())
+# Ok::<(), dns_lattice::core::Error>(())
 ```
 
 ## Status
