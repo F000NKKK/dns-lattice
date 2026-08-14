@@ -26,27 +26,22 @@
 # отключает эту проверку полностью.
 #
 # Примеры:
-#   ./scripts/release.sh dns-lattice-core --minor    # каскад: core → ip → model → platform → ...
+#   ./scripts/release.sh dns-lattice-core --minor    # каскад зависимых workspace-крейтов
 #   ./scripts/release.sh dns-lattice --patch         # patch: ссылки совместимы, каскада нет
-#   ./scripts/release.sh dns-lattice-ip              # без бампа: публикует текущую версию, если ещё не на crates.io
+#   ./scripts/release.sh dns-lattice                   # без бампа: публикует текущую версию, если ещё не на crates.io
 #   ./scripts/release.sh --publish-all           # весь воркспейс как есть, публикует неопубликованное
 #   ./scripts/release.sh --publish-all --patch   # patch-бамп + публикация всех крейтов
 #
 # Перед бампом/публикацией (если не --skip-checks) прогоняется preflight:
-# cargo fmt --check, cargo clippy -D warnings, cargo test, cargo doc и, если
+# cargo fmt --check, cargo clippy/test --all-features, строгий rustdoc для
+# каждой feature-конфигурации, package smoke и, если
 # установлен cargo-semver-checks, semver-сверка каждого крейта из плана
 # против его опубликованной версии (soft — предупреждает, не блокирует,
 # т.к. умеет ложно сработать на крейте без стабильного публичного API ещё).
 #
-# dns-lattice-platform → dns-lattice-model зависимость запрещена архитектурой (см.
-# ARCHITECTURE.md, "dns-lattice-platform never depends on dns-lattice-model") —
-# в отличие от Meridian-Engine здесь нет отдельного скрипта проверки графа
-# зависимостей; при ревью PR перед релизом сверяйся с ARCHITECTURE.md вручную.
-#
 # Какой бамп когда (человеческая дисциплина, скриптом не проверяется):
 #   --patch  — багфиксы, без изменения публичного API
-#   --minor  — завершённый функциональный этап (см. ARCHITECTURE.md's
-#              Incremental Delivery Plan — 0.1, 0.2, ...)
+#   --minor  — завершённый функциональный этап (см. ROADMAP.md)
 #   --major  — изменение публичной архитектуры (breaking change)
 # Не релизь просто чтобы был релиз.
 
@@ -72,9 +67,9 @@ usage() {
     echo -e "${BOLD}Использование:${RESET} $0 <crate-name> [--patch|--minor|--major] [--dry-run] [--no-publish] [--no-cascade] [--no-check-ver] [--no-gh-release]"
     echo -e "           $0 --publish-all [--patch|--minor|--major] [--dry-run] [--no-publish] [--no-check-ver] [--no-gh-release]"
     echo ""
-    echo "  --patch          0.1.3 → 0.1.4  (ссылки не меняются — semver совместимость)"
-    echo "  --minor          0.1.3 → 0.2.0  (обновит ссылки и каскадно сбампит зависимые крейты)"
-    echo "  --major          0.1.3 → 1.0.0  (обновит ссылки и каскадно сбампит зависимые крейты)"
+    echo "  --patch          0.5.0 → 0.5.1  (ссылки не меняются — semver совместимость)"
+    echo "  --minor          0.5.0 → 0.6.0  (обновит ссылки и каскадно сбампит зависимые крейты)"
+    echo "  --major          0.5.0 → 1.0.0  (обновит ссылки и каскадно сбампит зависимые крейты)"
     echo "  (без бампа)      не менять version — опубликовать план как есть, что ещё не на crates.io"
     echo "  --no-bump        то же самое явно (алиас «без бампа»)"
     echo "  --dry-run        только показать, что изменится"
@@ -160,17 +155,33 @@ run_preflight() {
     (cd "$WS" && cargo fmt --check) \
         || die "cargo fmt --check провалился — прогони 'cargo fmt' и закоммить"
 
-    info "Preflight: cargo clippy --workspace --all-targets ..."
-    cargo clippy --manifest-path "$WS/Cargo.toml" --workspace --all-targets --quiet -- -D warnings \
+    info "Preflight: cargo clippy --workspace --all-targets --all-features ..."
+    cargo clippy --manifest-path "$WS/Cargo.toml" --workspace --all-targets --all-features --quiet -- -D warnings \
         || die "cargo clippy нашёл проблемы"
 
-    info "Preflight: cargo test --workspace ..."
-    cargo test --manifest-path "$WS/Cargo.toml" --workspace --quiet \
+    info "Preflight: cargo test --workspace --all-features ..."
+    cargo test --manifest-path "$WS/Cargo.toml" --workspace --all-features --quiet \
         || die "cargo test провалился"
 
-    info "Preflight: cargo doc --no-deps --workspace ..."
-    cargo doc --manifest-path "$WS/Cargo.toml" --no-deps --workspace --quiet \
-        || die "cargo doc провалился"
+    for feature_args in \
+        "--no-default-features" \
+        "--no-default-features --features dot" \
+        "--no-default-features --features doh" \
+        "--no-default-features --features doq" \
+        "--all-features"; do
+        info "Preflight: strict rustdoc dns-lattice $feature_args ..."
+        RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path "$WS/Cargo.toml" --no-deps \
+            -p dns-lattice $feature_args --quiet \
+            || die "strict rustdoc ($feature_args) провалился"
+    done
+
+    info "Preflight: cargo package --workspace --allow-dirty --list ..."
+    cargo package --manifest-path "$WS/Cargo.toml" --workspace --allow-dirty --list --quiet \
+        || die "cargo package провалился"
+
+    info "Preflight: release automation regression ..."
+    bash "$WS/scripts/test_gh_release.sh" \
+        || die "release automation regression провалился"
 
     if command -v cargo-semver-checks >/dev/null 2>&1; then
         info "Preflight: cargo semver-checks (по крейтам из плана) ..."
