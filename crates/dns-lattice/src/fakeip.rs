@@ -901,6 +901,62 @@ mod tests {
     }
 
     #[test]
+    fn allocation_reclaims_expired_mapping_before_evicting_live_lru() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(2))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 2))
+            .build()
+            .unwrap();
+        let expired = name("expired.test");
+        let live = name("live.test");
+        let expired_address = pool.allocate_ipv4(expired.clone()).unwrap();
+
+        clock.advance(Duration::from_secs(1));
+        let live_address = pool.allocate_ipv4(live.clone()).unwrap();
+        // Make the mapping that will expire most-recently-used, so a bare LRU
+        // eviction would incorrectly discard the still-live mapping instead.
+        assert_eq!(pool.allocate_ipv4(expired).unwrap(), expired_address);
+
+        clock.advance(Duration::from_secs(1));
+        let fresh_address = pool.allocate_ipv4(name("fresh.test")).unwrap();
+
+        assert_eq!(fresh_address, expired_address);
+        assert_eq!(pool.lookup_ipv4(live_address), Some(live));
+    }
+
+    #[test]
+    fn allocation_reuse_refreshes_lru_without_extending_mapping_expiry() {
+        let clock = FakeClock::new();
+        let pool = FakeIpPool::builder()
+            .ttl(Duration::from_secs(5))
+            .clock(clock.clone())
+            .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2))
+            .build()
+            .unwrap();
+        let reused = name("reused.test");
+        let evicted = name("evicted.test");
+        let reused_address = pool.allocate_ipv4(reused.clone()).unwrap();
+
+        clock.advance(Duration::from_secs(1));
+        let evicted_address = pool.allocate_ipv4(evicted).unwrap();
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            pool.allocate_ipv4_with_ttl(reused.clone()).unwrap(),
+            (reused_address, Duration::from_secs(3),)
+        );
+
+        let fresh_address = pool.allocate_ipv4(name("fresh.test")).unwrap();
+        assert_eq!(fresh_address, evicted_address);
+        assert_eq!(pool.lookup_ipv4(reused_address), Some(reused));
+
+        clock.advance(Duration::from_secs(3));
+
+        assert_eq!(pool.lookup_ipv4(reused_address), None);
+    }
+
+    #[test]
     fn snapshot_restore_preserves_live_mappings_ttl_and_lru_order() {
         let clock = FakeClock::new();
         let pool = FakeIpPool::builder()
