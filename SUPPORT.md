@@ -15,10 +15,11 @@ the DNS message/matcher/policy model, resolver/cache, upstream transports,
 failover, and inbound server listeners; stage 0.4 adds opt-in Fake IP
 synthesis through `Resolver` and its server transports, TTL-bound mappings,
 and caller-owned process-local snapshots. Development on `main` additionally
-implements the stage 0.5 dynamic route-selection hook: it selects an existing
-upstream group before route-scoped cache lookup and has no OS/network side
-effects. Hook errors or invalid selected groups do not fall back, and hook
-implementations own timeout, retry, cancellation cleanup, and any external
-side effects. Durable persistence remains future work. No public API is stable yet. Questions, bug
+has completed the stage 0.5 dynamic route-selection hook: it selects an
+existing upstream group before route-scoped cache lookup and has no OS/network
+side effects. Hook errors or invalid selected groups do not fall back, and
+hook implementations own timeout, retry, cancellation cleanup, and any
+external side effects. Its remaining release gate is external CI validation.
+Durable persistence remains future work. No public API is stable yet. Questions, bug
 reports, and design discussion are welcome; full usage support will start
 once a stable release ships.

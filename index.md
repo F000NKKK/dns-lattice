@@ -59,12 +59,12 @@ implementation starts.
 ## Current status
 
 Version `0.4.0` is published; the public API remains pre-1.0 and unstable.
-Stages 0.0 through 0.4 are done. Stage 0.5 is active on `main`: its optional
+Stages 0.0 through 0.5 are implemented on `main`. Stage 0.5's optional
 `hooks::RouteHook` selects a registered upstream group for an ordinary query
 after static routing and before the route-scoped cache. Fake IP remains
 terminal before hooks; hook implementations own timeout, retry, cancellation
-cleanup, and any external side effects. See `CONTRIBUTING.md` and `SUPPORT.md`
-for current project-status language.
+cleanup, and any external side effects. The remaining release gate is external
+CI validation. See `CONTRIBUTING.md` and `SUPPORT.md` for current status.
 
 ## Useful commands
 

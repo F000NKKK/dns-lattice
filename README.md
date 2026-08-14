@@ -19,9 +19,9 @@
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
 > `dns-lattice` facade. It also adds opt-in Fake IP answer synthesis through
 > the resolver and every server transport. Development on `main` additionally
-> implements the stage 0.5 route-hook pipeline; it is not part of the
-> published `0.4.0` release. The API remains pre-1.0; see Current Status
-> below.
+> has completed the stage 0.5 route-hook pipeline, pending external release
+> CI validation; it is not part of the published `0.4.0` release. The API
+> remains pre-1.0; see Current Status below.
 
 ## Overview
 
@@ -347,7 +347,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
    allocation, reverse lookup, LRU eviction, expiry, and caller-owned
    process-local snapshot/restore; opt-in resolver/server synthesis for
    matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
-6. **Stage 0.5: Dynamic routing hooks** *(active on `main`)* — one optional
+6. **Stage 0.5: Dynamic routing hooks** *(implementation complete; release CI pending)* — one optional
    `RouteHook` selects an existing upstream group after static routing and
    before the route-scoped cache; no hook composition, response rewriting, or
    OS/network side effects belong to DNS Lattice.

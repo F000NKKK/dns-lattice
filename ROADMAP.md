@@ -102,7 +102,7 @@ Status: completed and published in 0.4.0
 
 ## Stage 0.5 — Dynamic routing hooks
 
-Status: active
+Status: implementation complete; awaiting 0.5 release validation
 
 - Implemented on `main`: `hooks::RouteHook` lets a caller (e.g.
   `flow-lattice`) select one existing upstream group per ordinary query
@@ -115,8 +115,8 @@ Status: active
   hook composition, response rewrite, cache-policy override, resolver
   re-entry, or OS/network side effect is in scope. Hook implementations own
   timeout, retry, and cancellation cleanup.
-- Remaining stage work: inbound transport integration verification, public
-  documentation/package reconciliation, and independent release review.
+- Stage verification, public documentation/package reconciliation, and
+  independent review are complete. The remaining external gate is release CI.
 
 ## Stage 0.6 — Hardening and platform validation
 
