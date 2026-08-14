@@ -102,7 +102,7 @@ Status: completed and published in 0.4.0
 
 ## Stage 0.5 — Dynamic routing hooks
 
-Status: implementation complete; awaiting 0.5 release validation
+Status: done; published in 0.5.0
 
 - Implemented on `main`: `hooks::RouteHook` lets a caller (e.g.
   `flow-lattice`) select one existing upstream group per ordinary query
@@ -115,19 +115,23 @@ Status: implementation complete; awaiting 0.5 release validation
   hook composition, response rewrite, cache-policy override, resolver
   re-entry, or OS/network side effect is in scope. Hook implementations own
   timeout, retry, and cancellation cleanup.
-- Stage verification, public documentation/package reconciliation, and
-  independent review are complete. The remaining external gate is release CI.
+- Stage verification, public documentation/package reconciliation, independent
+  review, and release validation are complete.
 
 ## Stage 0.6 — Hardening and platform validation
 
-Status: planned
+Status: active
 
 - Cross-platform CI matrix (Linux/Windows/macOS) exercising every backend
-  feature combination.
-- Fuzz/property tests for message parsing and matcher precedence.
-- Observability sink trait finalized; structured events documented.
-- Full documentation sync: rustdoc, crate README, root EN/RU docs,
-  CHANGELOG, SECURITY, SUPPORT, CONTRIBUTING.
+  feature combination, with strict per-feature rustdoc checks.
+- Fuzz/property tests for message parsing, compression bounds, matcher
+  precedence, resolver cache identity, and Fake IP expiry/eviction invariants.
+- Finalize an observability sink trait with structured query, cache, hook,
+  upstream, timeout, and error events while keeping sinks side-effect-only.
+- Harden package/release automation: reproducible `cargo package`, docs.rs
+  checks, facade-first release selection, and idempotent reruns.
+- Keep English/Russian rustdoc, crate READMEs, root docs, CHANGELOG, SECURITY,
+  SUPPORT, and CONTRIBUTING synchronized as each hardening contract lands.
 
 ## Stage 1.0 — Stable public API and first stable release
 

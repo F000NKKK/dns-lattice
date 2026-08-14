@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Stage 0.6 hardening is tracked here: cross-platform verification,
+  parser and matcher fuzz/property coverage, structured observability, and
+  release/package validation improvements.
+
+## [0.5.0] - 2026-08-14
+
 - Added `dns_lattice::hooks`: `RouteHook` receives the first DNS question and
   the tentative static upstream group, then either selects one existing group
   with `Use` or preserves it with `Abstain`. `ResolverBuilder::route_hook`
@@ -16,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unknown/empty selected groups, and cancellation follow the resolver error
   boundary without static fallback or cache insertion. Hooks own timeout,
   retry, and cancellation cleanup and must not re-enter the same resolver.
+- Removed flat root facade aliases in favor of canonical domain modules:
+  `core`, `model`, `engine`, `fakeip`, `hooks`, `server`, and `upstream`.
 
 ## [0.4.0] - 2026-08-14
 

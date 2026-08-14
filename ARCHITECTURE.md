@@ -3,8 +3,8 @@
 Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
 `dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
 server listeners. Stage 0.4 is published in `0.4.0` with opt-in resolver Fake
-IP synthesis; development on `main` also completes the stage 0.5 route-hook
-pipeline, pending external release CI validation.
+IP synthesis, and stage 0.5 route hooks are published in `0.5.0`.
+Development on `main` is now stage 0.6 hardening and platform validation.
 Update this document whenever an implementation slice changes a public
 contract.
 

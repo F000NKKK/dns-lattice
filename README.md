@@ -13,15 +13,14 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** `0.4.0` is published. It delivers the DNS message model, zone/domain
+> **Status:** `0.5.0` is published. It delivers the DNS message model, zone/domain
 > matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
 > `dns-lattice` facade. It also adds opt-in Fake IP answer synthesis through
-> the resolver and every server transport. Development on `main` additionally
-> has completed the stage 0.5 route-hook pipeline, pending external release
-> CI validation; it is not part of the published `0.4.0` release. The API
-> remains pre-1.0; see Current Status below.
+> the resolver and every server transport, plus the stage 0.5 route-hook
+> pipeline. Development has moved to stage 0.6 hardening and platform
+> validation. The API remains pre-1.0; see Current Status below.
 
 ## Overview
 
@@ -222,8 +221,7 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (published through `0.4.0`, plus the in-development 0.5 hook
-pipeline on `main`):
+Implemented and published through `0.5.0`:
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -256,9 +254,13 @@ pipeline on `main`):
   scope. Hooks cannot resolve, rewrite answers, alter cache policy, or perform
   networking side effects through DNS Lattice.
 
-Planned (see [ROADMAP.md](ROADMAP.md)):
+Planned for stage 0.6 (see [ROADMAP.md](ROADMAP.md)):
 
-- Cross-platform CI matrix, fuzz/property tests, observability sink (stage 0.6)
+- Linux/Windows/macOS feature-matrix hardening and strict per-feature rustdoc
+- Fuzz/property tests for parsing, compression bounds, matcher precedence,
+  cache identity, and Fake IP TTL/LRU invariants
+- Structured observability sink and documented query/cache/hook/upstream events
+- Reproducible package/docs.rs checks and idempotent release automation
 
 ## Transport features
 
@@ -298,12 +300,11 @@ This gives a complete, tested DNS message model, a deterministic
 zone/domain matcher, an in-process resolver with real UDP/TCP/DoT/DoH/DoQ
 upstream transport and failover across a group's backends, and an
 embeddable inbound UDP/TCP/DoT/DoH/DoQ DNS server listener, all usable
-standalone today. The current development state additionally supports opt-in
-Fake IP synthesis in the resolver query path, which every `Server` transport
-uses through its shared resolver, and the stage 0.5 optional route-selection
-hook pipeline for ordinary queries. The hook runs after static candidate
-selection and before route-scoped caching; it cannot alter terminal Fake IP
-handling or gain OS/network side-effect authority.
+standalone today. Published `0.5.0` also includes opt-in Fake IP synthesis and
+the stage 0.5 route-selection hook pipeline. Stage 0.6 now hardens the tested
+surface with platform, parser, matcher, observability, and release validation;
+hooks cannot alter terminal Fake IP handling or gain OS/network side-effect
+authority.
 
 | Capability | Status |
 |---|:---:|
@@ -320,8 +321,8 @@ handling or gain OS/network side-effect authority.
 | Inbound DoT server listener (`dot` Cargo feature) | ✅ |
 | Inbound DoQ server listener (`doq` Cargo feature) | ✅ |
 | Inbound DoH server listener (`doh` Cargo feature) | ✅ |
-| Fake IP pool and opt-in resolver/server synthesis | ✅ (0.4.0) |
-| Dynamic routing hooks | active on `main` (0.5) |
+| Fake IP pool and opt-in resolver/server synthesis | ✅ |
+| Dynamic routing hooks | ✅ |
 
 ## Examples
 
@@ -347,11 +348,11 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
    allocation, reverse lookup, LRU eviction, expiry, and caller-owned
    process-local snapshot/restore; opt-in resolver/server synthesis for
    matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
-6. **Stage 0.5: Dynamic routing hooks** *(implementation complete; release CI pending)* — one optional
+6. **Stage 0.5: Dynamic routing hooks** *(completed and published in 0.5.0)* — one optional
    `RouteHook` selects an existing upstream group after static routing and
    before the route-scoped cache; no hook composition, response rewriting, or
    OS/network side effects belong to DNS Lattice.
-7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
+7. **Stage 0.6: Hardening and platform validation** *(active)* — cross-platform CI matrix, fuzz/property tests, structured observability, API/package checks, and release automation hardening.
 8. **Stage 1.0: Stable public API and first stable release** — public API frozen, `cargo package`/docs.rs verified, first stable crates.io release.
 
 Stages are delivery boundaries, not a promise of one release per heading;

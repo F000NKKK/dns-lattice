@@ -3,13 +3,13 @@
 ## Supported Versions
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
-published `0.4.0`. Development on `main` has completed stages 0.1-0.4; no
-public API is stable yet. Security fixes target the latest `0.4.x` release and
+published `0.5.0`. Development on `main` has completed stages 0.1-0.5 and is
+working on stage 0.6; no public API is stable yet. Security fixes target the latest `0.5.x` release and
 the development state on `main`.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.4.x   | ✅ |
+| 0.5.x   | ✅ |
 
 ## Reporting a Vulnerability
 
@@ -32,7 +32,7 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-The latest published `0.4.0` release provides a hand-rolled DNS message model
+The latest published `0.5.0` release provides a hand-rolled DNS message model
 (`dns-lattice-model`'s `message`/`record` modules: header, question, and
 resource-record wire encode/decode, including name decompression on
 decode), a deterministic zone/domain matcher (`matcher`), and static
@@ -56,4 +56,5 @@ hooks before their first release: reports of a hook leaking a query through an
 unintended static fallback, sharing cache entries across effective upstream
 groups, bypassing terminal Fake IP handling, failing to cancel cleanly, or
 permitting same-resolver re-entry are in scope for that development state. The
-published `0.4.0` release does not yet contain hooks.
+published `0.5.0` release contains the route-selection hook pipeline; stage
+0.6 hardening is under development on `main`.

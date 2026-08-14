@@ -10,16 +10,17 @@ Thank you for your interest in DNS Lattice.
 
 ## Project Status
 
-DNS Lattice `0.4.0` is published and remains pre-1.0: stages 0.1-0.3 delivered
+DNS Lattice `0.5.0` is published and remains pre-1.0: stages 0.1-0.3 delivered
 the DNS message/matcher/policy model, resolver/cache, upstream transports,
 failover, and inbound server listeners; stage 0.4 adds opt-in Fake IP
 synthesis through `Resolver` and its server transports, TTL-bound mappings,
 and caller-owned process-local snapshots. Development on `main` additionally
-has completed the stage 0.5 dynamic route-selection hook: it selects an
+has completed and published the stage 0.5 dynamic route-selection hook: it selects an
 existing upstream group before route-scoped cache lookup and has no OS/network
 side effects. Hook errors or invalid selected groups do not fall back, and
 hook implementations own timeout, retry, cancellation cleanup, and any
-external side effects. Its remaining release gate is external CI validation.
+external side effects. Stage 0.6 is active for cross-platform hardening,
+validation, observability, and release automation.
 Durable persistence remains future work. No public API is stable yet. Questions, bug
 reports, and design discussion are welcome; full usage support will start
 once a stable release ships.
