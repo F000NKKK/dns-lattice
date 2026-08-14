@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub-release automation regression alongside the existing strict,
   per-feature rustdoc matrix. These checks do not publish crates or contact
   external release services.
+- Added the opt-in `observability::ObservabilitySink` boundary with immutable,
+  bounded query/cache/Fake IP/hook/upstream/timeout/error events. Sink output
+  is non-authoritative and isolated from resolver routing, caching, retries,
+  and answers.
 
 ## [0.5.0] - 2026-08-14
 

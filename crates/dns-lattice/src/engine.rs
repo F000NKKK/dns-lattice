@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,9 @@ use dns_lattice_model::{
 
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
+use crate::observability::{
+    HookObserveDecision, ObservabilitySink, ObserveEvent, ObserveFailure, UpstreamObserveOutcome,
+};
 use crate::upstream::UpstreamBackend;
 
 /// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
@@ -128,6 +132,8 @@ pub struct Resolver {
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
+    observability_sink: Option<Arc<dyn ObservabilitySink>>,
+    next_correlation_id: AtomicU64,
 }
 
 /// Explicit Fake IP answer synthesis owned by a [`Resolver`].
@@ -149,6 +155,7 @@ impl Resolver {
             clock: Box::new(SystemClock),
             fake_ip: None,
             route_hook: None,
+            observability_sink: None,
         }
     }
 
@@ -189,20 +196,57 @@ impl Resolver {
     /// [`crate::upstream::TcpBackend`]) — see `crate::upstream`'s
     /// module-level docs.
     pub async fn resolve(&self, query: &Message) -> Result<Message> {
-        let question = query.questions.first().ok_or(Error::NoRoute)?;
-
-        if let Some(fake_ip) = &self.fake_ip
-            && let Some(answer) = fake_ip_answer(query, fake_ip)?
-        {
-            return Ok(answer);
+        let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let question = query.questions.first();
+        self.emit(ObserveEvent::QueryReceived {
+            correlation_id,
+            name: question.map(|question| question.name.clone()),
+            rtype: question.map(|question| question.qtype),
+            class: question.map(|question| question.qclass),
+        });
+        let Some(question) = query.questions.first() else {
+            self.emit(ObserveEvent::Failed {
+                correlation_id,
+                failure: ObserveFailure::NoRoute,
+            });
+            return Err(Error::NoRoute);
+        };
+        if let Some(fake_ip) = &self.fake_ip {
+            match fake_ip_answer(query, fake_ip) {
+                Ok(Some(answer)) => {
+                    self.emit(ObserveEvent::FakeIpTerminal { correlation_id });
+                    self.emit(ObserveEvent::Completed {
+                        correlation_id,
+                        rcode: answer.header.rcode,
+                    });
+                    return Ok(answer);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.emit(ObserveEvent::Failed {
+                        correlation_id,
+                        failure: observe_failure(&error),
+                    });
+                    return Err(error);
+                }
+            }
         }
 
-        let (group, backends) = self.select_backends(question).await?;
+        let (group, backends) = match self.select_backends(question, correlation_id).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.emit(ObserveEvent::Failed {
+                    correlation_id,
+                    failure: observe_failure(&error),
+                });
+                return Err(error);
+            }
+        };
         let key = CacheKey {
             name: question.name.clone(),
             rtype: question.qtype,
             class: question.qclass,
-            group,
+            group: group.clone(),
         };
 
         let now = self.clock.now();
@@ -211,14 +255,39 @@ impl Resolver {
             if let Some(entry) = cache.get(&key)
                 && entry.expires_at > now
             {
-                return Ok(cache_hit_response(query, &entry.answer));
+                let answer = cache_hit_response(query, &entry.answer);
+                drop(cache);
+                self.emit(ObserveEvent::CacheHit {
+                    correlation_id,
+                    group: group.clone(),
+                });
+                self.emit(ObserveEvent::Completed {
+                    correlation_id,
+                    rcode: answer.header.rcode,
+                });
+                return Ok(answer);
             }
         }
+        self.emit(ObserveEvent::CacheMiss {
+            correlation_id,
+            group: group.clone(),
+        });
 
         let mut last_err = None;
-        for backend in backends {
+        for (backend_index, backend) in backends.iter().enumerate() {
+            self.emit(ObserveEvent::UpstreamAttempt {
+                correlation_id,
+                group: group.clone(),
+                backend_index,
+            });
             match backend.resolve(query).await {
                 Ok(answer) => {
+                    self.emit(ObserveEvent::UpstreamOutcome {
+                        correlation_id,
+                        group: group.clone(),
+                        backend_index,
+                        outcome: UpstreamObserveOutcome::Success,
+                    });
                     if let Some(ttl) = cacheable_ttl(&answer) {
                         let mut cache = self.cache.lock().expect("cache mutex poisoned");
                         cache.insert(
@@ -229,16 +298,49 @@ impl Resolver {
                             },
                         );
                     }
+                    self.emit(ObserveEvent::Completed {
+                        correlation_id,
+                        rcode: answer.header.rcode,
+                    });
                     return Ok(answer);
                 }
                 Err(e) if is_retryable(&e) => {
+                    self.emit(ObserveEvent::UpstreamOutcome {
+                        correlation_id,
+                        group: group.clone(),
+                        backend_index,
+                        outcome: UpstreamObserveOutcome::RetryableFailure,
+                    });
                     last_err = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.emit(ObserveEvent::UpstreamOutcome {
+                        correlation_id,
+                        group: group.clone(),
+                        backend_index,
+                        outcome: UpstreamObserveOutcome::Failure,
+                    });
+                    self.emit(ObserveEvent::Failed {
+                        correlation_id,
+                        failure: observe_failure(&e),
+                    });
+                    return Err(e);
+                }
             }
         }
 
-        Err(last_err.expect("at least one backend was tried since backends is non-empty"))
+        let error = last_err.expect("at least one backend was tried since backends is non-empty");
+        self.emit(ObserveEvent::Failed {
+            correlation_id,
+            failure: observe_failure(&error),
+        });
+        Err(error)
+    }
+
+    fn emit(&self, event: ObserveEvent) {
+        if let Some(sink) = &self.observability_sink {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(&event)));
+        }
     }
 
     /// Selects and validates the effective upstream group for one ordinary
@@ -252,16 +354,36 @@ impl Resolver {
     async fn select_backends(
         &self,
         question: &dns_lattice_model::Question,
+        correlation_id: u64,
     ) -> Result<(UpstreamGroupId, &Vec<Box<dyn UpstreamBackend>>)> {
         let static_group = self.policy.resolve_group(&question.name);
+        self.emit(ObserveEvent::StaticRoute {
+            correlation_id,
+            group: static_group.cloned(),
+        });
         let group = match &self.route_hook {
-            Some(hook) => match hook
-                .select(RouteRequest::new(question, static_group))
-                .await
-                .map_err(|error| Error::Hook(error.to_string()))?
-            {
-                RouteDecision::Use(group) => Some(group),
-                RouteDecision::Abstain => static_group.cloned(),
+            Some(hook) => match hook.select(RouteRequest::new(question, static_group)).await {
+                Ok(RouteDecision::Use(group)) => {
+                    self.emit(ObserveEvent::HookDecision {
+                        correlation_id,
+                        decision: HookObserveDecision::Use(group.clone()),
+                    });
+                    Some(group)
+                }
+                Ok(RouteDecision::Abstain) => {
+                    self.emit(ObserveEvent::HookDecision {
+                        correlation_id,
+                        decision: HookObserveDecision::Abstain,
+                    });
+                    static_group.cloned()
+                }
+                Err(error) => {
+                    self.emit(ObserveEvent::HookDecision {
+                        correlation_id,
+                        decision: HookObserveDecision::Failed,
+                    });
+                    return Err(Error::Hook(error.to_string()));
+                }
             },
             None => static_group.cloned(),
         }
@@ -461,6 +583,17 @@ fn is_retryable(err: &Error) -> bool {
     matches!(err, Error::Timeout | Error::Transport(_) | Error::Tls(_))
 }
 
+fn observe_failure(error: &Error) -> ObserveFailure {
+    match error {
+        Error::NoRoute => ObserveFailure::NoRoute,
+        Error::Hook(_) => ObserveFailure::Hook,
+        Error::Timeout => ObserveFailure::Timeout,
+        Error::Transport(_) => ObserveFailure::Transport,
+        Error::Tls(_) => ObserveFailure::Tls,
+        _ => ObserveFailure::Other,
+    }
+}
+
 /// Determines the [`Duration`] an `answer` should be cached for, or `None`
 /// if it should not be cached at all.
 ///
@@ -506,6 +639,7 @@ pub struct ResolverBuilder {
     clock: Box<dyn Clock + Send + Sync>,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
+    observability_sink: Option<Arc<dyn ObservabilitySink>>,
 }
 
 impl ResolverBuilder {
@@ -564,6 +698,15 @@ impl ResolverBuilder {
         self
     }
 
+    /// Adds an optional, non-authoritative synchronous event sink.
+    ///
+    /// The resolver invokes it outside internal locks. Panics are isolated and
+    /// never affect DNS answers, route selection, cache behavior, or retries.
+    pub fn observability_sink(mut self, sink: Arc<dyn ObservabilitySink>) -> Self {
+        self.observability_sink = Some(sink);
+        self
+    }
+
     /// Substitutes the clock used to compute and check cache expiry.
     /// Crate-private: no public API for clock injection.
     #[cfg(test)]
@@ -581,6 +724,8 @@ impl ResolverBuilder {
             cache: Mutex::new(HashMap::new()),
             fake_ip: self.fake_ip,
             route_hook: self.route_hook,
+            observability_sink: self.observability_sink,
+            next_correlation_id: AtomicU64::new(1),
         }
     }
 }
@@ -913,6 +1058,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use crate::hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest};
+    use crate::observability::{ObservabilitySink, ObserveEvent};
 
     #[derive(Clone)]
     struct PoolClock(Arc<Mutex<Instant>>);
@@ -939,6 +1085,26 @@ mod tests {
     struct CountingBackend {
         answer: Message,
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<ObserveEvent>>);
+
+    impl ObservabilitySink for RecordingSink {
+        fn record(&self, event: &ObserveEvent) {
+            self.0
+                .lock()
+                .expect("event mutex poisoned")
+                .push(event.clone());
+        }
+    }
+
+    struct PanickingSink;
+
+    impl ObservabilitySink for PanickingSink {
+        fn record(&self, _: &ObserveEvent) {
+            panic!("observer failure must be isolated");
+        }
     }
 
     #[async_trait]
@@ -1116,6 +1282,239 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "backend called only once");
+    }
+
+    #[tokio::test]
+    async fn observability_reports_ordered_cache_miss_and_hit_without_affecting_resolution() {
+        let sink = Arc::new(RecordingSink::default());
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (base, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            a_answer("example.com", 300),
+            FakeClock::new(),
+        );
+        let resolver = ResolverBuilder {
+            policy: base.policy,
+            backends: base.backends,
+            clock: base.clock,
+            fake_ip: base.fake_ip,
+            route_hook: base.route_hook,
+            observability_sink: Some(sink.clone()),
+        }
+        .build();
+
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let events = sink.0.lock().unwrap().clone();
+        assert!(matches!(
+            events[0],
+            ObserveEvent::QueryReceived {
+                correlation_id: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            ObserveEvent::StaticRoute {
+                correlation_id: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            ObserveEvent::CacheMiss {
+                correlation_id: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[3],
+            ObserveEvent::UpstreamAttempt {
+                correlation_id: 1,
+                backend_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[4],
+            ObserveEvent::UpstreamOutcome {
+                correlation_id: 1,
+                outcome: UpstreamObserveOutcome::Success,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[5],
+            ObserveEvent::Completed {
+                correlation_id: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[6],
+            ObserveEvent::QueryReceived {
+                correlation_id: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[7],
+            ObserveEvent::StaticRoute {
+                correlation_id: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[8],
+            ObserveEvent::CacheHit {
+                correlation_id: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[9],
+            ObserveEvent::Completed {
+                correlation_id: 2,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn panicking_observability_sink_is_non_authoritative() {
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("g"),
+            fixed_backend(a_answer("example.com", 300)),
+        )
+        .observability_sink(Arc::new(PanickingSink))
+        .build();
+
+        assert!(resolver.resolve(&query_for("example.com")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn observability_starts_empty_queries_before_no_route_failure() {
+        let sink = Arc::new(RecordingSink::default());
+        let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .observability_sink(sink.clone())
+            .build();
+        let mut query = query_for("example.com");
+        query.questions.clear();
+
+        assert_eq!(resolver.resolve(&query).await, Err(Error::NoRoute));
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [
+                ObserveEvent::QueryReceived {
+                    name: None,
+                    rtype: None,
+                    class: None,
+                    ..
+                },
+                ObserveEvent::Failed {
+                    failure: ObserveFailure::NoRoute,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn observability_marks_fake_ip_terminal_before_cache_or_upstream() {
+        let sink = Arc::new(RecordingSink::default());
+        let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .fake_ip(
+                fake_ip_pool(PoolClock::new()),
+                fake_ip_policy("example.com"),
+            )
+            .observability_sink(sink.clone())
+            .build();
+
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [
+                ObserveEvent::QueryReceived { .. },
+                ObserveEvent::FakeIpTerminal { .. },
+                ObserveEvent::Completed { .. },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn observability_records_hook_and_timeout_failures_in_order() {
+        let sink = Arc::new(RecordingSink::default());
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .route_hook(FixedHook {
+            decision: Err(RouteHookError::new("denied")),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .observability_sink(sink.clone())
+        .build();
+        assert!(matches!(
+            resolver.resolve(&query_for("example.com")).await,
+            Err(Error::Hook(_))
+        ));
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [
+                ObserveEvent::QueryReceived { .. },
+                ObserveEvent::StaticRoute { .. },
+                ObserveEvent::HookDecision {
+                    decision: HookObserveDecision::Failed,
+                    ..
+                },
+                ObserveEvent::Failed {
+                    failure: ObserveFailure::Hook,
+                    ..
+                },
+            ]
+        ));
+
+        sink.0.lock().unwrap().clear();
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .backend(UpstreamGroupId::new("g"), FailingBackend(Error::Timeout))
+        .observability_sink(sink.clone())
+        .build();
+        assert_eq!(
+            resolver.resolve(&query_for("example.com")).await,
+            Err(Error::Timeout)
+        );
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [
+                ObserveEvent::QueryReceived { .. },
+                ObserveEvent::StaticRoute { .. },
+                ObserveEvent::CacheMiss { .. },
+                ObserveEvent::UpstreamAttempt { .. },
+                ObserveEvent::UpstreamOutcome {
+                    outcome: UpstreamObserveOutcome::RetryableFailure,
+                    ..
+                },
+                ObserveEvent::Failed {
+                    failure: ObserveFailure::Timeout,
+                    ..
+                },
+            ]
+        ));
     }
 
     #[tokio::test]

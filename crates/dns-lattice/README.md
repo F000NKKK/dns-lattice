@@ -167,6 +167,17 @@ must not re-enter the same resolver. Hooks receive no resolver/backend handle,
 client metadata, or OS/network side-effect capability. Compose side effects in
 the host application or another external layer.
 
+## Observability
+
+`ResolverBuilder::observability_sink` accepts an optional synchronous
+`observability::ObservabilitySink`. The sink receives immutable bounded events
+for query receipt, terminal Fake IP handling, route-hook decisions, cache
+hits/misses, upstream attempts/outcomes, timeouts, and terminal errors. It is
+non-authoritative: callback panics are isolated and events cannot change
+routing, answers, retries, or cache state. DNS Lattice invokes callbacks after
+releasing resolver locks and does not create a background queue or integrate
+with logging, OS networking, tunnel-lattice, flow-lattice, or sdk-lattice.
+
 ## Feature/platform constraints
 
 - Default build: no Cargo features enabled. Carries no TLS/HTTP dependency

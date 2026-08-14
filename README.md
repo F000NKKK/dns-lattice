@@ -253,6 +253,10 @@ Implemented and published through `0.5.0`:
   hook decision, validate the effective group, and cache only in that group's
   scope. Hooks cannot resolve, rewrite answers, alter cache policy, or perform
   networking side effects through DNS Lattice.
+- `observability::ObservabilitySink`: an optional synchronous, non-authoritative
+  event sink for query, cache, Fake IP, hook, upstream, timeout, and error
+  transitions. Events are immutable and bounded; sink callbacks cannot alter
+  routing, answers, retries, or cache state.
 
 Planned for stage 0.6 (see [ROADMAP.md](ROADMAP.md)):
 

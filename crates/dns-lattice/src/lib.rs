@@ -297,6 +297,8 @@ pub mod core {
 /// request, decision, and error types. Route hooks are intentionally not
 /// re-exported from the crate root.
 pub mod hooks;
+/// Optional, non-authoritative resolver event sink.
+pub mod observability;
 /// DNS message, domain-matching, and split-DNS policy types.
 ///
 /// This is the canonical facade path for types supplied by
