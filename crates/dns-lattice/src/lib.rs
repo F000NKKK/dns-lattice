@@ -90,6 +90,12 @@
 
 pub mod engine;
 pub mod fakeip;
+/// Caller-supplied dynamic upstream-group selection types.
+///
+/// This is the canonical facade path for [`hooks::RouteHook`] and its
+/// request, decision, and error types. Route hooks are intentionally not
+/// re-exported from the crate root.
+pub mod hooks;
 /// DNS message, domain-matching, and split-DNS policy types.
 ///
 /// This is the canonical facade path for types supplied by
@@ -126,7 +132,7 @@ pub use upstream::{TcpBackend, TcpBackendConfig, UdpBackend, UdpBackendConfig, U
 
 #[cfg(test)]
 mod facade_path_tests {
-    use super::{DomainMatcher, DomainPattern, Name, Resolver, ResolverBuilder, model};
+    use super::{DomainMatcher, DomainPattern, Name, Resolver, ResolverBuilder, hooks, model};
 
     #[test]
     fn canonical_model_paths_and_flat_aliases_name_the_same_types() {
@@ -134,5 +140,8 @@ mod facade_path_tests {
         let _: Option<model::DomainMatcher<()>> = Some(DomainMatcher::new());
         let _: fn(model::Name) -> model::DomainPattern = DomainPattern::suffix;
         let _: fn(model::SplitDnsPolicy) -> ResolverBuilder = Resolver::builder;
+
+        let _: Option<hooks::RouteDecision> = Some(hooks::RouteDecision::Abstain);
+        let _: Option<&dyn hooks::RouteHook> = None;
     }
 }

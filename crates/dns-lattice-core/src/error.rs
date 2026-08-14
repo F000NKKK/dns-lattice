@@ -68,6 +68,10 @@ pub enum Error {
     /// `PartialEq`-sensitive to the underlying TLS library's exact error
     /// type, matching `Transport`'s existing precedent.
     Tls(String),
+    /// A caller-supplied dynamic route-selection hook failed. Carries the
+    /// hook's human-readable failure message; resolver integration does not
+    /// fall back to static routing, retry an upstream, or cache this error.
+    Hook(String),
     /// A Fake IP pool range was empty because its start address was greater
     /// than its end address.
     InvalidFakeIpRange,
@@ -120,6 +124,7 @@ impl fmt::Display for Error {
             Error::Timeout => write!(f, "upstream backend timed out"),
             Error::Transport(message) => write!(f, "upstream transport error: {message}"),
             Error::Tls(message) => write!(f, "upstream tls error: {message}"),
+            Error::Hook(message) => write!(f, "route hook error: {message}"),
             Error::InvalidFakeIpRange => write!(f, "fake ip range start exceeds its end"),
             Error::FakeIpPoolUnconfigured => {
                 write!(f, "fake ip pool requires an ipv4 or ipv6 range")
@@ -191,6 +196,10 @@ mod tests {
             (
                 Error::Tls("certificate expired".to_string()),
                 "upstream tls error: certificate expired",
+            ),
+            (
+                Error::Hook("policy service unavailable".to_string()),
+                "route hook error: policy service unavailable",
             ),
             (
                 Error::InvalidFakeIpRange,
