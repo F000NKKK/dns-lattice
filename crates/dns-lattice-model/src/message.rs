@@ -760,4 +760,40 @@ mod tests {
         assert_eq!(Name::from_ascii("a..b").unwrap_err(), Error::InvalidName);
         assert_eq!(Name::from_ascii(".a").unwrap_err(), Error::InvalidName);
     }
+
+    #[test]
+    fn deterministic_malformed_wire_corpus_never_panics() {
+        // This deliberately small, fixed corpus covers every DNS-name length
+        // prefix class and every message length up to a header plus one
+        // question. It is a fuzz-style safety invariant, not a claim that
+        // arbitrary trailing bytes must be rejected when section counts are
+        // zero.
+        for len in 0..=18 {
+            for byte in [0x00, 0x01, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff] {
+                let wire = vec![byte; len];
+                let decoded = std::panic::catch_unwind(|| Message::decode(&wire));
+                assert!(
+                    decoded.is_ok(),
+                    "decoder panicked for len={len}, byte={byte:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compression_pointer_consumes_only_its_two_wire_bytes() {
+        // For every earlier pointer target in this bounded corpus, decoding a
+        // compressed root name succeeds and leaves the caller positioned
+        // immediately after the pointer rather than after its target.
+        for pointer in 0..64usize {
+            let cur = pointer + 1;
+            let mut wire = vec![0; cur + 2];
+            wire[cur] = 0xc0 | (((pointer >> 8) & 0x3f) as u8);
+            wire[cur + 1] = pointer as u8;
+            let mut pos = cur;
+
+            assert_eq!(decode_name(&wire, &mut pos).unwrap(), Name::root());
+            assert_eq!(pos, cur + 2, "pointer target {pointer}");
+        }
+    }
 }

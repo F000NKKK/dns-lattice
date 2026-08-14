@@ -283,4 +283,45 @@ mod tests {
             vec![&"exact", &"suffix", &"wildcard"]
         );
     }
+
+    #[test]
+    fn generated_precedence_cases_agree_with_resolve_all() {
+        // A deterministic property-style corpus: changing rule insertion
+        // order must not change kind/specificity precedence, while `resolve`
+        // must always agree with the first diagnostic match.
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let rules = [
+                (DomainPattern::wildcard(n("example.test")), "wildcard"),
+                (DomainPattern::suffix(n("api.example.test")), "suffix"),
+                (DomainPattern::exact(n("api.example.test")), "exact"),
+            ];
+            let mut matcher = DomainMatcher::new();
+            for index in order {
+                let (pattern, value) = &rules[index];
+                matcher.insert(pattern.clone(), *value);
+            }
+
+            for (candidate, expected) in [
+                ("API.EXAMPLE.TEST", Some("exact")),
+                ("v1.api.example.test", Some("suffix")),
+                ("worker.example.test", Some("wildcard")),
+                ("example.test", None),
+                ("example.invalid", None),
+            ] {
+                let resolved = matcher.resolve(&n(candidate));
+                assert_eq!(resolved.copied(), expected, "candidate {candidate}");
+                assert_eq!(
+                    resolved,
+                    matcher.resolve_all(&n(candidate)).first().copied()
+                );
+            }
+        }
+    }
 }

@@ -1160,6 +1160,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_identity_separates_generated_question_type_and_class_pairs() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let (resolver, calls) = resolver_with_counting_backend(
+            policy,
+            "g",
+            a_answer("example.com", 300),
+            FakeClock::new(),
+        );
+
+        let cases = [
+            (RecordType::A, Class::In, 1),
+            (RecordType::Aaaa, Class::In, 2),
+            (RecordType::A, Class::Ch, 3),
+            (RecordType::Other(65280), Class::Other(65280), 4),
+        ];
+
+        for (rtype, class, id) in cases {
+            resolver
+                .resolve(&query_for_type("example.com", rtype, class, id))
+                .await
+                .expect("each distinct cache identity resolves");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), cases.len());
+
+        for (rtype, class, id) in cases {
+            let cached = resolver
+                .resolve(&query_for_type("example.com", rtype, class, id + 10))
+                .await
+                .expect("same type/class pair is cached");
+            assert_eq!(cached.header.id, id + 10);
+            assert_eq!(cached.questions[0].qtype, rtype);
+            assert_eq!(cached.questions[0].qclass, class);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), cases.len());
+    }
+
+    #[tokio::test]
     async fn cache_entry_still_hit_just_before_ttl_elapses() {
         let policy = SplitDnsPolicy::builder()
             .default_group(UpstreamGroupId::new("g"))

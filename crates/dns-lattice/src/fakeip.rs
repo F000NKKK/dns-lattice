@@ -957,6 +957,47 @@ mod tests {
     }
 
     #[test]
+    fn generated_capacities_reclaim_expired_entries_before_live_lru() {
+        // Exercise the same eviction invariant across several finite pool
+        // sizes. The expired entry is deliberately made most recently used,
+        // so choosing LRU before purging would evict a live mapping instead.
+        for capacity in 2u8..=4 {
+            let clock = FakeClock::new();
+            let pool = FakeIpPool::builder()
+                .ttl(Duration::from_secs(3))
+                .clock(clock.clone())
+                .ipv4_range(
+                    Ipv4Addr::new(198, 18, 1, 1),
+                    Ipv4Addr::new(198, 18, 1, capacity),
+                )
+                .build()
+                .unwrap();
+            let expired = name(&format!("expired-{capacity}.test"));
+            let expired_address = pool.allocate_ipv4(expired.clone()).unwrap();
+            clock.advance(Duration::from_secs(1));
+
+            let live: Vec<_> = (1..capacity)
+                .map(|index| {
+                    let live = name(&format!("live-{capacity}-{index}.test"));
+                    let address = pool.allocate_ipv4(live.clone()).unwrap();
+                    (live, address)
+                })
+                .collect();
+            assert_eq!(pool.allocate_ipv4(expired).unwrap(), expired_address);
+
+            clock.advance(Duration::from_secs(2));
+            assert_eq!(
+                pool.allocate_ipv4(name(&format!("fresh-{capacity}.test")))
+                    .unwrap(),
+                expired_address
+            );
+            for (live_name, live_address) in live {
+                assert_eq!(pool.lookup_ipv4(live_address), Some(live_name));
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_restore_preserves_live_mappings_ttl_and_lru_order() {
         let clock = FakeClock::new();
         let pool = FakeIpPool::builder()
