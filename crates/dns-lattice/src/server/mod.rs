@@ -210,11 +210,10 @@ impl ServerBuilder {
     /// addresses, each with its own `tls_config`/`config`.
     ///
     /// This crate does not source certificate material itself — the caller
-    /// supplies a
-    /// fully configured `Arc<rustls::ServerConfig>`, exactly like
-    /// [`ServerBuilder::dot_addr`]. A deployment that serves both DoH HTTP
-    /// versions must configure its ALPN list with `h2` and `http/1.1`; the
-    /// listener serves whichever protocol TLS negotiates.
+    /// supplies a fully configured `Arc<rustls::ServerConfig>`. A deployment
+    /// that serves both DoH HTTP versions must configure its ALPN list with
+    /// `h2` and `http/1.1`; the listener serves whichever protocol TLS
+    /// negotiates.
     #[cfg(feature = "doh")]
     pub fn doh_addr(
         mut self,

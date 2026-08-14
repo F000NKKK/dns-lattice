@@ -41,8 +41,8 @@ pub struct DoqBackendConfig {
     /// include `doq` (RFC 9250 §4.1.1) —
     /// [`DoqBackendConfig::with_webpki_roots`] sets this correctly for the
     /// common case; a caller building `tls_config` directly is responsible
-    /// for setting it, matching [`super::DotBackendConfig`]'s own doc
-    /// precedent for caller-built `ClientConfig`s.
+    /// for setting it, as with any caller-built encrypted-transport
+    /// `ClientConfig`.
     pub tls_config: Arc<RustlsClientConfig>,
     /// Bounds establishing the QUIC connection (UDP handshake through TLS
     /// 1.3 completion).
@@ -84,14 +84,14 @@ impl DoqBackendConfig {
 
 /// DNS-over-QUIC upstream backend (RFC 9250), gated behind the `doq` Cargo
 /// feature. Follows the same `Config` + `Backend` +
-/// `#[async_trait] impl UpstreamBackend` pattern as [`super::UdpBackend`]/
-/// [`super::TcpBackend`]/[`super::DotBackend`]; this backend
+/// `#[async_trait] impl UpstreamBackend` pattern as the other transport
+/// backends; this backend
 /// adds no fields or methods to the [`UpstreamBackend`] trait itself.
 ///
 /// Opens a fresh `quinn::Endpoint` and `quinn::Connection` per
 /// [`UpstreamBackend::resolve`] call — no connection pooling/reuse this
-/// stage, matching [`super::DotBackend`]'s own per-call TCP+TLS connect
-/// precedent. A pre-handshake QUIC/UDP-layer failure
+/// stage, matching the per-call connection lifetime of the other encrypted
+/// backends. A pre-handshake QUIC/UDP-layer failure
 /// (endpoint bind, `Endpoint::connect`, or a post-handshake QUIC transport/
 /// stream failure) maps to [`Error::Transport`]; a failure attributable to
 /// the QUIC connection's embedded TLS 1.3 handshake maps to [`Error::Tls`].

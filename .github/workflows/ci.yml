@@ -48,6 +48,14 @@ jobs:
       - name: cargo test -p dns-lattice ${{ matrix.cargo_args }}
         run: cargo test -p dns-lattice ${{ matrix.cargo_args }}
 
+      # `--all-features` alone can hide links to items gated behind a
+      # different feature. Keep rustdoc warnings fatal for every supported
+      # feature selection so each published API surface is checked.
+      - name: cargo doc -D warnings -p dns-lattice ${{ matrix.cargo_args }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p dns-lattice ${{ matrix.cargo_args }}
+
   ci:
     name: ci (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
