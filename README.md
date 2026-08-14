@@ -253,18 +253,19 @@ Implemented and published through `0.5.0`:
   hook decision, validate the effective group, and cache only in that group's
   scope. Hooks cannot resolve, rewrite answers, alter cache policy, or perform
   networking side effects through DNS Lattice.
-- `observability::ObservabilitySink`: an optional synchronous, non-authoritative
-  event sink for query, cache, Fake IP, hook, upstream, timeout, and error
-  transitions. Events are immutable and bounded; sink callbacks cannot alter
-  routing, answers, retries, or cache state.
 
-Planned for stage 0.6 (see [ROADMAP.md](ROADMAP.md)):
+Implemented on `main` for stage 0.6 (see [ROADMAP.md](ROADMAP.md)):
 
 - Linux/Windows/macOS feature-matrix hardening and strict per-feature rustdoc
 - Fuzz/property tests for parsing, compression bounds, matcher precedence,
   cache identity, and Fake IP TTL/LRU invariants
 - Structured observability sink and documented query/cache/hook/upstream events
-- Reproducible package/docs.rs checks and idempotent release automation
+- Reproducible package-content/docs.rs-compatible checks and idempotent release automation
+
+Remaining before a 0.6 release:
+
+- External confirmation of the cross-platform GitHub Actions matrix and final
+  release/documentation reconciliation; 0.6 is not published yet.
 
 ## Transport features
 

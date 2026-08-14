@@ -122,14 +122,17 @@ Status: done; published in 0.5.0
 
 Status: active
 
-- Cross-platform CI matrix (Linux/Windows/macOS) exercising every backend
-  feature combination, with strict per-feature rustdoc checks.
-- Fuzz/property tests for message parsing, compression bounds, matcher
-  precedence, resolver cache identity, and Fake IP expiry/eviction invariants.
-- Finalize an observability sink trait with structured query, cache, hook,
-  upstream, timeout, and error events while keeping sinks side-effect-only.
-- Harden package/release automation: reproducible `cargo package`, docs.rs
-  checks, facade-first release selection, and idempotent reruns.
+- Implemented on `main`: Linux/Windows/macOS CI exercises every supported
+  feature selection with strict per-feature rustdoc checks; package contents
+  and release-automation regression are also checked hermetically.
+- Implemented on `main`: deterministic property-style coverage for message
+  parsing/compression bounds, matcher precedence, resolver cache identity,
+  and Fake IP expiry/eviction invariants.
+- Implemented on `main`: opt-in `observability::ObservabilitySink` emits
+  immutable, bounded query/cache/route/hook/upstream/terminal events without
+  client data, handles, or authority over resolution.
+- Remaining: external cross-platform CI confirmation and final release/docs
+  reconciliation; no stage 0.6 release has been published.
 - Keep English/Russian rustdoc, crate READMEs, root docs, CHANGELOG, SECURITY,
   SUPPORT, and CONTRIBUTING synchronized as each hardening contract lands.
 

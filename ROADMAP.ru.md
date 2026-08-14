@@ -129,14 +129,17 @@
 
 Статус: active
 
-- Кроссплатформенная CI-матрица (Linux/Windows/macOS) для всех комбинаций
-  фич бэкендов и строгие rustdoc-проверки каждой фичи.
-- Fuzz/property-тесты разбора сообщений, границ компрессии, приоритетов
-  матчера, cache identity резолвера и инвариантов TTL/LRU Fake IP.
-- Финализация sink-трейта наблюдаемости со структурированными событиями
-  query, cache, hook, upstream, timeout и error без побочных действий в sink.
-- Укрепление package/release automation: воспроизводимый `cargo package`,
-  проверки docs.rs, facade-first выбор релиза и идемпотентные повторы.
+- Реализовано в `main`: CI Linux/Windows/macOS проверяет каждую поддержанную
+  комбинацию фич со строгим per-feature rustdoc; package listings и regression
+  release automation также проверяются hermetic-режимом.
+- Реализовано в `main`: детерминированное property-style покрытие parsing/
+  compression bounds, matcher precedence, cache identity резолвера и
+  инвариантов Fake IP TTL/LRU.
+- Реализовано в `main`: opt-in `observability::ObservabilitySink` передаёт
+  неизменяемые ограниченные query/cache/route/hook/upstream/terminal события
+  без client data, handles и права влиять на резолвинг.
+- Осталось: внешнее подтверждение cross-platform CI и финальное согласование
+  release/docs; релиз стадии 0.6 ещё не опубликован.
 - Синхронизация EN/RU rustdoc, README крейтов, корневых документов,
   CHANGELOG, SECURITY, SUPPORT и CONTRIBUTING при каждом изменении контракта.
 
