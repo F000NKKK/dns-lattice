@@ -931,6 +931,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::fakeip::{FakeIpPolicy, FakeIpPool};
+    use crate::hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest};
     use crate::upstream::UpstreamBackend;
 
     fn query_for(name: &str, id: u16) -> Message {
@@ -983,6 +984,23 @@ mod tests {
         }
     }
 
+    /// A fixed-answer fake backend that records invocations, used to verify
+    /// route selection and cache scope through an inbound server transport.
+    struct CountingBackend {
+        answer: Message,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpstreamBackend for CountingBackend {
+        async fn resolve(&self, query: &Message) -> Result<Message> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut answer = self.answer.clone();
+            answer.header.id = query.header.id;
+            Ok(answer)
+        }
+    }
+
     /// A fake [`UpstreamBackend`] that always fails, used to exercise
     /// ServFail synthesis.
     struct FailingBackend;
@@ -991,6 +1009,25 @@ mod tests {
     impl UpstreamBackend for FailingBackend {
         async fn resolve(&self, _query: &Message) -> Result<Message> {
             Err(Error::NoRoute)
+        }
+    }
+
+    /// A deterministic hook used to prove that the server paths observe the
+    /// resolver's route-selection result without introducing a separate
+    /// transport-specific hook interface.
+    struct FixedHook {
+        decision: std::result::Result<RouteDecision, RouteHookError>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RouteHook for FixedHook {
+        async fn select(
+            &self,
+            _request: RouteRequest<'_>,
+        ) -> std::result::Result<RouteDecision, RouteHookError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.decision.clone()
         }
     }
 
@@ -1314,6 +1351,236 @@ mod tests {
             fallback.answers[0].rdata,
             RData::A("203.0.113.81".parse().unwrap())
         );
+
+        drop(stream);
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_route_hook_selects_the_observable_upstream_group() {
+        let static_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let selected_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = Arc::new(
+            Resolver::builder(
+                SplitDnsPolicy::builder()
+                    .default_group(UpstreamGroupId::new("static"))
+                    .build(),
+            )
+            .backend(
+                UpstreamGroupId::new("static"),
+                CountingBackend {
+                    answer: answer_with_a("hook.example.test", 0, "203.0.113.201".parse().unwrap()),
+                    calls: static_calls.clone(),
+                },
+            )
+            .backend(
+                UpstreamGroupId::new("selected"),
+                CountingBackend {
+                    answer: answer_with_a("hook.example.test", 0, "203.0.113.202".parse().unwrap()),
+                    calls: selected_calls.clone(),
+                },
+            )
+            .route_hook(FixedHook {
+                decision: Ok(RouteDecision::Use(UpstreamGroupId::new("selected"))),
+                calls: hook_calls.clone(),
+            })
+            .build(),
+        );
+        let server = ServerBuilder::new(resolver)
+            .udp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds udp");
+        let addr = server.udp_sockets[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = query_for("hook.example.test", 81);
+        let response = udp_round_trip(&client, addr, &query).await;
+        assert_eq!(response.header.id, 81);
+        assert_eq!(response.questions, query.questions);
+        assert_eq!(
+            response.answers[0].rdata,
+            RData::A("203.0.113.202".parse().unwrap())
+        );
+        assert_eq!(hook_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(static_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(selected_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_abstaining_hook_uses_static_route_and_preserves_cache_request_identity() {
+        let backend_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = Arc::new(
+            Resolver::builder(
+                SplitDnsPolicy::builder()
+                    .default_group(UpstreamGroupId::new("static"))
+                    .build(),
+            )
+            .backend(
+                UpstreamGroupId::new("static"),
+                CountingBackend {
+                    answer: answer_with_a(
+                        "cache.example.test",
+                        0,
+                        "203.0.113.203".parse().unwrap(),
+                    ),
+                    calls: backend_calls.clone(),
+                },
+            )
+            .route_hook(FixedHook {
+                decision: Ok(RouteDecision::Abstain),
+                calls: hook_calls.clone(),
+            })
+            .build(),
+        );
+        let server = ServerBuilder::new(resolver)
+            .tcp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds tcp");
+        let addr = server.tcp_listeners[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let first_query = query_for("cache.example.test", 91);
+        let mut second_query = query_for("cache.example.test", 92);
+        second_query.questions.push(Question {
+            name: Name::from_ascii("extra.example.test").unwrap(),
+            qtype: RecordType::Aaaa,
+            qclass: Class::In,
+        });
+        let first = tcp_round_trip(&mut stream, &first_query).await;
+        let second = tcp_round_trip(&mut stream, &second_query).await;
+        assert_eq!(
+            first.answers[0].rdata,
+            RData::A("203.0.113.203".parse().unwrap())
+        );
+        assert_eq!(
+            second.answers[0].rdata,
+            RData::A("203.0.113.203".parse().unwrap())
+        );
+        assert_eq!(
+            second.header.id, 92,
+            "a cached answer echoes this request's id"
+        );
+        assert_eq!(
+            second.questions, second_query.questions,
+            "a cached answer echoes this request's question section"
+        );
+        assert_eq!(backend_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hook_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        drop(stream);
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_fake_ip_answer_bypasses_route_hook() {
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = Arc::new(
+            FakeIpPool::builder()
+                .ipv4_range("198.18.0.1".parse().unwrap(), "198.18.0.2".parse().unwrap())
+                .ttl(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        );
+        let policy = FakeIpPolicy::builder()
+            .rule(DomainPattern::suffix(
+                Name::from_ascii("fake.test").unwrap(),
+            ))
+            .build();
+        let resolver = Arc::new(
+            Resolver::builder(SplitDnsPolicy::builder().build())
+                .fake_ip(pool, policy)
+                .route_hook(FixedHook {
+                    decision: Ok(RouteDecision::Use(UpstreamGroupId::new("unused"))),
+                    calls: hook_calls.clone(),
+                })
+                .build(),
+        );
+        let server = ServerBuilder::new(resolver)
+            .udp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds udp");
+        let addr = server.udp_sockets[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let response = udp_round_trip(&client, addr, &query_for("www.fake.test", 101)).await;
+        assert_eq!(response.header.id, 101);
+        assert_eq!(
+            response.answers[0].rdata,
+            RData::A("198.18.0.1".parse().unwrap())
+        );
+        assert_eq!(hook_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        shutdown_tx.send(()).unwrap();
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_hook_error_is_servfail_with_request_identity() {
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = Arc::new(
+            Resolver::builder(SplitDnsPolicy::builder().build())
+                .route_hook(FixedHook {
+                    decision: Err(RouteHookError::new("policy unavailable")),
+                    calls: hook_calls.clone(),
+                })
+                .build(),
+        );
+        let server = ServerBuilder::new(resolver)
+            .tcp_addr("127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("binds tcp");
+        let addr = server.tcp_listeners[0].local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let query = query_for("hook-error.example.test", 111);
+        let response = tcp_round_trip(&mut stream, &query).await;
+        assert_eq!(response.header.rcode, Rcode::ServFail);
+        assert_eq!(response.header.id, 111);
+        assert_eq!(response.questions, query.questions);
+        assert_eq!(hook_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         drop(stream);
         shutdown_tx.send(()).unwrap();
