@@ -40,6 +40,12 @@ DNS Lattice follows standard Rust ecosystem conventions:
 - Code must be free of `clippy` warnings.
 - Public APIs must be documented.
 - Changes must include appropriate tests.
+- CI treats `cargo doc --no-deps` with warnings denied across every supported
+  feature selection as the local docs.rs-compatible documentation gate; it
+  does not publish or query docs.rs during pull-request validation.
+- CI also lists reproducible `cargo package --workspace --allow-dirty`
+  archives and runs the hermetic release-automation regression script. These
+  checks never publish a crate, create a tag, or contact GitHub/crates.io.
 - Every affected crate must retain a standalone crate-local README, and
   English/Russian project documentation must remain synchronized.
 - Privileged network tests must be isolated, opt-in, and restore changed state.

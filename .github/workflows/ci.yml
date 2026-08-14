@@ -18,12 +18,13 @@ env:
 
 jobs:
   feature-matrix:
-    name: feature matrix (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    name: feature matrix (${{ matrix.os }}, ${{ matrix.feature.name }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        feature:
           - name: no-default-features
             cargo_args: --no-default-features
           - name: dot
@@ -42,19 +43,41 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.2
 
-      - name: cargo check -p dns-lattice ${{ matrix.cargo_args }}
-        run: cargo check -p dns-lattice ${{ matrix.cargo_args }}
+      - name: cargo check -p dns-lattice ${{ matrix.feature.cargo_args }}
+        run: cargo check -p dns-lattice ${{ matrix.feature.cargo_args }}
 
-      - name: cargo test -p dns-lattice ${{ matrix.cargo_args }}
-        run: cargo test -p dns-lattice ${{ matrix.cargo_args }}
+      - name: cargo test -p dns-lattice ${{ matrix.feature.cargo_args }}
+        run: cargo test -p dns-lattice ${{ matrix.feature.cargo_args }}
 
       # `--all-features` alone can hide links to items gated behind a
       # different feature. Keep rustdoc warnings fatal for every supported
       # feature selection so each published API surface is checked.
-      - name: cargo doc -D warnings -p dns-lattice ${{ matrix.cargo_args }}
+      - name: cargo doc -D warnings -p dns-lattice ${{ matrix.feature.cargo_args }}
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps -p dns-lattice ${{ matrix.cargo_args }}
+        run: cargo doc --no-deps -p dns-lattice ${{ matrix.feature.cargo_args }}
+
+  package-and-release-smoke:
+    name: package and release smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      # Build and list each publishable archive from the checkout. This
+      # checks the crate-local README/package boundary reproducibly without
+      # publishing or contacting crates.io.
+      - name: cargo package --workspace --allow-dirty --list
+        run: cargo package --workspace --allow-dirty --list
+
+      # The script stubs git/GitHub/crates.io inside a disposable workspace;
+      # this is a deterministic regression test, not a release action.
+      - name: release automation regression
+        run: bash scripts/test_gh_release.sh
 
   ci:
     name: ci (${{ matrix.os }})

@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stage 0.6 hardening is tracked here: cross-platform verification,
   parser and matcher fuzz/property coverage, structured observability, and
   release/package validation improvements.
+- CI now lists every workspace package archive and runs the hermetic
+  GitHub-release automation regression alongside the existing strict,
+  per-feature rustdoc matrix. These checks do not publish crates or contact
+  external release services.
 
 ## [0.5.0] - 2026-08-14
 
