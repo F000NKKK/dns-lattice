@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-14
+
 - New public `dns_lattice::fakeip` module: `FakeIpPool` configures inclusive
   IPv4 and/or IPv6 ranges, deterministically allocates or reuses one
   synthetic address per DNS name, and reverse-resolves active mappings.

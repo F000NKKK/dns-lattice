@@ -21,5 +21,5 @@ when implementing a component that needs the DNS model without the rest of
 
 ## Status
 
-Version `0.3.0` is published and this crate remains pre-1.0. Types may
+Version `0.4.0` is published and this crate remains pre-1.0. Types may
 change without notice until `dns-lattice` reaches its first stable release.

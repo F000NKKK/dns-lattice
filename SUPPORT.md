@@ -10,11 +10,11 @@ Thank you for your interest in DNS Lattice.
 
 ## Project Status
 
-DNS Lattice `0.3.0` is published and remains pre-1.0: stages 0.1-0.3 have delivered the DNS
-message/matcher/policy model, resolver/cache, upstream transports, failover,
-and inbound server listeners. Stage 0.4 is active with opt-in Fake IP
+DNS Lattice `0.4.0` is published and remains pre-1.0: stages 0.1-0.3 delivered
+the DNS message/matcher/policy model, resolver/cache, upstream transports,
+failover, and inbound server listeners; stage 0.4 adds opt-in Fake IP
 synthesis through `Resolver` and its server transports, TTL-bound mappings,
-and caller-owned process-local snapshots; durable persistence and dynamic
+and caller-owned process-local snapshots. Durable persistence and dynamic
 hooks remain future work. No public API is stable yet. Questions, bug
 reports, and design discussion are welcome; full usage support will start
 once a stable release ships.

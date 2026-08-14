@@ -184,7 +184,7 @@ let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
 
 ## Status
 
-Version `0.3.0` is published and this crate remains pre-1.0: its public API
+Version `0.4.0` is published and this crate remains pre-1.0: its public API
 may change before the first stable release. Stage 0.1 (core model)
 landed the DNS message/matcher/policy model above; stage 0.2 landed the
 resolver's construct/resolve lifecycle, static split-DNS routing, and its
@@ -194,8 +194,8 @@ the public async `upstream` trait, baseline UDP/TCP backends, the opt-in
 across a group's registered backends, and the `server` module's
 embeddable inbound UDP/TCP listener (`Server`/`ServerBuilder`) plus its
 opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
-(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Stage 0.4 adds the
-opt-in Fake IP resolver behavior above, TTL expiry, and caller-owned,
+(`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Published Stage 0.4 adds
+the opt-in Fake IP resolver behavior above, TTL expiry, and caller-owned
 process-local snapshot/restore; it does not add durable persistence. Dynamic
 routing hooks are not implemented yet. Types may change without notice until
 the first stable release.

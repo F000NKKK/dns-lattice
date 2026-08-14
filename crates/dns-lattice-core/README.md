@@ -34,6 +34,6 @@ assert!(decode_class(9999).is_err());
 
 ## Status
 
-Version `0.3.0` is published and this crate remains pre-1.0. Types and
+Version `0.4.0` is published and this crate remains pre-1.0. Types and
 variants may change without notice until `dns-lattice` reaches its first
 stable release.

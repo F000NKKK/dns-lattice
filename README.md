@@ -13,13 +13,13 @@
 
 **DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
 
-> **Status:** `0.3.0` is published. It delivers the DNS message model, zone/domain
+> **Status:** `0.4.0` is published. It delivers the DNS message model, zone/domain
 > matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
-> `dns-lattice` facade. Development of `0.4` adds opt-in Fake IP answer
-> synthesis through the resolver and every server transport. The API remains
-> pre-1.0; see Current Status below.
+> `dns-lattice` facade. It also adds opt-in Fake IP answer synthesis through
+> the resolver and every server transport. The API remains pre-1.0; see
+> Current Status below.
 
 ## Overview
 
@@ -149,7 +149,7 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (`0.3.0` plus the current `0.4` development slice):
+Implemented (published through `0.4.0`):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -236,7 +236,7 @@ uses through its shared resolver.
 | Inbound DoT server listener (`dot` Cargo feature) | ✅ |
 | Inbound DoQ server listener (`doq` Cargo feature) | ✅ |
 | Inbound DoH server listener (`doh` Cargo feature) | ✅ |
-| Fake IP pool and opt-in resolver/server synthesis | ✅ (0.4 development) |
+| Fake IP pool and opt-in resolver/server synthesis | ✅ (0.4.0) |
 | Dynamic routing hooks | planned (0.5) |
 
 ## Examples
@@ -259,7 +259,7 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
 2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
 3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
 4. **Stage 0.3: Upstream transport backends and server listener** *(completed)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
-5. **Stage 0.4: Fake IP** *(active)* — deterministic synthetic address
+5. **Stage 0.4: Fake IP** *(completed in 0.4.0)* — deterministic synthetic address
    allocation, reverse lookup, LRU eviction, expiry, and caller-owned
    process-local snapshot/restore; opt-in resolver/server synthesis for
    matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.

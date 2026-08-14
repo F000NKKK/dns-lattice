@@ -58,13 +58,11 @@ implementation starts.
 
 ## Current status
 
-Version `0.3.0` is published; the public API remains pre-1.0 and unstable.
-Stages 0.0 through 0.3 are done; stage 0.3 delivered the core model,
-resolver/cache, upstream transports, failover, and inbound server listeners.
-Stage 0.4 is active with opt-in Fake IP answer synthesis in `Resolver` and
-the server transports that use it, plus caller-owned process-local pool
-snapshots. See `CONTRIBUTING.md` and `SUPPORT.md` for current project-status
-language.
+Version `0.4.0` is published; the public API remains pre-1.0 and unstable.
+Stages 0.0 through 0.4 are done. Stage 0.4 adds opt-in Fake IP answer
+synthesis in `Resolver` and the server transports that use it, plus
+caller-owned process-local pool snapshots. See `CONTRIBUTING.md` and
+`SUPPORT.md` for current project-status language.
 
 ## Useful commands
 

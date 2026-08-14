@@ -83,7 +83,7 @@ Status: done
 
 ## Stage 0.4 — Fake IP
 
-Status: active
+Status: completed and published in 0.4.0
 
 - Implemented: deterministic allocation of synthetic IPv4/IPv6 addresses per
   domain, reverse lookup (address -> domain), explicit not-found handling,
@@ -97,8 +97,8 @@ Status: active
 - Snapshot/restore remains caller-owned, process-local in-memory state; this
   crate supplies no serialization or durable persistence. DNS Lattice has no
   direct dependency on `tunnel-lattice`; composition belongs above this crate.
-- Remaining release work: API/documentation/package reconciliation and
-  independent review.
+- Release validation, package reconciliation, and independent review completed
+  before publication.
 
 ## Stage 0.5 — Dynamic routing hooks
 
