@@ -95,11 +95,17 @@ CREATED=0
 SKIPPED_TAGGED=0
 SKIPPED_UNPUBLISHED=0
 NOT_FOUND=0
+FACADE_CRATE="dns-lattice"
+FACADE_VERSION=""
 
 for toml in "$WS"/crates/*/Cargo.toml; do
     crate="$(grep -m1 '^name *= *"' "$toml" | sed 's/.*"\([^"]*\)".*/\1/')"
     version="$(grep -m1 '^version *= *"' "$toml" | sed 's/.*"\([^"]*\)".*/\1/')"
     [[ -n "$crate" && -n "$version" ]] || { warn "Не смог прочитать name/version из $toml"; continue; }
+
+    if [[ "$crate" == "$FACADE_CRATE" ]]; then
+        FACADE_VERSION="$version"
+    fi
 
     tag="${crate}-v${version}"
     rel_path="crates/${crate}/Cargo.toml"
@@ -137,7 +143,7 @@ crates.io: https://crates.io/crates/${crate}/${version}"
 
     if $DRY_RUN; then
         dryrun "git tag $tag ${sha:0:8} && git push origin $tag"
-        dryrun "gh release create $tag --title \"${crate} v${version}\" --notes '<changelog: $(echo "$notes" | wc -l) commit(s)>'"
+        dryrun "gh release create $tag --verify-tag --latest=false --title \"${crate} v${version}\" --notes '<changelog: $(echo "$notes" | wc -l) commit(s)>'"
         if [[ -n "$prev_tag" ]]; then
             dryrun "  changelog range: ${prev_tag}..${sha:0:8}"
         else
@@ -147,12 +153,61 @@ crates.io: https://crates.io/crates/${crate}/${version}"
         git tag "$tag" "$sha"
         git push origin "$tag"
         gh release create "$tag" \
+            --verify-tag \
+            --latest=false \
             --title "${crate} v${version}" \
             --notes "$full_notes"
         ok "Релиз создан: $tag"
     fi
     CREATED=$((CREATED + 1))
 done
+
+# GitHub otherwise chooses the most recently created release as Latest. Crate
+# manifests are visited lexically, so that would make dns-lattice-model Latest
+# rather than the application-facing facade. Explicitly repair the designation
+# on every run: this is safe when it is already correct and heals older runs.
+if [[ -z "$FACADE_VERSION" ]]; then
+    die "Не найден facade crate $FACADE_CRATE"
+fi
+
+FACADE_TAG="${FACADE_CRATE}-v${FACADE_VERSION}"
+if ! crate_is_published "$FACADE_CRATE" "$FACADE_VERSION"; then
+    warn "$FACADE_TAG: facade-версия ещё не опубликована на crates.io — Latest не меняю"
+elif ! git rev-parse -q --verify "refs/tags/$FACADE_TAG" >/dev/null; then
+    warn "$FACADE_TAG: тег facade отсутствует — Latest не меняю"
+else
+    # A past run can have pushed the tag before its GitHub release failed.
+    # Rebuild that one missing facade release from the immutable tag instead
+    # of leaving every later rerun stuck at the already-existing tag.
+    facade_sha="$(git rev-list -n 1 "$FACADE_TAG")"
+    [[ -n "$facade_sha" ]] || die "$FACADE_TAG: не удалось определить commit тега"
+    facade_prev_tag="$(git tag -l "${FACADE_CRATE}-v*" --sort=-version:refname | grep -vF "$FACADE_TAG" | head -1 || true)"
+    facade_range="$facade_sha"
+    [[ -n "$facade_prev_tag" ]] && facade_range="${facade_prev_tag}..${facade_sha}"
+    facade_notes="$(categorize_notes "$facade_range" "crates/${FACADE_CRATE}/")"
+    facade_full_notes="## ${FACADE_CRATE} v${FACADE_VERSION}
+
+${facade_notes}
+
+crates.io: https://crates.io/crates/${FACADE_CRATE}/${FACADE_VERSION}"
+
+    if $DRY_RUN; then
+        dryrun "gh release view $FACADE_TAG || gh release create $FACADE_TAG --verify-tag --latest=false --title \"${FACADE_CRATE} v${FACADE_VERSION}\" --notes '<recovered changelog: $(echo "$facade_notes" | wc -l) line(s)>'"
+        dryrun "gh release edit $FACADE_TAG --latest"
+    elif ! gh release view "$FACADE_TAG" >/dev/null 2>&1; then
+        gh release create "$FACADE_TAG" \
+            --verify-tag \
+            --latest=false \
+            --title "${FACADE_CRATE} v${FACADE_VERSION}" \
+            --notes "$facade_full_notes"
+        ok "Восстановлен GitHub release: $FACADE_TAG"
+        gh release edit "$FACADE_TAG" --latest
+        ok "GitHub Latest: $FACADE_TAG"
+    else
+        gh release edit "$FACADE_TAG" --latest
+        ok "GitHub Latest: $FACADE_TAG"
+    fi
+fi
 
 echo ""
 if $DRY_RUN; then
