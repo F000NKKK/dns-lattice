@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added `dns_lattice::hooks`: `RouteHook` receives the first DNS question and
+  the tentative static upstream group, then either selects one existing group
+  with `Use` or preserves it with `Abstain`. `ResolverBuilder::route_hook`
+  stores one optional hook. Fake IP local answers remain terminal before the
+  hook; ordinary answers are cached with the effective upstream group as part
+  of their cache identity, preventing cross-route cache reuse. Hook failures,
+  unknown/empty selected groups, and cancellation follow the resolver error
+  boundary without static fallback or cache insertion. Hooks own timeout,
+  retry, and cancellation cleanup and must not re-enter the same resolver.
+
 ## [0.4.0] - 2026-08-14
 
 - New public `dns_lattice::fakeip` module: `FakeIpPool` configures inclusive

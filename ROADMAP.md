@@ -102,12 +102,21 @@ Status: completed and published in 0.4.0
 
 ## Stage 0.5 — Dynamic routing hooks
 
-Status: planned
+Status: active
 
-- Stable hook trait(s) letting a caller (e.g. `flow-lattice`) influence
-  per-query routing without `dns-lattice` depending on it at compile time.
-- Hook composition and precedence rules against static split-DNS rules.
-- Example/integration test simulating a policy-driven hook end to end.
+- Implemented on `main`: `hooks::RouteHook` lets a caller (e.g.
+  `flow-lattice`) select one existing upstream group per ordinary query
+  without a compile-time dependency from `dns-lattice` on that caller.
+- Explicit resolver precedence: terminal Fake IP local synthesis, static
+  split-DNS candidate, optional hook `Use`/`Abstain`, selected-group
+  validation, route-scoped cache, then ordered upstream failover. Hook errors
+  and invalid selected groups do not silently fall back.
+- The hook is intentionally one-at-a-time and selection-only: no multiple
+  hook composition, response rewrite, cache-policy override, resolver
+  re-entry, or OS/network side effect is in scope. Hook implementations own
+  timeout, retry, and cancellation cleanup.
+- Remaining stage work: inbound transport integration verification, public
+  documentation/package reconciliation, and independent release review.
 
 ## Stage 0.6 — Hardening and platform validation
 

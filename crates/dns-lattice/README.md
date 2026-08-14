@@ -11,7 +11,8 @@ For new code, prefer the canonical domain modules:
   upstream failover;
 - `dns_lattice::upstream` — the outbound backend trait and transports;
 - `dns_lattice::server` — inbound listener construction and lifecycle;
-- `dns_lattice::fakeip` — synthetic-address pool, policy, and snapshots.
+- `dns_lattice::fakeip` — synthetic-address pool, policy, and snapshots;
+- `dns_lattice::hooks` — caller-supplied dynamic upstream-group selection.
 
 The existing flat root aliases remain compatible.
 
@@ -95,8 +96,16 @@ The existing flat root aliases remain compatible.
   HTTP/3 over QUIC/UDP with ALPN `h3` and TLS 1.3. Keep `doh_addr` for
   HTTP/1.1/HTTP/2 legacy TCP clients on TLS 1.2 or 1.3.
 
-Dynamic routing hooks are planned for a later stage; see `ROADMAP.md` in the
-repository root.
+For ordinary queries, `ResolverBuilder::route_hook` accepts one caller-owned
+`hooks::RouteHook`. The resolver supplies the first question and the tentative
+static group; `Use(group)` selects a registered, nonempty group, while
+`Abstain` keeps static routing. Fake IP local answers are terminal before the
+hook. The effective group scopes the answer cache, so answers cannot cross
+between different hook-selected groups. A hook error, an unknown group, or an
+empty group returns a resolver error without cache or upstream fallback.
+Hooks own timeout, retry, and cancellation cleanup, and must not re-enter the
+same resolver. They are selection-only: they receive neither resolver/backend
+handles nor client metadata or side-effect capabilities.
 
 ## Feature/platform constraints
 
@@ -199,5 +208,6 @@ opt-in `dot`/`doh`/`doq`-gated inbound DoT/DoH/DoQ listeners
 (`ServerBuilder::dot_addr`/`doh_addr`/`doq_addr`). Published Stage 0.4 adds
 the opt-in Fake IP resolver behavior above, TTL expiry, and caller-owned
 process-local snapshot/restore; it does not add durable persistence. Dynamic
-routing hooks are not implemented yet. Types may change without notice until
-the first stable release.
+routing hooks are implemented on `main` for stage 0.5 but are not part of
+published `0.4.0`. Types may change without notice until the first stable
+release.

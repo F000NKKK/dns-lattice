@@ -3,7 +3,8 @@
 Status: draft. Stages 0.1-0.3 have landed the `dns-lattice-core` and
 `dns-lattice-model` crates, resolver/cache, upstream transports, and inbound
 server listeners. Stage 0.4 is published in `0.4.0` with opt-in resolver Fake
-IP synthesis; later stages implement the remaining target shape incrementally.
+IP synthesis; development on `main` also implements the stage 0.5 route-hook
+pipeline, pending that stage's release validation.
 Update this document whenever an implementation slice changes a public
 contract.
 
@@ -39,9 +40,9 @@ sdk-lattice      Application-facing SDK composing the crates above
 `dns-lattice` therefore exposes a library API consumed directly by
 applications today, and by `flow-lattice` and `sdk-lattice` once those
 crates are ready to build on it: `sdk-lattice` composes it with the other
-Lattice crates into a full application, and `flow-lattice` is expected to
-drive it through the dynamic routing hooks below once policy compilation
-exists. Embedding the server core does not itself require OS privilege or
+Lattice crates into a full application, and `flow-lattice` may drive its
+existing dynamic route-selection hook once policy compilation exists.
+Embedding the server core does not itself require OS privilege or
 an OS-specific code path: DNS message handling, inbound query serving,
 routing decisions, caching, and Fake IP allocation are pure, portable logic
 that binds to a UDP/TCP socket like any other network server. Only a
@@ -106,7 +107,7 @@ it does not itself hold implementation modules beyond that re-export layer.
 dns-lattice-core     Error/Result shared across the workspace (implemented, stage 0.1)
 dns-lattice-model    DNS message types, zones/domain matchers, policy types (implemented, stage 0.1)
 dns-lattice-platform Cross-platform provider trait(s), once a stage needs OS-facing behavior (target, not yet implemented)
-dns-lattice          Facade crate: re-exports model/core/engine/server/upstream/fakeip (and later hooks) as the crate's stable public surface
+dns-lattice          Facade crate: re-exports model/core/engine/server/upstream/fakeip/hooks as the crate's stable public surface
 ```
 
 Within `dns-lattice` itself, the target module layout for capabilities not
@@ -145,10 +146,9 @@ flowchart LR
     FakePolicy -->|canonical in-range IN PTR| Reverse[Fake IP pool: lookup / NXDOMAIN]
     FakeIP --> Answer[Answer]
     Reverse --> Answer
-    FakePolicy -->|all other queries| Match[Zone / policy matcher]
-    Match -->|hook decision| Hook[Dynamic routing hook]
-    Match -->|static split rule| Route[Upstream group selection]
-    Hook --> Route
+    FakePolicy -->|all other queries| Match[Static split-DNS candidate]
+    Match --> Hook[Optional RouteHook]
+    Hook -->|Use or Abstain| Route[Validated effective upstream group]
     Route --> Cache{Cache hit?}
     Cache -->|yes| Answer[Answer]
     Cache -->|no| Upstream[Upstream backend: UDP/TCP/DoT/DoH/DoQ]
@@ -201,7 +201,13 @@ re-exports, at minimum:
   remaining lifetime bounds the emitted DNS TTL. The crate provides no durable
   persistence or direct dependency on any sibling Lattice crate.
 - `upstream`: the backend trait, so callers can implement custom transports.
-- `hooks`: the dynamic routing hook trait.
+- `hooks`: the dynamic route-selection trait. `RouteHook` receives only the
+  first question and tentative static group; `Use` selects an existing group
+  and `Abstain` preserves static routing. Fake IP local answers run first;
+  non-local queries invoke the hook before a cache lookup keyed by the
+  effective group. Hooks cannot resolve, mutate the cache, access backends,
+  or perform OS/network side effects through DNS Lattice. They own timeout,
+  retry, and cancellation cleanup and must not re-enter the same resolver.
 
 Concrete type and trait names are decided per implementation slice and
 recorded as ADRs before the first 0.x release stabilizes them.

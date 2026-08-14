@@ -18,8 +18,10 @@
 > upstream transports, failover, and matching inbound server listeners
 > across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
 > `dns-lattice` facade. It also adds opt-in Fake IP answer synthesis through
-> the resolver and every server transport. The API remains pre-1.0; see
-> Current Status below.
+> the resolver and every server transport. Development on `main` additionally
+> implements the stage 0.5 route-hook pipeline; it is not part of the
+> published `0.4.0` release. The API remains pre-1.0; see Current Status
+> below.
 
 ## Overview
 
@@ -30,7 +32,7 @@ DNS resolution logic in Rust applications is usually either hand-rolled ad hoc, 
 The normal inbound path is:
 
 ```text
-DNS client → Server → Resolver → SplitDnsPolicy → UpstreamBackend → UDP/TCP/DoT/DoH/DoQ
+DNS client → Server → Resolver → Fake IP (terminal when selected) → static policy → RouteHook → route-scoped cache → UpstreamBackend → UDP/TCP/DoT/DoH/DoQ
 ```
 
 When a resolver is explicitly configured with a `FakeIpPool` and
@@ -80,6 +82,17 @@ server.serve().await?;
 `Resolver` orchestrates decoded queries, static routing, caching, and
 upstream failover. `Server` owns inbound listening and framing;
 `UpstreamBackend` implementations own outbound transport execution.
+
+For an ordinary (non-Fake-IP) query, an optional `RouteHook` receives the
+first question and the tentative `SplitDnsPolicy` group. `Use(group)`
+authoritatively selects a registered, nonempty group; `Abstain` retains the
+static candidate. The effective group is part of the cache identity, so
+answers from differently selected groups are never shared. A hook failure,
+unknown selected group, or empty selected group returns a resolver error
+without cache or upstream fallback. Hooks are selection-only: they do not
+receive a resolver, backend, client metadata, or OS-side-effect capability.
+They own timeout/retry/cancellation cleanup and must not re-enter the same
+resolver.
 
 To opt into Fake IP synthesis, configure the same resolver that is passed to
 the server. A pool is shared explicitly, so the host can also inspect,
@@ -149,7 +162,8 @@ has no compile-time dependency on any sibling crate.
 
 ## Capabilities
 
-Implemented (published through `0.4.0`):
+Implemented (published through `0.4.0`, plus the in-development 0.5 hook
+pipeline on `main`):
 
 - Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
 - Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
@@ -175,10 +189,15 @@ Implemented (published through `0.4.0`):
   the ordinary resolver cache and upstreams; their DNS TTL is the mapping's
   remaining lifetime, so it never extends the mapping. Snapshot data is not
   serialized or durably persisted by this crate.
+- `hooks::RouteHook`: an optional, one-hook dynamic upstream-group selection
+  point configured with `ResolverBuilder::route_hook`. Local Fake IP answers
+  are terminal before hooks; ordinary queries select static candidate then
+  hook decision, validate the effective group, and cache only in that group's
+  scope. Hooks cannot resolve, rewrite answers, alter cache policy, or perform
+  networking side effects through DNS Lattice.
 
 Planned (see [ROADMAP.md](ROADMAP.md)):
 
-- Dynamic routing hooks for caller-driven policy (stage 0.5)
 - Cross-platform CI matrix, fuzz/property tests, observability sink (stage 0.6)
 
 ## Transport features
@@ -221,7 +240,10 @@ upstream transport and failover across a group's backends, and an
 embeddable inbound UDP/TCP/DoT/DoH/DoQ DNS server listener, all usable
 standalone today. The current development state additionally supports opt-in
 Fake IP synthesis in the resolver query path, which every `Server` transport
-uses through its shared resolver.
+uses through its shared resolver, and the stage 0.5 optional route-selection
+hook pipeline for ordinary queries. The hook runs after static candidate
+selection and before route-scoped caching; it cannot alter terminal Fake IP
+handling or gain OS/network side-effect authority.
 
 | Capability | Status |
 |---|:---:|
@@ -239,7 +261,7 @@ uses through its shared resolver.
 | Inbound DoQ server listener (`doq` Cargo feature) | ✅ |
 | Inbound DoH server listener (`doh` Cargo feature) | ✅ |
 | Fake IP pool and opt-in resolver/server synthesis | ✅ (0.4.0) |
-| Dynamic routing hooks | planned (0.5) |
+| Dynamic routing hooks | active on `main` (0.5) |
 
 ## Examples
 
@@ -265,7 +287,10 @@ Run an example with `cargo run -p dns-lattice --example <name>`.
    allocation, reverse lookup, LRU eviction, expiry, and caller-owned
    process-local snapshot/restore; opt-in resolver/server synthesis for
    matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
-6. **Stage 0.5: Dynamic routing hooks** — stable hook trait(s) for caller-driven routing, composition/precedence against static rules.
+6. **Stage 0.5: Dynamic routing hooks** *(active on `main`)* — one optional
+   `RouteHook` selects an existing upstream group after static routing and
+   before the route-scoped cache; no hook composition, response rewriting, or
+   OS/network side effects belong to DNS Lattice.
 7. **Stage 0.6: Hardening and platform validation** — cross-platform CI matrix, fuzz/property tests, observability sink, full documentation sync.
 8. **Stage 1.0: Stable public API and first stable release** — public API frozen, `cargo package`/docs.rs verified, first stable crates.io release.
 

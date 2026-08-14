@@ -10,8 +10,9 @@ scaffolding are in place, ported from
 message/matcher/policy model, resolver/cache, upstream transports, failover,
 and inbound server listeners (stages 0.1-0.3) have landed in published
 releases. Published `0.4.0` adds opt-in resolver/server Fake IP synthesis and
-caller-owned process-local mapping snapshots. No public API is stable yet. The
-most valuable contributions right now are:
+caller-owned process-local mapping snapshots. Development on `main` adds the
+stage 0.5 route-selection hook pipeline before release validation. No public
+API is stable yet. The most valuable contributions right now are:
 
 - Feedback on the project's vision, scope, and roadmap (see [README.md](README.md))
 - Discussion of API design and architecture for planned stages

@@ -51,5 +51,9 @@ request handling, and listener failures are in scope. Reports of incorrect
 allocation, reverse lookup, or unbounded resource consumption in the
 development-state Fake IP pool, policy matching, local IN A/AAAA and
 canonical in-range IN PTR synthesis, or their TTL/expiry handling are also in
-scope. Dynamic routing hooks are not implemented yet and remain out of scope
-until their corresponding stage ships.
+scope. Development on `main` additionally implements dynamic route-selection
+hooks before their first release: reports of a hook leaking a query through an
+unintended static fallback, sharing cache entries across effective upstream
+groups, bypassing terminal Fake IP handling, or failing to cancel cleanly are
+in scope for that development state. The published `0.4.0` release does not
+yet contain hooks.

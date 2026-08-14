@@ -6,10 +6,12 @@
 //! values in registration order with retryable-error failover.
 //!
 //! It does **not** own inbound server lifecycle, socket binding, wire
-//! framing, TLS/HTTP/QUIC protocol handling, dynamic hooks, operating-system
-//! DNS configuration, or packet forwarding. Those responsibilities belong
-//! respectively to [`crate::server`], [`crate::upstream`], future hook APIs,
-//! and composing applications. When explicitly configured with a
+//! framing, TLS/HTTP/QUIC protocol handling, operating-system DNS
+//! configuration, or packet forwarding. Those responsibilities belong
+//! respectively to [`crate::server`], [`crate::upstream`], and composing
+//! applications. An optional [`crate::hooks::RouteHook`] selects an existing
+//! upstream group; it does not own resolution or side effects. When
+//! explicitly configured with a
 //! [`crate::fakeip::FakeIpPool`] and [`crate::fakeip::FakeIpPolicy`], it does
 //! orchestrate their local DNS answer synthesis; allocation and mapping
 //! storage remain owned by the pool.
@@ -25,6 +27,7 @@ use dns_lattice_model::{
 };
 
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
+use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::upstream::UpstreamBackend;
 
 /// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
@@ -91,6 +94,7 @@ struct CacheKey {
     name: Name,
     rtype: RecordType,
     class: Class,
+    group: UpstreamGroupId,
 }
 
 /// A cached answer plus its absolute expiry instant, computed at insert
@@ -123,6 +127,7 @@ pub struct Resolver {
     clock: Box<dyn Clock + Send + Sync>,
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
     fake_ip: Option<FakeIpResolverConfig>,
+    route_hook: Option<Box<dyn RouteHook>>,
 }
 
 /// Explicit Fake IP answer synthesis owned by a [`Resolver`].
@@ -143,15 +148,19 @@ impl Resolver {
             backends: HashMap::new(),
             clock: Box::new(SystemClock),
             fake_ip: None,
+            route_hook: None,
         }
     }
 
     /// Resolves one query.
     ///
-    /// Extracts the queried name from `query`'s first question, checks the
-    /// in-memory answer cache, and on a miss routes the query through the
-    /// configured [`SplitDnsPolicy`] to select an upstream group, then tries
-    /// that group's registered backends in registration order: the first
+    /// Extracts the queried name from `query`'s first question. Locally
+    /// handled Fake IP questions return before the hook, cache, and upstream
+    /// stages. For every other question, static [`SplitDnsPolicy`] routing
+    /// supplies a tentative group and an optional [`crate::hooks::RouteHook`]
+    /// can authoritatively replace it. The selected registered group scopes
+    /// the in-memory answer cache; on a miss its backends are tried in
+    /// registration order: the first
     /// backend to return `Ok` wins and its answer is
     /// cached (per the existing TTL rules) and returned immediately. A
     /// backend failing with [`Error::Timeout`], [`Error::Transport`], or
@@ -164,10 +173,12 @@ impl Resolver {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NoRoute`] when no split-DNS rule matches the
-    /// queried name and no default upstream group is configured, when no
-    /// question is present in `query`, or when the matched group has no
-    /// backend registered. Returns the last attempted backend's error,
+    /// Returns [`Error::NoRoute`] when no split-DNS rule matches the queried
+    /// name and no default upstream group is configured, when no question is
+    /// present in `query`, or when the selected group has no backend
+    /// registered. A hook-selected unknown or empty group never falls back to
+    /// static policy. A hook failure returns [`Error::Hook`] and is neither
+    /// retried nor cached. Returns the last attempted backend's error,
     /// propagated as-is (not cached), once every backend in the matched
     /// group has failed.
     ///
@@ -186,10 +197,12 @@ impl Resolver {
             return Ok(answer);
         }
 
+        let (group, backends) = self.select_backends(question).await?;
         let key = CacheKey {
             name: question.name.clone(),
             rtype: question.qtype,
             class: question.qclass,
+            group,
         };
 
         let now = self.clock.now();
@@ -200,15 +213,6 @@ impl Resolver {
             {
                 return Ok(entry.answer.clone());
             }
-        }
-
-        let group = self
-            .policy
-            .resolve_group(&question.name)
-            .ok_or(Error::NoRoute)?;
-        let backends = self.backends.get(group).ok_or(Error::NoRoute)?;
-        if backends.is_empty() {
-            return Err(Error::NoRoute);
         }
 
         let mut last_err = None;
@@ -235,6 +239,39 @@ impl Resolver {
         }
 
         Err(last_err.expect("at least one backend was tried since backends is non-empty"))
+    }
+
+    /// Selects and validates the effective upstream group for one ordinary
+    /// query. This deliberately happens before the cache lookup because a
+    /// hook may choose different groups for equal DNS questions.
+    ///
+    /// No resolver mutex is held while invoking the hook. Dropping the
+    /// enclosing [`Resolver::resolve`] future drops this in-flight hook call;
+    /// hook implementations own cancellation cleanup and must not re-enter
+    /// this resolver.
+    async fn select_backends(
+        &self,
+        question: &dns_lattice_model::Question,
+    ) -> Result<(UpstreamGroupId, &Vec<Box<dyn UpstreamBackend>>)> {
+        let static_group = self.policy.resolve_group(&question.name);
+        let group = match &self.route_hook {
+            Some(hook) => match hook
+                .select(RouteRequest::new(question, static_group))
+                .await
+                .map_err(|error| Error::Hook(error.to_string()))?
+            {
+                RouteDecision::Use(group) => Some(group),
+                RouteDecision::Abstain => static_group.cloned(),
+            },
+            None => static_group.cloned(),
+        }
+        .ok_or(Error::NoRoute)?;
+
+        let backends = self.backends.get(&group).ok_or(Error::NoRoute)?;
+        if backends.is_empty() {
+            return Err(Error::NoRoute);
+        }
+        Ok((group, backends))
     }
 }
 
@@ -453,6 +490,7 @@ pub struct ResolverBuilder {
     backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     clock: Box<dyn Clock + Send + Sync>,
     fake_ip: Option<FakeIpResolverConfig>,
+    route_hook: Option<Box<dyn RouteHook>>,
 }
 
 impl ResolverBuilder {
@@ -493,6 +531,24 @@ impl ResolverBuilder {
         self
     }
 
+    /// Configures one optional dynamic upstream-group selection hook.
+    ///
+    /// For each non-local query, the hook receives the first question and
+    /// the static split-DNS candidate. [`crate::hooks::RouteDecision::Use`]
+    /// replaces that candidate, while `Abstain` retains it. The resulting
+    /// group must be registered and nonempty; otherwise resolution returns
+    /// [`Error::NoRoute`] without static fallback, cache access, or an
+    /// upstream call. Fake IP local answers remain terminal and never invoke
+    /// the hook.
+    ///
+    /// The hook owns timeout, retry, and cancellation cleanup. A dropped
+    /// [`Resolver::resolve`] call drops the in-flight hook future. Hooks must
+    /// not call `resolve` on this same resolver directly or indirectly.
+    pub fn route_hook(mut self, hook: impl RouteHook + 'static) -> Self {
+        self.route_hook = Some(Box::new(hook));
+        self
+    }
+
     /// Substitutes the clock used to compute and check cache expiry.
     /// Crate-private: no public API for clock injection.
     #[cfg(test)]
@@ -509,6 +565,7 @@ impl ResolverBuilder {
             clock: self.clock,
             cache: Mutex::new(HashMap::new()),
             fake_ip: self.fake_ip,
+            route_hook: self.route_hook,
         }
     }
 }
@@ -835,9 +892,12 @@ mod tests {
 
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use dns_lattice_model::{RData, ResourceRecord};
+    use tokio::sync::Notify;
+
+    use crate::hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest};
 
     #[derive(Clone)]
     struct PoolClock(Arc<Mutex<Instant>>);
@@ -871,6 +931,84 @@ mod tests {
         async fn resolve(&self, _query: &Message) -> Result<Message> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.answer.clone())
+        }
+    }
+
+    struct FixedHook {
+        decision: std::result::Result<RouteDecision, RouteHookError>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RouteHook for FixedHook {
+        async fn select(
+            &self,
+            _request: RouteRequest<'_>,
+        ) -> std::result::Result<RouteDecision, RouteHookError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision.clone()
+        }
+    }
+
+    struct SequencedHook {
+        decisions: Mutex<Vec<RouteDecision>>,
+    }
+
+    #[async_trait]
+    impl RouteHook for SequencedHook {
+        async fn select(
+            &self,
+            _request: RouteRequest<'_>,
+        ) -> std::result::Result<RouteDecision, RouteHookError> {
+            Ok(self
+                .decisions
+                .lock()
+                .expect("hook decisions mutex poisoned")
+                .remove(0))
+        }
+    }
+
+    struct RecordingHook {
+        decision: RouteDecision,
+        static_groups: Arc<Mutex<Vec<Option<UpstreamGroupId>>>>,
+    }
+
+    #[async_trait]
+    impl RouteHook for RecordingHook {
+        async fn select(
+            &self,
+            request: RouteRequest<'_>,
+        ) -> std::result::Result<RouteDecision, RouteHookError> {
+            self.static_groups
+                .lock()
+                .expect("recorded static groups mutex poisoned")
+                .push(request.static_group().cloned());
+            Ok(self.decision.clone())
+        }
+    }
+
+    struct PendingHook {
+        entered: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RouteHook for PendingHook {
+        async fn select(
+            &self,
+            _request: RouteRequest<'_>,
+        ) -> std::result::Result<RouteDecision, RouteHookError> {
+            let _drop_signal = DropSignal(self.dropped.clone());
+            self.entered.notify_waiters();
+            std::future::pending().await
         }
     }
 
@@ -1095,6 +1233,297 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hook_use_overrides_the_static_group() {
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let static_calls = Arc::new(AtomicUsize::new(0));
+        let selected_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("static"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("static"),
+            CountingBackend {
+                answer: answer_tagged(1),
+                calls: static_calls.clone(),
+            },
+        )
+        .backend(
+            UpstreamGroupId::new("selected"),
+            CountingBackend {
+                answer: answer_tagged(2),
+                calls: selected_calls.clone(),
+            },
+        )
+        .route_hook(FixedHook {
+            decision: Ok(RouteDecision::Use(UpstreamGroupId::new("selected"))),
+            calls: hook_calls.clone(),
+        })
+        .build();
+
+        let answer = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(answer.header.id, 2);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(static_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(selected_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hook_abstain_uses_the_static_group() {
+        let backend_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("static"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("static"),
+            CountingBackend {
+                answer: answer_tagged(3),
+                calls: backend_calls.clone(),
+            },
+        )
+        .route_hook(FixedHook {
+            decision: Ok(RouteDecision::Abstain),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .build();
+
+        assert_eq!(
+            resolver
+                .resolve(&query_for("example.com"))
+                .await
+                .unwrap()
+                .header
+                .id,
+            3
+        );
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hook_observes_static_candidate_and_can_supply_a_route_without_one() {
+        let static_groups = Arc::new(Mutex::new(Vec::new()));
+        let static_resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("static"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("static"),
+            fixed_backend(answer_tagged(30)),
+        )
+        .route_hook(RecordingHook {
+            decision: RouteDecision::Abstain,
+            static_groups: static_groups.clone(),
+        })
+        .build();
+        assert_eq!(
+            static_resolver
+                .resolve(&query_for("static.example"))
+                .await
+                .unwrap()
+                .header
+                .id,
+            30
+        );
+
+        let dynamic_resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .backend(
+                UpstreamGroupId::new("dynamic"),
+                fixed_backend(answer_tagged(31)),
+            )
+            .route_hook(RecordingHook {
+                decision: RouteDecision::Use(UpstreamGroupId::new("dynamic")),
+                static_groups: static_groups.clone(),
+            })
+            .build();
+        assert_eq!(
+            dynamic_resolver
+                .resolve(&query_for("dynamic.example"))
+                .await
+                .unwrap()
+                .header
+                .id,
+            31
+        );
+        assert_eq!(
+            *static_groups.lock().unwrap(),
+            vec![Some(UpstreamGroupId::new("static")), None]
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_abstain_without_static_route_returns_no_route() {
+        let backend_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .backend(
+                UpstreamGroupId::new("unused"),
+                CountingBackend {
+                    answer: answer_tagged(4),
+                    calls: backend_calls.clone(),
+                },
+            )
+            .route_hook(FixedHook {
+                decision: Ok(RouteDecision::Abstain),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .build();
+
+        assert_eq!(
+            resolver.resolve(&query_for("example.com")).await,
+            Err(Error::NoRoute)
+        );
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn hook_selected_unknown_or_empty_group_returns_no_route_without_fallback() {
+        for group in ["unknown", "empty"] {
+            let static_calls = Arc::new(AtomicUsize::new(0));
+            let builder = Resolver::builder(
+                SplitDnsPolicy::builder()
+                    .default_group(UpstreamGroupId::new("static"))
+                    .build(),
+            )
+            .backend(
+                UpstreamGroupId::new("static"),
+                CountingBackend {
+                    answer: answer_tagged(5),
+                    calls: static_calls.clone(),
+                },
+            );
+            let mut resolver = builder
+                .route_hook(FixedHook {
+                    decision: Ok(RouteDecision::Use(UpstreamGroupId::new(group))),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                })
+                .build();
+            if group == "empty" {
+                resolver
+                    .backends
+                    .insert(UpstreamGroupId::new("empty"), Vec::new());
+            }
+
+            assert_eq!(
+                resolver.resolve(&query_for("example.com")).await,
+                Err(Error::NoRoute)
+            );
+            assert_eq!(
+                static_calls.load(Ordering::SeqCst),
+                0,
+                "static backend must not receive a hook-selected {group} route"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_error_is_not_cached_retried_or_fallen_back() {
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("static"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("static"),
+            CountingBackend {
+                answer: answer_tagged(6),
+                calls: backend_calls.clone(),
+            },
+        )
+        .route_hook(FixedHook {
+            decision: Err(RouteHookError::new("policy unavailable")),
+            calls: hook_calls.clone(),
+        })
+        .build();
+
+        for _ in 0..2 {
+            assert_eq!(
+                resolver.resolve(&query_for("example.com")).await,
+                Err(Error::Hook("policy unavailable".to_string()))
+            );
+        }
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 0);
+        assert!(resolver.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_is_scoped_to_the_effective_hook_selected_group() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .backend(
+                UpstreamGroupId::new("first"),
+                CountingBackend {
+                    answer: a_answer("example.com", 300),
+                    calls: first_calls.clone(),
+                },
+            )
+            .backend(
+                UpstreamGroupId::new("second"),
+                CountingBackend {
+                    answer: answer_tagged(8),
+                    calls: second_calls.clone(),
+                },
+            )
+            .route_hook(SequencedHook {
+                decisions: Mutex::new(vec![
+                    RouteDecision::Use(UpstreamGroupId::new("first")),
+                    RouteDecision::Use(UpstreamGroupId::new("second")),
+                    RouteDecision::Use(UpstreamGroupId::new("first")),
+                ]),
+            })
+            .build();
+
+        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        let second = resolver.resolve(&query_for("example.com")).await.unwrap();
+        let cached_first = resolver.resolve(&query_for("example.com")).await.unwrap();
+
+        assert_eq!(first.answers[0].ttl, 300);
+        assert_eq!(
+            second.header.id, 8,
+            "second route cannot reuse first route cache"
+        );
+        assert_eq!(cached_first, first, "first route has its own cache hit");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_resolve_drops_the_hook_future_without_holding_cache_lock() {
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let resolver = Arc::new(
+            Resolver::builder(SplitDnsPolicy::builder().build())
+                .route_hook(PendingHook {
+                    entered: entered.clone(),
+                    dropped: dropped.clone(),
+                })
+                .build(),
+        );
+        let entered_wait = entered.notified();
+        let task_resolver = resolver.clone();
+        let task =
+            tokio::spawn(async move { task_resolver.resolve(&query_for("example.com")).await });
+
+        entered_wait.await;
+        assert!(
+            resolver.cache.try_lock().is_ok(),
+            "the resolver cache mutex is not held across hook await"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "hook future was dropped on cancellation"
+        );
+    }
+
     fn query_for_type(name: &str, qtype: RecordType, qclass: Class, id: u16) -> Message {
         let mut query = query_for(name);
         query.header.id = id;
@@ -1137,6 +1566,7 @@ mod tests {
     #[tokio::test]
     async fn fake_ip_a_answer_is_local_and_bypasses_upstream_and_cache() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::new(AtomicUsize::new(0));
         let backend = CountingBackend {
             answer: a_answer("example.test", 300),
             calls: calls.clone(),
@@ -1149,6 +1579,10 @@ mod tests {
         )
         .backend(UpstreamGroupId::new("g"), backend)
         .fake_ip(pool, fake_ip_policy("example.test"))
+        .route_hook(FixedHook {
+            decision: Ok(RouteDecision::Use(UpstreamGroupId::new("g"))),
+            calls: hook_calls.clone(),
+        })
         .build();
 
         let first = resolver
@@ -1171,6 +1605,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            0,
+            "Fake IP is terminal before hooks"
+        );
         assert_eq!(first.header.id, 41);
         assert_eq!(second.header.id, 42, "synthetic answers are not cached");
         assert!(first.header.qr);
