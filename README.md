@@ -11,38 +11,89 @@
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
 
-**DNS Lattice** is a programmable Rust DNS control plane for the Lattice networking stack — the DNS equivalent of what Kestrel is for HTTP in ASP.NET Core: a full, embeddable DNS server engine that any application hosts to gain split DNS, Fake IP, caching, encrypted upstream transport, and programmable routing, without building a resolver from scratch.
+**DNS Lattice** is a programmable, embeddable DNS resolver/server engine for
+Rust. It provides split DNS, caching, Fake IP, dynamic route selection,
+structured observability, and UDP/TCP/DoT/DoH/DoQ transports behind one typed
+library API.
 
-> **Status:** `0.5.0` is published. It delivers the DNS message model, zone/domain
-> matcher, split-DNS policy types, resolver/cache, UDP/TCP/DoT/DoH/DoQ
-> upstream transports, failover, and matching inbound server listeners
-> across three crates — `dns-lattice-core`, `dns-lattice-model`, and the
-> `dns-lattice` facade. It also adds opt-in Fake IP answer synthesis through
-> the resolver and every server transport, plus the stage 0.5 route-hook
-> pipeline. Development has moved to stage 0.6 hardening and platform
-> validation. The API remains pre-1.0; see Current Status below.
+Think of it as the DNS equivalent of an embeddable HTTP server core: the host
+application owns the process and configuration, while DNS Lattice owns DNS
+protocol handling, resolution, serving, routing, cache behavior, and transport
+execution.
 
-## Overview
+> **Status:** stages **0.0 through 0.6 are complete**. Stage 0.6 defines the
+> `0.6.x` hardening release line and has no remaining implementation work. The
+> repository release script owns the mechanical `0.6.0` Cargo version bump and
+> publication. The next development milestone is **1.0**, which freezes and
+> audits the public API before the first stable release. Until `1.0.0`, the API
+> remains pre-1.0 and may change.
 
-DNS resolution logic in Rust applications is usually either hand-rolled ad hoc, or pulled in as a heavyweight, fully async, transport-coupled resolver library. DNS Lattice aims to separate the protocol/policy plane (message parsing, zone matching, split-DNS routing, Fake IP) from transport concerns, so applications can embed exactly the DNS server or resolver behavior they need behind one strongly typed API.
+## Why DNS Lattice
 
-## Quick start
+Applications that need custom DNS behavior often end up combining several
+concerns manually: DNS wire parsing, split-DNS policy, cache semantics,
+transport fallback, encrypted DNS, Fake IP state, server listeners, and
+application-specific routing. DNS Lattice keeps those concerns separate but
+composable.
 
-The normal inbound path is:
+The resolver pipeline is explicit:
 
 ```text
-DNS client → Server → Resolver → Fake IP (terminal when selected) → static policy → RouteHook → route-scoped cache → UpstreamBackend → UDP/TCP/DoT/DoH/DoQ
+DNS query
+  → terminal Fake IP handling when selected
+  → static split-DNS candidate
+  → optional RouteHook
+  → validate effective upstream group
+  → route-scoped cache
+  → ordered upstream failover
+  → answer
 ```
 
-When a resolver is explicitly configured with a `FakeIpPool` and
-`FakeIpPolicy`, a matching IN A or AAAA question is answered locally before
-the cache and upstream path. If that selected address family is disabled, the
-resolver returns local NODATA (NOERROR with no records), still without an
-upstream lookup. Canonical IN reverse PTR questions inside a pool range are
-also local: a live mapping yields PTR and an unmapped address yields NXDOMAIN.
-Every other question follows the path above.
+Inbound listeners reuse the same resolver pipeline:
 
-Use domain-scoped imports. The facade deliberately has no flat root aliases.
+```text
+Client → Server → Resolver → Cache/Policy/Hook/Fake IP → UpstreamBackend → Resolver → Server → Client
+```
+
+## Workspace
+
+DNS Lattice is published as three crates:
+
+| Crate | Responsibility |
+|---|---|
+| `dns-lattice` | Public facade plus resolver/server runtime implementation |
+| `dns-lattice-model` | DNS message model, names, matcher, split-DNS policy |
+| `dns-lattice-core` | Shared typed `Error` / `Result` boundary |
+
+Most applications should depend only on `dns-lattice`.
+
+## Installation
+
+Baseline UDP/TCP support has no TLS/HTTP/QUIC feature requirement:
+
+```toml
+[dependencies]
+dns-lattice = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+Enable encrypted transports only when needed:
+
+```toml
+[dependencies]
+dns-lattice = { version = "0.6", features = ["dot", "doh", "doq"] }
+```
+
+Cargo features are independent and default-off:
+
+- `dot` — DNS-over-TLS;
+- `doh` — DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3;
+- `doq` — DNS-over-QUIC.
+
+## Quick start: UDP resolver + server
+
+Use canonical domain modules; the facade intentionally exposes no flat root
+aliases.
 
 ```rust,no_run
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -57,7 +108,10 @@ use dns_lattice::{
 
 # async fn run() -> Result<()> {
 let group = UpstreamGroupId::new("default");
-let policy = SplitDnsPolicy::builder().default_group(group.clone()).build();
+let policy = SplitDnsPolicy::builder()
+    .default_group(group.clone())
+    .build();
+
 let resolver = Arc::new(
     Resolver::builder(policy)
         .backend(
@@ -70,47 +124,79 @@ let resolver = Arc::new(
         )
         .build(),
 );
+
 let server = ServerBuilder::new(resolver)
     .udp_addr("127.0.0.1:5353".parse().unwrap())
     .bind()
     .await?;
+
 server.serve().await?;
 # Ok(())
 # }
 ```
 
-`Resolver` orchestrates decoded queries, static routing, caching, and
-upstream failover. `Server` owns inbound listening and framing;
-`UpstreamBackend` implementations own outbound transport execution.
+`Resolver` owns routing/cache/failover. `Server` owns inbound listening and
+framing. `UpstreamBackend` implementations own outbound transport execution.
 
-For an ordinary (non-Fake-IP) query, an optional `RouteHook` receives the
-first question and the tentative `SplitDnsPolicy` group. `Use(group)`
-authoritatively selects a registered, nonempty group; `Abstain` retains the
-static candidate. The effective group is part of the cache identity, so
-answers from differently selected groups are never shared. A hook failure,
-unknown selected group, or empty selected group returns a resolver error
-without cache or upstream fallback. Hooks are selection-only: they do not
-receive a resolver, backend, client metadata, or OS-side-effect capability.
-They own timeout/retry/cancellation cleanup and must not re-enter the same
-resolver.
+## Public modules
 
-### Dynamic route hook
+Canonical public paths are:
 
-The hook path is fully in-process and does not require a network transport.
-For every ordinary query, `Resolver` obtains the static candidate, invokes at
-most one hook, validates the effective group, checks that group's cache scope,
-then runs its registered upstream failover. A Fake IP local answer is terminal
-before all of those steps. Add `async-trait` to an application's dependencies
-when implementing `RouteHook`.
+| Module | Purpose |
+|---|---|
+| `dns_lattice::core` | Shared typed errors/results |
+| `dns_lattice::model` | DNS messages, records, names, matchers, policies |
+| `dns_lattice::engine` | `Resolver` / `ResolverBuilder` |
+| `dns_lattice::upstream` | Outbound backend trait and transports |
+| `dns_lattice::server` | Inbound listener configuration/lifecycle |
+| `dns_lattice::fakeip` | Fake IP pool, policy, TTL, snapshots |
+| `dns_lattice::hooks` | Dynamic route-selection hook |
+| `dns_lattice::observability` | Structured resolver events/sink |
+
+## Split DNS and matching
+
+`dns-lattice-model` provides deterministic exact/suffix/wildcard matching and
+`SplitDnsPolicy`. The resolver first obtains a static upstream-group candidate
+from that policy.
+
+The matching/model layer performs no network I/O and has no OS dependency.
+Stage-0.6 hardening adds deterministic property-style coverage for matcher
+precedence, message parsing, and DNS name compression bounds.
+
+## Cache semantics
+
+The resolver has an in-memory TTL-respecting answer cache, including negative
+caching. Ordinary cache identity includes the **effective upstream group**.
+That matters when a route hook sends equal DNS questions to different routes:
+an answer obtained from one group cannot be reused for another group.
+
+Fake IP terminal answers bypass the ordinary answer cache; their lifetime is
+owned by the Fake IP mapping.
+
+## Dynamic route hooks
+
+`ResolverBuilder::route_hook` installs one caller-owned `RouteHook` for
+ordinary queries. The hook receives the first DNS question and tentative
+static group:
+
+- `Use(group)` selects an existing, nonempty upstream group;
+- `Abstain` keeps the static candidate.
+
+A hook error, unknown group, or empty group fails resolution without silently
+falling back to another static route. Hooks are selection-only: DNS Lattice
+does not give them resolver/backend handles, cache authority, client transport
+metadata, or OS/network side-effect capabilities.
+
+Hook implementations own timeout, retry, cancellation cleanup, and any
+external calls. Re-entering the same resolver from its hook is prohibited.
+
+### Hook example
 
 ```rust,no_run
 use async_trait::async_trait;
 use dns_lattice::{
-    core::Result,
-    engine::Resolver,
     hooks::{RouteDecision, RouteHook, RouteHookError, RouteRequest},
-    model::{Message, SplitDnsPolicy, UpstreamGroupId},
-    upstream::UpstreamBackend,
+    model::UpstreamGroupId,
 };
 
 struct PreferFiltered;
@@ -126,251 +212,193 @@ impl RouteHook for PreferFiltered {
         Ok(RouteDecision::Use(UpstreamGroupId::new("filtered")))
     }
 }
-
-struct InProcessBackend;
-
-#[async_trait]
-impl UpstreamBackend for InProcessBackend {
-    async fn resolve(&self, query: &Message) -> Result<Message> {
-        Ok(query.clone())
-    }
-}
-
-let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
-    .backend(UpstreamGroupId::new("filtered"), InProcessBackend)
-    .route_hook(PreferFiltered)
-    .build();
-# let _ = resolver;
 ```
 
-`Use` must name a registered nonempty group; `Abstain` keeps the static
-candidate. A hook error, an unknown group, or an empty group returns a resolver
-error without static fallback, cache access, or upstream execution. The cache
-key includes the validated effective group, preventing answers selected to
-different groups from being shared. A dropped `Resolver::resolve` future drops
-the in-flight hook call; implementations own cancellation cleanup, timeout,
-and retry. They must not call the same resolver directly or indirectly, and
-they cannot use DNS Lattice to perform OS/network side effects—compose those
-actions in the host application or an external layer.
+## Fake IP
 
-To opt into Fake IP synthesis, configure the same resolver that is passed to
-the server. A pool is shared explicitly, so the host can also inspect,
-snapshot, or restore its mappings:
+`fakeip::FakeIpPool` provides deterministic, concurrent synthetic IPv4/IPv6
+state:
 
-```rust
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+- inclusive IPv4 and/or IPv6 ranges;
+- deterministic domain → address allocation/reuse;
+- address → active-domain reverse lookup;
+- per-family LRU eviction on exhaustion;
+- required whole-second TTL and expiry;
+- caller-owned process-local in-memory snapshot/restore.
 
-use dns_lattice::{
-    engine::Resolver,
-    fakeip::{FakeIpPolicy, FakeIpPool},
-    model::{DomainPattern, Name, SplitDnsPolicy},
-};
+`ResolverBuilder::fake_ip` explicitly enables local synthesis through a
+`FakeIpPolicy`:
 
-let pool = Arc::new(
-    FakeIpPool::builder()
-        .ipv4_range(Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 254))
-        .ttl(Duration::from_secs(60))
-        .build()?,
-);
-let policy = FakeIpPolicy::builder()
-    .rule(DomainPattern::suffix(Name::from_ascii("internal")?))
-    .build();
-let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
-    .fake_ip(pool, policy)
-    .build();
-# let _ = resolver;
-# Ok::<(), dns_lattice::core::Error>(())
+- matching IN A/AAAA → local synthetic answer;
+- selected but disabled address family → local NODATA;
+- canonical in-range IN PTR → active name or NXDOMAIN.
+
+Fake IP answers are terminal before static routing, hooks, ordinary cache, and
+upstream calls. Their DNS TTL never exceeds the mapping's remaining lifetime.
+
+DNS Lattice intentionally does **not** define durable Fake IP persistence or a
+snapshot serialization format.
+
+## Observability
+
+`ResolverBuilder::observability_sink` accepts an optional
+`observability::ObservabilitySink`. The resolver emits immutable, bounded
+events for the important state transitions in the pipeline, including:
+
+- query receipt;
+- Fake IP terminal handling;
+- static/effective route and hook outcomes;
+- cache hit/miss;
+- upstream attempts/outcomes;
+- timeout and terminal error paths.
+
+The sink is non-authoritative. It cannot alter routing, answers, cache state,
+or retries; it receives no resolver/backend handles; resolver locks are
+released before callbacks run; callback panics are isolated from resolver
+correctness. DNS Lattice does not require a logging/tracing framework or own a
+background telemetry queue.
+
+## Upstream transports
+
+The resolver tries backends registered in an upstream group in registration
+order. Timeout/transport/TLS failures can fail over to the next backend. If
+all backends fail, the last error is returned and no successful answer is
+cached.
+
+| Transport | Feature | Implementation notes |
+|---|---|---|
+| UDP | default | Falls back to TCP on `TC=1` |
+| TCP | default | RFC 1035 length-prefixed framing |
+| DoT | `dot` | `rustls` / `tokio-rustls` |
+| DoH HTTP/1.1 + HTTP/2 | `doh` | `hyper` / `hyper-rustls` |
+| DoH HTTP/3 | `doh` | `h3` / `quinn`, ALPN `h3` |
+| DoQ | `doq` | `quinn`, ALPN `doq` |
+
+DoQ and HTTP/3 use QUIC/TLS 1.3. TCP DoH supports HTTP/1.1 and HTTP/2 over
+TLS 1.2/1.3 according to the supplied configuration.
+
+## Inbound server
+
+`Server` / `ServerBuilder` provide an embeddable inbound DNS server over a
+shared `Arc<Resolver>`:
+
+- UDP/TCP in the default build;
+- DoT through `ServerBuilder::dot_addr` with `dot`;
+- DoH HTTP/1.1/HTTP/2 through `ServerBuilder::doh_addr` with `doh`;
+- DoH HTTP/3 through `ServerBuilder::doh3_addr` with `doh`;
+- DoQ through `ServerBuilder::doq_addr` with `doq`.
+
+The host application supplies TLS/QUIC server configuration and certificate
+material. DNS Lattice does not provision certificates and does not own
+privileged-port setup.
+
+## Feature and platform constraints
+
+MSRV: **Rust 1.93**.
+
+Stage 0.6 validates the supported facade surface on:
+
+- Linux;
+- Windows;
+- macOS.
+
+CI runs workspace formatting, linting, checking, tests, and docs, plus strict
+per-feature `check`/`test`/rustdoc coverage for:
+
+```text
+--no-default-features
+dot
+doh
+doq
+--all-features
 ```
 
-## Workspace crates
+CI also verifies workspace package contents and runs a hermetic regression of
+the release automation. Those checks do not publish crates.
 
-The workspace is split into focused crates, mirroring
-[net-lattice](https://github.com/F000NKKK/net-lattice)'s topology. Each
-crate has its own crate-level README with its scope and a usage example:
-
-| Crate | Purpose |
-|---|---|
-| [`dns-lattice`](crates/dns-lattice/README.md) | Public facade: re-exports the crates below as the crate's stable surface |
-| [`dns-lattice-model`](crates/dns-lattice-model/README.md) | DNS message, zone/domain matcher, and split-DNS policy model |
-| [`dns-lattice-core`](crates/dns-lattice-core/README.md) | Shared `Error`/`Result` types |
-
-## The Lattice ecosystem
-
-DNS Lattice is one crate in a wider Lattice family of composable,
-cross-platform Rust networking libraries.
-
-| Crate | Purpose |
-|---|---|
-| [net-lattice](https://github.com/F000NKKK/net-lattice) | OS networking inspection and configuration (routes, DNS, interfaces) |
-| [tunnel-lattice](https://github.com/F000NKKK/tunnel-lattice) | TUN/TAP tunnel interfaces |
-| [dns-lattice](https://github.com/F000NKKK/dns-lattice) | Programmable DNS control plane (this repository) |
-| [flow-lattice](https://github.com/F000NKKK/flow-lattice) | Policy compiler: rules -> platform-neutral network plans |
-| [sdk-lattice](https://github.com/F000NKKK/sdk-lattice) | Application-facing SDK composing the crates above |
-
-Cross-repository dependency direction and API boundaries are recorded in
-[ARCHITECTURE.md](ARCHITECTURE.md) as that design work happens; `dns-lattice`
-has no compile-time dependency on any sibling crate.
-
-## Philosophy
-
-- **Strong typing over raw bytes.** Consumers work with typed messages, names, and records — never manual byte-offset arithmetic.
-- **Protocol/policy separate from transport.** The message model, zone matcher, and policy types have no network I/O. Outbound transport is isolated behind `UpstreamBackend`, while inbound framing and listener lifecycle belong to `Server`.
-- **Deterministic by design.** Zone/domain matching precedence is a documented, tested contract (see [ARCHITECTURE.md](ARCHITECTURE.md)), not incidental iteration order.
-- **Typed errors, never panics.** Every fallible operation returns `Result<T, Error>`; malformed wire input is rejected, not undefined behavior.
-- **Incremental, well-considered growth.** Each roadmap stage ships a bounded, fully tested slice rather than a large, under-tested surface.
-
-## Capabilities
-
-Implemented and published through `0.5.0`:
-
-- Hand-rolled DNS message model: header, question, and resource-record encode/decode, including name (de)compression on decode
-- Record types: A, AAAA, CNAME, PTR, NS, TXT, MX, SOA, plus a typed fallback for any other record type
-- Zone/domain matcher with deterministic exact/suffix/wildcard precedence
-- Static split-DNS policy types (`SplitDnsPolicy`) built on the matcher
-- In-process, async `Resolver`: construct from a `SplitDnsPolicy`, route one query to an upstream group, and resolve it with failover across that group's registered backends in registration order, with an in-memory TTL-respecting answer cache including RFC 2308 negative caching
-- Public, async `upstream` module (`UpstreamBackend` trait, `UdpBackend`, `TcpBackend`): baseline UDP and TCP upstream transports over `tokio`, no EDNS0/OPT yet (UDP falls back to TCP on a truncated response)
-- DoT (`DotBackend`, RFC 7858) and DoH (`DohBackend`, RFC 8484) upstream backends, each behind its own default-off `dot`/`doh` Cargo feature, over `rustls`/`tokio-rustls`/`hyper`/`hyper-rustls`
-- DoQ (`DoqBackend`, RFC 9250) upstream backend behind its own default-off `doq` Cargo feature, over `quinn` (QUIC transport, TLS 1.3 embedded via `rustls`); a fresh QUIC connection per query in this stage, no connection pooling/reuse yet
-- Public, async `server` module (`Server`, `ServerBuilder`): embeddable inbound UDP/TCP DNS listener over an `Arc<Resolver>` — construct/bind/serve/shutdown lifecycle, one task per UDP datagram and one task per TCP connection (looping over multiple length-prefixed queries per RFC 1035 §4.2.2), oversized UDP answers truncated with `TC=1`, and `Rcode::ServFail` synthesis when the resolver returns an error
-- Inbound DNS-over-TLS (DoT, RFC 7858) listener behind the `dot` Cargo feature: `ServerBuilder::dot_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor` and reuses the same length-prefixed read/write loop as the TCP listener
-- Inbound DNS-over-QUIC (DoQ, RFC 9250) listener behind the `doq` Cargo feature: `ServerBuilder::doq_addr` accepts a `quinn` QUIC endpoint (ALPN `doq`) and answers one query per bidirectional stream, reusing the same framing helpers as the `DoqBackend` upstream
-- Inbound DNS-over-HTTPS (DoH, RFC 8484) listener behind the `doh` Cargo feature: TCP `ServerBuilder::doh_addr` TLS-accepts each connection via `tokio_rustls::TlsAcceptor`, then serves ALPN-negotiated HTTP/1.1 or HTTP/2 via `hyper_util`'s protocol-detecting server builder over TLS 1.2 or 1.3. A dual-protocol deployment configures `h2` and `http/1.1` ALPN identifiers; GET (`?dns=` base64url) and POST (`application/dns-message` body) work on either protocol.
-- HTTP/3 DoH is additive, not a replacement for legacy TCP: `Doh3Backend` and QUIC `ServerBuilder::doh3_addr` use QUIC/UDP with ALPN `h3` and TLS 1.3. Keep TCP `DohBackend`/`doh_addr` for HTTP/1.1 and HTTP/2 clients on TLS 1.2 or 1.3.
-- `fakeip::FakeIpPool` and `FakeIpPolicy`: deterministic, concurrent IPv4
-  and/or IPv6 allocation and reverse lookup with inclusive ranges and
-  per-family LRU eviction. Mappings have a required whole-second TTL and can
-  be captured/restored as caller-owned, process-local in-memory snapshots.
-  `ResolverBuilder::fake_ip` makes the behavior opt-in: matching IN A/AAAA
-  queries synthesize addresses locally, while canonical IN PTR queries inside
-  a configured range return a live mapping or NXDOMAIN. A selected but
-  disabled A/AAAA family returns local NODATA. Local Fake IP answers bypass
-  the ordinary resolver cache and upstreams; their DNS TTL is the mapping's
-  remaining lifetime, so it never extends the mapping. Snapshot data is not
-  serialized or durably persisted by this crate.
-- `hooks::RouteHook`: an optional, one-hook dynamic upstream-group selection
-  point configured with `ResolverBuilder::route_hook`. Local Fake IP answers
-  are terminal before hooks; ordinary queries select static candidate then
-  hook decision, validate the effective group, and cache only in that group's
-  scope. Hooks cannot resolve, rewrite answers, alter cache policy, or perform
-  networking side effects through DNS Lattice.
-
-Implemented on `main` for stage 0.6 (see [ROADMAP.md](ROADMAP.md)):
-
-- Linux/Windows/macOS feature-matrix hardening and strict per-feature rustdoc
-- Fuzz/property tests for parsing, compression bounds, matcher precedence,
-  cache identity, and Fake IP TTL/LRU invariants
-- Structured observability sink and documented query/cache/hook/upstream events
-- Reproducible package-content/docs.rs-compatible checks and idempotent release automation
-
-Remaining before a 0.6 release:
-
-- External confirmation of the cross-platform GitHub Actions matrix and final
-  release/documentation reconciliation; 0.6 is not published yet.
-
-## Transport features
-
-UDP and TCP are available in the default build. Encrypted transports are
-opt-in: enable `dot` for DoT, `doh` for DoH (including HTTP/3 over QUIC),
-and `doq` for DoQ. The `doh` feature deliberately includes its HTTP/3/QUIC
-dependencies; `doq` remains independent for DNS-over-QUIC without the HTTP
-stack. All are default-off, so applications that only need UDP/TCP do not
-inherit TLS, HTTP, or QUIC dependencies.
-
-## Non-Goals
-
-- DNS Lattice does not own OS-level DNS configuration mutation — that is [net-lattice](https://github.com/F000NKKK/net-lattice)'s responsibility.
-- DNS Lattice does not compile a rule syntax — that is [flow-lattice](https://github.com/F000NKKK/flow-lattice)'s responsibility.
-- DNS Lattice does not manage TUN/TAP devices or packet forwarding; those data-plane concerns are outside this crate's scope.
-- DNS Lattice does not ship as a standalone server product (CLI, config file format, process supervision) — only the embeddable serving *engine* is in scope; packaging it as an installable daemon belongs to an application built on top, typically via [sdk-lattice](https://github.com/F000NKKK/sdk-lattice).
-
-## Current Status
-
-Stages 0.1-0.2 plus the implementation scope of stage 0.3 of the
-[architecture](ARCHITECTURE.md)'s module layout is covered by
-deterministic unit/doc tests, `clippy -D warnings`, and verified `cargo
-package` listings for all three crates:
-
-- `dns-lattice-core`'s `Error`/`Result` pair, hand-rolled `Display`/`std::error::Error`
-- `dns-lattice-model`'s `message` (`Message`, `Header`, `Question`, `ResourceRecord`), `record` (`RecordType`, `Class`, `RData`), `matcher` (`DomainPattern`, `DomainMatcher<T>`), and `policy` (`SplitDnsPolicy`) modules
-- the `dns-lattice` facade's `engine` module (`Resolver`, `ResolverBuilder`): in-process, async construct/resolve, static split-DNS routing, failover across a matched group's registered backends in registration order, and an in-memory TTL-respecting/negative-caching answer cache
-- the `dns-lattice` facade's `upstream` module (`UpstreamBackend`, `UdpBackend`, `TcpBackend`): baseline UDP/TCP upstream transports over `tokio`, no EDNS0/OPT yet
-- the `dns-lattice` facade's `upstream` module's opt-in `dot`/`doh` Cargo features (`DotBackend`, `DohBackend`): DNS-over-TLS/DNS-over-HTTPS transports over `rustls`/`hyper`, tested against loopback TLS/HTTPS fixtures with a locally generated self-signed certificate
-- the `dns-lattice` facade's `upstream` module's opt-in `doq` Cargo feature (`DoqBackend`): DNS-over-QUIC transport over `quinn`/`rustls`, tested against a loopback `quinn` QUIC server fixture with a locally generated self-signed certificate
-- the `dns-lattice` facade's `server` module (`Server`, `ServerBuilder`): inbound UDP/TCP listener over an in-process fake `Resolver` fixture, covering round-trip resolution over both transports, UDP truncation/`TC=1` behavior, `Rcode::ServFail` synthesis on a resolver error, and graceful shutdown via `serve_until`
-- the `dns-lattice` facade's `server` module's opt-in `dot` Cargo feature (`ServerBuilder::dot_addr`): inbound DNS-over-TLS listener, tested against a loopback TLS client with a locally generated self-signed certificate, covering round-trip resolution, multiple queries over one TLS connection, and `Rcode::ServFail` synthesis on a resolver error
-- the `dns-lattice` facade's `server` module's opt-in `doq` Cargo feature (`ServerBuilder::doq_addr`): inbound DNS-over-QUIC listener, tested against a loopback `quinn` QUIC client with a locally generated self-signed certificate, covering round-trip resolution, multiple queries over one QUIC connection (separate streams), and `Rcode::ServFail` synthesis on a resolver error
-- the `dns-lattice` facade's `server` module's opt-in `doh` Cargo feature: TCP `ServerBuilder::doh_addr`, tested end-to-end over ALPN-negotiated HTTP/1.1 and HTTP/2 with a locally generated self-signed certificate, and QUIC `ServerBuilder::doh3_addr`, tested over HTTP/3 with ALPN `h3`; both cover GET and POST round trips, with HTTP/3 also covering 400/404 and DNS `SERVFAIL` response semantics
-
-This gives a complete, tested DNS message model, a deterministic
-zone/domain matcher, an in-process resolver with real UDP/TCP/DoT/DoH/DoQ
-upstream transport and failover across a group's backends, and an
-embeddable inbound UDP/TCP/DoT/DoH/DoQ DNS server listener, all usable
-standalone today. Published `0.5.0` also includes opt-in Fake IP synthesis and
-the stage 0.5 route-selection hook pipeline. Stage 0.6 now hardens the tested
-surface with platform, parser, matcher, observability, and release validation;
-hooks cannot alter terminal Fake IP handling or gain OS/network side-effect
-authority.
+## Capability status
 
 | Capability | Status |
 |---|:---:|
-| DNS message encode/decode | ✅ |
-| Name (de)compression on decode | ✅ |
-| Zone/domain matcher (exact/suffix/wildcard) | ✅ |
-| Static split-DNS policy types | ✅ |
-| Resolver engine / answer cache | ✅ |
-| UDP/TCP upstream backends | ✅ |
-| DoT/DoH upstream backends (`dot`/`doh` Cargo features) | ✅ |
-| DoQ upstream backend (`doq` Cargo feature) | ✅ |
-| Upstream failover across a group's backends | ✅ |
-| Inbound UDP/TCP server listener | ✅ |
-| Inbound DoT server listener (`dot` Cargo feature) | ✅ |
-| Inbound DoQ server listener (`doq` Cargo feature) | ✅ |
-| Inbound DoH server listener (`doh` Cargo feature) | ✅ |
-| Fake IP pool and opt-in resolver/server synthesis | ✅ |
-| Dynamic routing hooks | ✅ |
+| DNS message encode/decode and name decompression | ✅ |
+| Exact/suffix/wildcard domain matcher | ✅ |
+| Static split-DNS policy | ✅ |
+| Resolver + TTL/negative cache | ✅ |
+| Route-scoped cache identity | ✅ |
+| UDP/TCP upstreams | ✅ |
+| DoT/DoH/DoQ upstreams | ✅ |
+| Ordered upstream failover | ✅ |
+| UDP/TCP inbound server | ✅ |
+| DoT/DoH/DoH3/DoQ inbound server | ✅ |
+| Fake IP pool + resolver synthesis | ✅ |
+| Dynamic `RouteHook` | ✅ |
+| Structured `ObservabilitySink` | ✅ |
+| Linux/Windows/macOS feature-matrix validation | ✅ |
+| Package/release automation hardening | ✅ |
+| Stable public API / SemVer guarantee | ⏳ Stage 1.0 |
+
+## Lattice ecosystem boundaries
+
+DNS Lattice is one component of the wider Lattice networking stack:
+
+```text
+net-lattice      OS network configuration and inspection
+tunnel-lattice   TUN/TAP data-plane primitives
+dns-lattice      DNS resolver/server control plane
+flow-lattice     Policy compiler
+sdk-lattice      Application-facing composition
+```
+
+DNS Lattice does not mutate OS DNS settings, manage TUN/TAP devices, compile a
+rule language, or ship a standalone daemon product. Those responsibilities
+belong to the host application or sibling Lattice components.
+
+## Current status and roadmap
+
+Completed:
+
+1. **0.0** — repository/architecture baseline;
+2. **0.1** — core DNS model;
+3. **0.2** — resolver and static split DNS;
+4. **0.3** — upstream transports, failover, inbound server;
+5. **0.4** — Fake IP;
+6. **0.5** — dynamic route hooks;
+7. **0.6** — hardening, cross-platform validation, observability, package and
+   release checks.
+
+Stage 0.6 has no remaining implementation work. The `0.6.0` release operation
+is the repository's mechanical version bump/publication step.
+
+Next:
+
+8. **1.0** — audit/freeze the public API, establish the stable SemVer contract,
+   perform final package/docs.rs verification, and publish the first stable
+   release.
+
+See [ROADMAP.md](ROADMAP.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the
+full delivery and contract details.
 
 ## Examples
 
-The runnable sources in
-[`crates/dns-lattice/examples`](crates/dns-lattice/examples) cover the
-model surface available today:
+Runnable examples live in
+[`crates/dns-lattice/examples`](crates/dns-lattice/examples):
 
-| Scenario | Runnable example | API covered |
-|---|---|---|
-| Split-DNS policy resolution | [`split_dns_policy`](crates/dns-lattice/examples/split_dns_policy.rs) | `SplitDnsPolicy`, `DomainPattern`, exact/suffix/wildcard precedence, default group fallback |
-| Message wire round-trip | [`message_round_trip`](crates/dns-lattice/examples/message_round_trip.rs) | `Message::encode`, `Message::decode`, `Header`, `Question`, `ResourceRecord`, `RData::A` |
-| Resolver with split-DNS + cache | [`resolver`](crates/dns-lattice/examples/resolver.rs) | `Resolver`, `ResolverBuilder`, in-process fake upstream backends, TTL answer cache, `Error::NoRoute` |
+- `split_dns_policy` — matcher and static policy behavior;
+- `message_round_trip` — DNS wire encode/decode;
+- `resolver` — in-process resolver/cache behavior.
 
-Run an example with `cargo run -p dns-lattice --example <name>`.
+Run one with:
 
-## Roadmap
+```bash
+cargo run -p dns-lattice --example <name>
+```
 
-1. **Stage 0.0: Audit, roadmap, architecture baseline** *(completed)* — repository audit, target module layout, and non-goals.
-2. **Stage 0.1: Core model** *(completed)* — DNS message model, zone/domain matcher, split-DNS policy types, `dns-lattice-core`/`dns-lattice-model`/`dns-lattice` crate split.
-3. **Stage 0.2: Resolver engine and static split DNS** *(completed)* — construct-resolve-shutdown resolver entry point, static split-DNS routing, in-memory answer cache with negative caching, fake in-process upstream for deterministic tests.
-4. **Stage 0.3: Upstream transport backends and server listener** *(completed)* — stabilized upstream backend trait, UDP/TCP baseline, DoT/DoH/DoQ behind `dot`/`doh`/`doq` Cargo features, fallback/failover across upstreams within a group, and an embeddable inbound UDP/TCP/DoT/DoH/DoQ server listener (`Server`/`ServerBuilder`).
-5. **Stage 0.4: Fake IP** *(completed in 0.4.0)* — deterministic synthetic address
-   allocation, reverse lookup, LRU eviction, expiry, and caller-owned
-   process-local snapshot/restore; opt-in resolver/server synthesis for
-   matching IN A/AAAA and canonical in-range IN PTR. No durable persistence.
-6. **Stage 0.5: Dynamic routing hooks** *(completed and published in 0.5.0)* — one optional
-   `RouteHook` selects an existing upstream group after static routing and
-   before the route-scoped cache; no hook composition, response rewriting, or
-   OS/network side effects belong to DNS Lattice.
-7. **Stage 0.6: Hardening and platform validation** *(active)* — cross-platform CI matrix, fuzz/property tests, structured observability, API/package checks, and release automation hardening.
-8. **Stage 1.0: Stable public API and first stable release** — public API frozen, `cargo package`/docs.rs verified, first stable crates.io release.
+## Contributing and security
 
-Stages are delivery boundaries, not a promise of one release per heading;
-see [ROADMAP.md](ROADMAP.md) for the full non-goal list per stage.
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
-guidelines, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community
-expectations, and [SECURITY.md](SECURITY.md) for reporting security issues.
-Feedback on scope, API design, and architecture is the most valuable
-contribution at this stage.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and
+[SUPPORT.md](SUPPORT.md) for project support status.
 
 ## License
 
-Licensed under the [Mozilla Public License 2.0](LICENSE) (`MPL-2.0`).
+Mozilla Public License 2.0. See [LICENSE](LICENSE).
