@@ -1,21 +1,27 @@
 # DNS Lattice stage 0.6 release readiness
 
 Date: 2026-08-15
-Baseline commit: `bcc751b1eca45439d64335d174bc293aa6def0ce`
-GitHub Actions run: `31821041466` (`CI`, `main`)
+Baseline implementation commit: `bcc751b1eca45439d64335d174bc293aa6def0ce`
+Verified GitHub Actions run: `31821041466` (`CI`, `main`)
+Release line: `0.6.0`
 
 ## Result
 
-Stage 0.6 implementation and external cross-platform verification are complete.
-The repository is release-ready from the implementation/CI side.
+Stage 0.6 is complete. Implementation, independent cross-platform CI
+verification, package/release validation, and public documentation
+reconciliation are finished.
 
-The only intentionally unresolved release action is the crate version change and
-publication. Repository policy in `.codex/rules/versioning.md` requires the
-version number to be chosen by the user rather than by an agent.
+There is no remaining stage-0.6 implementation task. The remaining release
+operation is mechanical: the user invokes the repository release script to
+apply the `0.6.0` Cargo version bump, run release preflight, publish the
+workspace crates in dependency order, and create the release/tag.
+
+After `0.6.0` publication, stage 1.0 is the next development milestone.
 
 ## Verified gates
 
-The `main` CI run for the baseline commit completed successfully.
+The final `main` CI run for the stage-0.6 implementation baseline completed
+successfully.
 
 ### Full workspace CI
 
@@ -51,29 +57,48 @@ Passed:
 - `cargo package --workspace --allow-dirty --list`
 - hermetic release-automation regression
 
-## Stage 0.6 implementation already present on main
+## Stage 0.6 implementation
 
-- Cross-platform CI and strict per-feature rustdoc validation.
-- Deterministic property-style coverage for DNS parsing/compression bounds,
-  matcher precedence, resolver cache identity, and Fake IP TTL/LRU invariants.
-- Opt-in `observability::ObservabilitySink` with bounded immutable events and no
-  authority over resolver behavior.
-- Package-content and release-automation hardening.
+Complete on `main`:
 
-## Remaining release actions
+- cross-platform CI and strict per-feature rustdoc validation;
+- deterministic property-style coverage for DNS parsing/compression bounds,
+  matcher precedence, resolver cache identity, and Fake IP TTL/LRU invariants;
+- opt-in `observability::ObservabilitySink` with bounded immutable events and
+  no authority over resolver behavior;
+- package-content and release-automation hardening.
 
-1. User selects the stage 0.6 crate version in accordance with repository
-   versioning policy (the expected roadmap line is `0.6.x`; the exact version is
-   deliberately not chosen in this document).
-2. Apply the version bump consistently to all workspace crates and workspace
-   dependency versions.
-3. Reconcile `CHANGELOG.md`, `SECURITY.md`, `SUPPORT.md`, root/crate READMEs,
-   and EN/RU roadmap status with the selected release version.
-4. Run the release preflight from `scripts/release.sh`.
-5. Publish crates in dependency order and create the corresponding GitHub
-   release/tag using the repository release automation.
-6. Confirm crates.io and docs.rs publication, then mark stage 0.6 fully
-   published and activate stage 1.0.
+## Documentation reconciliation
 
-No implementation defect or failed platform gate is currently known to block
-stage 0.6.
+Release documentation has been reconciled for the completed 0.6 stage:
+
+- `README.md` / `README.ru.md`;
+- `ARCHITECTURE.md` / `ARCHITECTURE.ru.md`;
+- `ROADMAP.md` / `ROADMAP.ru.md`;
+- `CHANGELOG.md`;
+- `SECURITY.md`;
+- `SUPPORT.md`;
+- `CONTRIBUTING.md`;
+- `index.md`;
+- all three crate-local README files;
+- Codex/Claude versioning guidance.
+
+The docs now consistently describe stage 0.6 as complete, the `0.6.x` line as
+the hardening release boundary, and stage 1.0 as the only next development
+stage. The architecture also reflects the implemented `observability` module
+and the actual facade/runtime module layout rather than the older target-state
+description.
+
+## Remaining release operation
+
+The user-owned release step is:
+
+1. invoke `scripts/release.sh` for the stage-0.6 minor release so Cargo
+   versions/workspace dependency versions move to `0.6.0`;
+2. let the script run its release preflight;
+3. publish the workspace crates in dependency order;
+4. create/verify the corresponding tag and GitHub release;
+5. confirm crates.io/docs.rs publication.
+
+No implementation defect, documentation gap, or failed platform gate is known
+to block `0.6.0` publication.
