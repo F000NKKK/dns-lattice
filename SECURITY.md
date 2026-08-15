@@ -3,13 +3,18 @@
 ## Supported Versions
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
-published `0.5.0`. Development on `main` has completed stages 0.1-0.5 and is
-working on stage 0.6; no public API is stable yet. Security fixes target the latest `0.5.x` release and
-the development state on `main`.
+use the `0.6.x` line as the supported pre-1.0 release line. Stage 0.6 is
+complete; work after that release moves to the 1.0 public-API stabilization
+milestone. No public API is stable until 1.0.0 ships.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.5.x   | ✅ |
+| 0.6.x   | ✅ |
+| 0.5.x and earlier | ❌ |
+
+Security fixes target the latest supported `0.6.x` release and the current
+development state on `main` when a fix is also relevant to the upcoming 1.0
+line.
 
 ## Reporting a Vulnerability
 
@@ -32,29 +37,35 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-The latest published `0.5.0` release provides a hand-rolled DNS message model
-(`dns-lattice-model`'s `message`/`record` modules: header, question, and
-resource-record wire encode/decode, including name decompression on
-decode), a deterministic zone/domain matcher (`matcher`), and static
-split-DNS policy types (`policy`) — all pure, in-memory, no network I/O.
-`dns-lattice-core` provides the shared `Error`/`Result` pair. The published
-`dns-lattice` facade also provides the resolver/cache, UDP/TCP/DoT/DoH/DoQ
-upstream transports, matching inbound listeners, and the opt-in Fake IP
-resolver behavior and pool described below.
+The supported 0.6 release surface includes the hand-rolled DNS message model
+(`dns-lattice-model`'s `message`/`record` modules), deterministic domain
+matcher and split-DNS policy types, the shared `dns-lattice-core` error
+boundary, resolver/cache, UDP/TCP/DoT/DoH/DoQ upstream transports and inbound
+listeners, Fake IP allocation/reverse lookup/TTL/snapshot behavior, dynamic
+route-selection hooks, and structured resolver observability.
 
-Reports involving a decode panic, an infinite loop or excessive resource
-consumption on malformed wire input (e.g. a crafted name-compression
-pointer loop), incorrect matcher precedence that could cause a query to be
-misrouted, cache poisoning or unbounded resource consumption, transport or
-TLS/QUIC failures that violate the documented error boundary, malformed DoH
-request handling, and listener failures are in scope. Reports of incorrect
-allocation, reverse lookup, or unbounded resource consumption in the
-development-state Fake IP pool, policy matching, local IN A/AAAA and
-canonical in-range IN PTR synthesis, or their TTL/expiry handling are also in
-scope. Development on `main` additionally implements dynamic route-selection
-hooks before their first release: reports of a hook leaking a query through an
-unintended static fallback, sharing cache entries across effective upstream
-groups, bypassing terminal Fake IP handling, failing to cancel cleanly, or
-permitting same-resolver re-entry are in scope for that development state. The
-published `0.5.0` release contains the route-selection hook pipeline; stage
-0.6 hardening is under development on `main`.
+Reports involving any of the following are in scope:
+
+- decode panics, infinite loops, compression-pointer loops, or excessive
+  resource consumption on malformed DNS wire input;
+- incorrect matcher precedence or route selection that can send a query to an
+  unintended upstream group;
+- cache poisoning, cache identity violations, or unbounded cache/resource
+  consumption;
+- transport, TLS, HTTP, or QUIC behavior that violates the documented error
+  boundary or request/response validation rules;
+- malformed DoH/DoH3 request handling or listener failures that can crash,
+  hang, or bypass the resolver policy;
+- Fake IP allocation, eviction, reverse lookup, snapshot restoration, or
+  TTL/expiry behavior that can corrupt mappings or consume resources without
+  bound;
+- route-hook behavior that leaks a query through unintended static fallback,
+  shares cache entries across effective groups, bypasses terminal Fake IP
+  handling, fails cancellation isolation, or enables same-resolver re-entry;
+- observability sink behavior that can mutate resolver authority/state, escape
+  its documented panic isolation, or unexpectedly retain privileged runtime
+  handles/client transport metadata.
+
+Reports about OS-level DNS configuration mutation, TUN/TAP packet forwarding,
+or rule-language compilation belong to the sibling Lattice components that
+own those responsibilities rather than DNS Lattice itself.
