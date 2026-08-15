@@ -19,7 +19,12 @@ crate rather than depending on this crate directly. Depend on it directly
 when implementing a component that needs the DNS model without the rest of
 `dns-lattice`.
 
+Stage-0.6 hardening adds deterministic property-style verification around
+message parsing/compression bounds and matcher precedence without introducing
+network or OS responsibilities into this crate.
+
 ## Status
 
-Version `0.5.0` is published and this crate remains pre-1.0. Types may
-change without notice until `dns-lattice` reaches its first stable release.
+Stage 0.6 is complete and this crate is part of the `0.6.x` pre-1.0 release
+line. Its public model may still evolve during the stage-1.0 API freeze and
+compatibility audit; ordinary stable SemVer guarantees begin with `1.0.0`.
