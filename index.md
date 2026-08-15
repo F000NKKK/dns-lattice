@@ -2,17 +2,16 @@
 
 Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks.
 
-This repository is past its bootstrap stage: base repository workflow,
-policies, and packaging are in place, and stages 0.1/0.2 have landed the
-crate's first real implementation (the DNS message/matcher/policy model and
-the resolver engine with static split DNS). `ARCHITECTURE.md` /
-`ARCHITECTURE.ru.md` record the target design and `ROADMAP.md` /
-`ROADMAP.ru.md` sequence the stages that implement it; read both before
-starting or continuing any stage. Task-specific plans, evidence, and
-decisions live in the YouTrack project `DL`
-(https://hush.youtrack.cloud/projects/DL), reached via the `mcp__youtrack__*`
-tools (Claude Code) or the YouTrack REST API (Codex) — this replaced the
-former file-based `.ai/<task-name>/` workspace on 2026-08-11.
+This repository is past its bootstrap and pre-1.0 implementation stages:
+repository workflow, policies, packaging, the DNS model, resolver/cache,
+upstream transports, inbound listeners, Fake IP, dynamic routing hooks, and
+the stage-0.6 hardening surface are all implemented. `ARCHITECTURE.md` /
+`ARCHITECTURE.ru.md` record the design and `ROADMAP.md` / `ROADMAP.ru.md`
+sequence the delivery stages; read both before starting or continuing work.
+Task-specific plans, evidence, and decisions live in the YouTrack project
+`DL` (https://hush.youtrack.cloud/projects/DL), reached via the
+`mcp__youtrack__*` tools (Claude Code) or the YouTrack REST API (Codex) — this
+replaced the former file-based `.ai/<task-name>/` workspace on 2026-08-11.
 
 ## Workspace map
 
@@ -25,10 +24,10 @@ dns-lattice/
 ├── .github/workflows/          CI
 ├── .codex/                     Reusable Codex rules, roles, and templates
 ├── .claude/                    Reusable Claude Code rules, roles, and templates
-├── ARCHITECTURE.md             Target architecture (English)
-├── ARCHITECTURE.ru.md          Target architecture (Russian)
+├── ARCHITECTURE.md             Architecture (English)
+├── ARCHITECTURE.ru.md          Architecture (Russian)
 ├── ROADMAP.md                  Stage sequencing (English)
-├── ROADMAP.ru.md                Stage sequencing (Russian)
+├── ROADMAP.ru.md               Stage sequencing (Russian)
 ├── README.md                   English user documentation
 ├── README.ru.md                Russian user documentation
 ├── CHANGELOG.md                Release history
@@ -58,14 +57,21 @@ implementation starts.
 
 ## Current status
 
-Version `0.5.0` is published; the public API remains pre-1.0 and unstable.
-Stages 0.0 through 0.5 are complete on `main`. Stage 0.5's optional
-`hooks::RouteHook` selects a registered upstream group for an ordinary query
-after static routing and before the route-scoped cache. Fake IP remains
-terminal before hooks; hook implementations own timeout, retry, cancellation
-cleanup, and any external side effects. Stage 0.6 is active and covers
-cross-platform hardening, parser/matcher validation, observability, and release
-gates. See `CONTRIBUTING.md` and `SUPPORT.md` for current status.
+Stages 0.0 through 0.6 are complete. The 0.6 release line contains the full
+pre-1.0 implementation surface: DNS model and matching, static split DNS,
+resolver/cache, UDP/TCP/DoT/DoH/DoQ upstreams and inbound listeners, Fake IP,
+route-selection hooks, structured observability, deterministic hardening
+coverage, cross-platform feature-matrix CI, strict rustdoc gates, package
+validation, and release-automation regression checks.
+
+Stage 0.6 has no remaining implementation work. The repository release script
+owns the mechanical `0.6.0` version bump/publication step. The next development
+stage is 1.0, focused on freezing and auditing the public API, establishing the
+stable SemVer contract, final package/docs.rs verification, and the first
+stable crates.io release. Until that milestone ships, the API remains
+pre-1.0 and may still change.
+
+See `CONTRIBUTING.md` and `SUPPORT.md` for contributor and support guidance.
 
 ## Useful commands
 
