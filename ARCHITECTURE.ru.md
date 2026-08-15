@@ -1,249 +1,320 @@
 # Архитектура DNS Lattice
 
-Статус: черновик. Стадии 0.1-0.3 уже реализовали крейты
-`dns-lattice-core` и `dns-lattice-model`, резолвер/кэш, апстрим-транспорты
-и входящие серверные слушатели. Стадия 0.4 опубликована в `0.4.0` и содержит
-opt-in синтез Fake IP в резолвере, а хуки маршрутизации стадии 0.5
-опубликованы в `0.5.0`. В `main` активна стадия 0.6 — укрепление и проверка
-платформ. Обновляйте
-документ при каждом изменении публичного контракта.
+Статус: реализована до стадии 0.6 включительно. Код, тесты,
+кроссплатформенная feature-матрица, observability boundary, package validation
+и release automation для pre-1.0 роадмапа реализации завершены. Следующий
+архитектурный этап — стадия 1.0: аудит и заморозка публичного API, фиксация
+стабильного SemVer-контракта и публикация первого стабильного релиза.
 
-## Место в экосистеме Lattice
+Этот документ описывает архитектуру на границе релиза стадии 0.6. Обновляйте
+его, когда реализация меняет публичный контракт или когда аудит стадии 1.0
+намеренно замораживает либо перерабатывает такой контракт.
 
-DNS Lattice — это **встраиваемый DNS-серверный движок**: DNS-аналог того,
-чем Kestrel является для HTTP в ASP.NET Core — полноценное, современное,
-хостируемое серверное ядро, которое любое приложение встраивает, чтобы
-получить полный DNS-сервер (приём входящих запросов, split DNS, Fake IP,
-кэширование, DoT/DoH/DoQ, динамическая маршрутизация), не реализуя его с
-нуля. Это плоскость протокола/сервера DNS, а не слой интеграции с ОС и не
-компилятор политик:
+## Область ответственности и место в экосистеме Lattice
+
+DNS Lattice — **встраиваемый DNS server/resolver engine**. Это DNS-протокольный
+и control-plane компонент семейства Lattice: приложение встраивает его, чтобы
+разбирать и обслуживать DNS, маршрутизировать запросы, кэшировать ответы,
+использовать шифрованные DNS-транспорты, синтезировать Fake IP и подключать
+динамический выбор маршрута без запуска отдельного DNS-демона.
 
 ```text
-net-lattice      Инспекция и настройка сетевого стека ОС (маршруты, DNS, интерфейсы)
-tunnel-lattice   TUN/TAP туннельные интерфейсы
-dns-lattice      Программируемый DNS control plane                 <- этот крейт
-flow-lattice     Компилятор политик: правила -> платформенно-нейтральные планы
-sdk-lattice      Прикладной SDK, объединяющий крейты выше
+net-lattice      Инспекция/настройка сети ОС (routes, DNS, interfaces)
+tunnel-lattice   TUN/TAP-интерфейсы и связанные data-plane примитивы
+dns-lattice      Программируемый DNS resolver/server engine      <- этот репозиторий
+flow-lattice     Компилятор политик: rules -> platform-neutral network plans
+sdk-lattice      Application-facing слой композиции
 ```
 
-- `net-lattice` читает и изменяет DNS-настройки уровня ОС (системный
-  резолвер, аналоги `/etc/resolv.conf`). Он не выполняет резолвинг запросов и
-  не хранит политику маршрутизации.
-- `flow-lattice` компилирует пользовательские/операторские правила в
-  платформенно-нейтральные планы. Он может производить политику
-  маршрутизации, которую исполняет `dns-lattice`, но сам DNS-запросы не
-  выполняет.
-- `tunnel-lattice` — крейт экосистемы для интерфейсов TUN/TAP. У него своя
-  область data plane; он не входит в API или граф зависимостей DNS Lattice.
-- `sdk-lattice` связывает крейты выше в единое приложение. Это единственный
-  крейт, для которого ожидается одновременная зависимость от всех остальных.
+Границы зависимостей и ответственности намеренные:
 
-Таким образом, `dns-lattice` предоставляет библиотечный API, который уже
-сейчас потребляется напрямую приложениями, а в дальнейшем — `flow-lattice` и
-`sdk-lattice`, когда те будут готовы строиться поверх него: `sdk-lattice`
-объединяет его с остальными крейтами Lattice в единое приложение, а
-`flow-lattice` сможет использовать существующий хук динамического выбора
-маршрута, когда появится компиляция политик. Встраивание
-серверного ядра само по себе не требует привилегий ОС или
-платформенно-специфичного пути: обработка DNS-сообщений, обслуживание
-входящих запросов, решения маршрутизации, кэширование и выделение Fake IP —
-это чистая, переносимая логика, которая привязывается к UDP/TCP-сокету так
-же, как любой другой сетевой сервер. Вне ядра этого крейта остаётся только
-то, что неизбежно платформенно-специфично (например, переопределение
-системного резолвера, привязка к привилегированному порту на некоторых
-платформах), и вызывается составляющим приложением, как правило через
-`net-lattice`.
+- `net-lattice` владеет DNS/resolver-настройками ОС. DNS Lattice не изменяет
+  системные DNS-настройки.
+- `tunnel-lattice` владеет TUN/TAP-устройствами и packet forwarding. У DNS
+  Lattice нет прямой зависимости от него.
+- `flow-lattice` может реализовывать route-hook контракт DNS Lattice и влиять
+  на маршрутизацию запросов, но DNS Lattice не компилирует пользовательский
+  язык правил.
+- `sdk-lattice` или другое host-приложение компонует DNS Lattice с соседними
+  компонентами семейства.
 
 ## Цели дизайна
 
-- **Встраиваемое серверное ядро, а не только клиент-резолвер.** Крейт
-  обслуживает входящие DNS-запросы (слушатели UDP/TCP/DoT/DoH/DoQ) целиком,
-  так же как Kestrel обслуживает входящий HTTP: создание, привязка,
-  обслуживание, остановка. Приложение получает полноценный современный
-  DNS-сервер, встраивая этот крейт, а не оборачивая отдельный демон.
-- **Полный паритет современных возможностей.** Split DNS, Fake IP,
-  кэширование, зашифрованный транспорт до апстримов и программируемая
-  маршрутизация — встроенные возможности движка первого класса, а не
-  опциональные надстройки крейта-потребителя.
-- **Программируемость, а не только конфигурация.** Решения маршрутизации и
-  резолвинга выражаются как типы и трейты Rust (политики, матчеры, хуки),
-  чтобы хост-приложение могло реализовать собственную логику без форка
-  крейта.
-- **Split DNS.** Запросы маршрутизируются в разные группы апстримов на
-  основе доменных/зональных матчеров, контекста источника или
-  пользовательского хука, а не единого фиксированного апстрима.
-- **Fake IP.** Детерминированное, обратимое выделение синтетических адресов
-  на домен для вызывающего кода, которому нужно состояние синтетических
-  адресов.
-- **Динамические хуки маршрутизации.** Стабильная точка расширения, чтобы
-  `flow-lattice` (или любой вызывающий код) мог влиять на резолвинг
-  конкретного запроса без зависимости `dns-lattice` от `flow-lattice` на
-  этапе компиляции.
-- **Транспорт, независимый от бэкенда.** UDP/TCP/DoT/DoH/DoQ — взаимозаменяемые
-  реализации одного трейта апстрима; ядро никогда не предполагает конкретный
-  транспорт.
-- **Без скрытого глобального состояния.** Всё состояние движка принадлежит
-  значению, которое создаёт и держит вызывающий код; нет процессных
-  синглтонов, нет неявного I/O.
-- **Кроссплатформенность в первую очередь.** Базовый крейт должен собираться
-  и проходить тесты на Linux, Windows и macOS без `cfg`-веток в базовой
-  логике. Варьироваться по платформенным возможностям (не поведению) может
-  только I/O бэкендов (сокеты, стеки TLS/QUIC).
+- **Встраиваемое серверное ядро.** Host может создать, bind, запустить и
+  остановить входящие DNS listeners без обёртки вокруг отдельного демона.
+- **Resolver и server в одном engine.** Один и тот же resolver pipeline можно
+  использовать напрямую in-process или за входящими UDP/TCP/DoT/DoH/DoQ
+  listeners.
+- **Split DNS.** Статическая политика выбирает upstream group через
+  детерминированный domain matcher.
+- **Программируемая маршрутизация.** Один необязательный caller-owned route
+  hook может выбрать другую существующую upstream group для обычного запроса.
+- **Fake IP.** Детерминированное обратимое выделение синтетических IPv4/IPv6 с
+  TTL, ограниченным per-family LRU-вытеснением, reverse lookup и caller-owned
+  process-local snapshots.
+- **Транспорт-независимое ядро.** UDP, TCP, DoT, DoH (HTTP/1.1, HTTP/2,
+  HTTP/3) и DoQ реализуют явные transport boundaries и не протекают в
+  resolver policy.
+- **Детерминированная cache identity.** Обычные кэшированные ответы включают
+  effective upstream group в область идентичности, поэтому одинаковые DNS
+  questions, отправленные разными маршрутами, не могут случайно разделить
+  ответ.
+- **Неавторитетная наблюдаемость.** Структурированные события показывают
+  переходы resolver pipeline, но не дают sink права влиять на routing, cache,
+  retries или ответы.
+- **Нет скрытого global state.** Resolver, cache, Fake IP state, hooks,
+  observability, server listeners и upstream backends принадлежат явно
+  созданным вызывающим кодом объектам.
+- **Cross-platform first.** Поддерживаемый public surface собирается и
+  тестируется на Linux, Windows и macOS с одинаковым поведенческим контрактом.
 
-## Не-цели (для этого крейта)
+## Не-цели
 
-- Владение или изменение DNS-конфигурации уровня ОС (задача `net-lattice`).
-- Компиляция пользовательского синтаксиса правил в политику (задача
-  `flow-lattice`); этот крейт потребляет уже структурированную
-  политику/хук, а не сырой текст правил.
-- Управление устройствами TUN/TAP и пересылкой пакетов.
-- Поставка самостоятельного DNS-сервера как **продукта** (точка входа CLI,
-  формат конфигурационного файла, супервизия процесса, упаковка как
-  системного сервиса). Крейт предоставляет полноценный серверный *движок*
-  — приём, обслуживание и ответ на запросы входят в его объём как
-  встраиваемый библиотечный API, — но превращение этого движка в
-  устанавливаемый демон/бинарник принадлежит `sdk-lattice` или отдельному
-  приложению.
+DNS Lattice не:
 
-## Целевая структура модулей
+- владеет или изменяет resolver-конфигурацию ОС;
+- управляет TUN/TAP-устройствами и не пересылает произвольные пакеты;
+- компилирует пользовательский/operator rule language;
+- поставляет standalone CLI/config-file/service-supervision продукт;
+- выполняет долговременное хранение Fake IP state и не задаёт формат
+  сериализации snapshots;
+- выполняет скрытые OS/network side effects из route hooks или observability
+  callbacks.
 
-DNS Lattice — мульти-крейтовый workspace, по аналогии с топологией
-`net-lattice`: общие фундаментальные типы и доменная модель выделены в
-собственные крейты, а `dns-lattice` — публичный **фасадный крейт**,
-реэкспортирующий их и собирающий стабильную поверхность для приложений; сам
-он не содержит модулей реализации сверх этого слоя реэкспорта.
+Host-приложение может построить такие возможности вокруг DNS Lattice, но они
+не входят в authority этого крейта.
+
+## Структура workspace и модулей
+
+Workspace содержит три публикуемых крейта:
 
 ```text
-dns-lattice-core     Error/Result, общие для всего workspace (реализовано, стадия 0.1)
-dns-lattice-model    Типы DNS-сообщений, доменные/зональные матчеры, типы политик (реализовано, стадия 0.1)
-dns-lattice-platform Кросс-платформенный(е) трейт(ы) провайдера — когда какой-то стадии понадобится OS-специфичное поведение (целевой, ещё не реализован)
-dns-lattice          Фасадный крейт: реэкспортирует model/core/engine/server/upstream/fakeip/hooks как стабильную публичную поверхность крейта
+dns-lattice-core     Общая граница Error/Result
+dns-lattice-model    DNS wire model, matcher и split-DNS policy types
+dns-lattice          Public facade + реализация resolver/server
 ```
 
-Для возможностей, ещё не выделенных в отдельный крейт, целевая структура
-модулей внутри самого `dns-lattice` такова:
+`dns-lattice-core` и `dns-lattice-model` намеренно не содержат socket- или
+OS-интеграции. `dns-lattice` одновременно является рекомендуемым публичным
+facade crate и местом реализации runtime engine modules.
+
+Канонические публичные модули:
 
 ```text
-dns-lattice (фасадный крейт)
-├── server         Входящие слушатели: привязка, приём, обслуживание UDP/TCP/DoT/DoH/DoQ (реализовано, стадия 0.3)
-├── engine         Резолвер: конвейер запроса, кэш, split-DNS маршрутизация (реализовано, этап 0.2)
-├── fakeip         Пул, политика, snapshot и жизненный цикл отображений Fake IP
-├── upstream       Трейт апстрим-бэкенда + реализации UDP/TCP/DoT/DoH/DoQ (реализовано, стадия 0.3)
-└── hooks          Трейт(ы) динамических хуков маршрутизации для вызывающего кода
+dns_lattice::core           общий Error/Result
+dns_lattice::model          DNS message/record/name/matcher/policy types
+dns_lattice::engine         Resolver и ResolverBuilder
+dns_lattice::upstream       outbound backend trait и transports
+dns_lattice::server         inbound listeners и server lifecycle
+dns_lattice::fakeip         synthetic address pool/policy/snapshots
+dns_lattice::hooks          dynamic route-selection hook contract
+dns_lattice::observability  structured resolver event sink contract
 ```
 
-`server` и `upstream` оба говорят на UDP/TCP/DoT/DoH/DoQ, но смотрят в
-противоположные стороны: `server` принимает запросы от клиентов, `upstream`
-отправляет запросы резолверам. Внутри они могут делить транспортную
-инфраструктуру, но публичные трейты слушателя и бэкенда остаются разными.
+Плоских root aliases для domain types намеренно нет. Приложения должны
+импортировать типы из канонического domain module, чтобы API boundary оставался
+явным перед freeze стадии 1.0.
 
-Имена модулей и крейтов выше — целевая форма, а не зафиксированные
-публичные пути; роль архитектора подтверждает или пересматривает их для
-каждого ограниченного слоя перед реализацией, и любой публичный путь
-фиксируется до стабилизации. `dns-lattice-core` и `dns-lattice-model` —
-единственные выделенные пока крейты (стадия 0.1); дальнейшее разделение
-(например, отдельный крейт на каждый оставшийся модуль или
-`dns-lattice-platform`) происходит только тогда, когда это реально
-понадобится какой-то стадии.
-
-## Основной поток данных
+## Поток данных resolver
 
 ```mermaid
 flowchart LR
-    Client[Клиент] --> Listener[Серверный слушатель: UDP/TCP/DoT/DoH/DoQ]
-    Listener --> Query[Входящий запрос]
-    Query --> FakePolicy{Политика Fake IP?}
-    FakePolicy -->|совпавшие IN A/AAAA| FakeIP[Пул Fake IP: выделение/повторное использование]
-    FakePolicy -->|канонический IN PTR в диапазоне| Reverse[Пул Fake IP: поиск / NXDOMAIN]
-    FakeIP --> Answer[Ответ]
-    Reverse --> Answer
-    FakePolicy -->|все остальные запросы| Match[Статический кандидат split-DNS]
-    Match --> Hook[Необязательный RouteHook]
-    Hook -->|Use или Abstain| Route[Проверенная эффективная группа апстримов]
-    Route --> Cache{Есть в кэше?}
-    Cache -->|да| Answer[Ответ]
-    Cache -->|нет| Upstream[Апстрим-бэкенд: UDP/TCP/DoT/DoH/DoQ]
-    Upstream --> Cache
-    Cache --> Answer
-    Answer --> Host[Хост-приложение]
-    Answer --> Listener
-    Listener --> Client
+    Client[Client или in-process caller] --> Query[DNS query]
+    Query --> Fake{Fake IP terminal path?}
+    Fake -->|matching A/AAAA| FakeAlloc[Allocate/reuse synthetic IP]
+    Fake -->|in-range PTR| FakeReverse[Reverse lookup / NXDOMAIN]
+    FakeAlloc --> Answer[DNS answer]
+    FakeReverse --> Answer
+    Fake -->|ordinary query| Static[Static split-DNS candidate]
+    Static --> Hook[Optional RouteHook]
+    Hook --> Validate[Validate effective upstream group]
+    Validate --> Cache{Route-scoped cache hit?}
+    Cache -->|yes| Answer
+    Cache -->|no| Upstream[Ordered upstream failover]
+    Upstream --> CacheStore[Cache answer by effective group]
+    CacheStore --> Answer
+    Answer --> Client
 ```
 
-## Поток сбоев и компенсации
+Порядок resolver pipeline является частью контракта:
 
-```mermaid
-flowchart LR
-    Upstream[Апстрим-бэкенд] -->|таймаут/ошибка| Fallback[Следующий апстрим в группе]
-    Fallback -->|все исчерпаны| Negative[Негативный/отказной ответ]
-    Negative --> Cache[Негативное кэширование с ограниченным TTL]
-    FakeIPAlloc[Выделение Fake IP] -->|пул исчерпан| Evict[LRU-вытеснение старейшего отображения]
-    FakeIPAlloc -->|промах обратного поиска| NotFound[Явный not-found, без паники]
-```
+1. проверить/декодировать DNS query и определить первый question для routing;
+2. выполнить terminal Fake IP handling, если его выбирает policy;
+3. вычислить статического split-DNS кандидата;
+4. вызвать не более одного optional route hook;
+5. проверить effective group, выбранную static policy/hook;
+6. проверить cache в области этой effective group;
+7. попробовать upstream backends в порядке регистрации;
+8. закэшировать cacheable answer и вернуть его.
 
-Каждый отказоустойчивый путь возвращает типизированную ошибку; движок
-никогда не паникует при сетевом сбое, некорректном ответе апстрима или
-исчерпании пула. Точные типы ошибок определяются при реализации слоёв
-`model` и `engine`, а не в этом документе.
+Ошибка hook, неизвестная выбранная group или group без backends — это ошибка.
+DNS Lattice не выполняет молчаливый fallback к другой static group после
+ошибки hook или некорректного выбора.
 
-## Публичная поверхность API (фасад)
+## DNS-модель и matching
 
-Фасад `dns-lattice` — рекомендуемая точка импорта для внешних крейтов. Его
-канонические пути разделены по доменам: `dns_lattice::model`, `core`,
-`engine`, `server`, `upstream`, `fakeip` и `hooks`; плоских aliases нет. Он
-как минимум реэкспортирует:
+`dns-lattice-model` владеет protocol/domain типами, используемыми engine:
 
-- `dns-lattice-model`: типы запроса/ответа, зональный матчер, конфигурацию
-  политики (`Message`, `Header`, `Question`, `ResourceRecord`,
-  `RecordType`, `Class`, `RData`, `DomainPattern`, `DomainMatcher`,
-  `SplitDnsPolicy`, `UpstreamGroupId`) — реализовано, стадия 0.1.
-- `dns-lattice-core`: общую пару `Error`/`Result` — реализовано, стадия 0.1.
-- `server`: точку входа слушателя (создание, привязка, обслуживание,
-  остановка) для встраивания полноценного входящего DNS-сервера.
-- `engine`: точку входа резолвера (создание, резолвинг, остановка),
-  пригодную для использования отдельно (без слушателя) в приложениях,
-  которым нужен только программный резолвинг.
-- `fakeip`: конфигурацию пула, `FakeIpPolicy`, типы поиска/обратного поиска,
-  TTL и process-local in-memory snapshot/restore. Вызывающий код явно
-  включает синтез через `ResolverBuilder::fake_ip(Arc<FakeIpPool>,
-  FakeIpPolicy)`: совпавшие IN A/AAAA получают локальный синтетический
-  ответ, а канонический IN PTR в диапазоне возвращает живое отображение либо
-  NXDOMAIN. Оставшееся время жизни отображения ограничивает DNS TTL ответа.
-  Крейт не предоставляет долговременное persistence и не зависит напрямую
-  от соседних крейтов Lattice.
-- `upstream`: трейт бэкенда, чтобы вызывающий код мог реализовать свой
-  транспорт.
-- `hooks`: трейт динамического выбора маршрута. `RouteHook` получает только
-  первый вопрос и предварительную статическую группу; `Use` выбирает
-  существующую группу, а `Abstain` сохраняет статическую маршрутизацию.
-  Локальные ответы Fake IP выполняются первыми; не локальные запросы вызывают
-  хук до поиска в кэше, ключ которого включает эффективную группу. Хук не
-  может резолвить, менять кэш, получать доступ к бэкендам или выполнять
-  побочные действия ОС/сети через DNS Lattice. Timeout, retry и очистка при
-  отмене принадлежат хуку; он не должен повторно входить в тот же резолвер.
+- DNS `Message`, `Header`, `Question` и `ResourceRecord` wire model;
+- record/class/RData types, необходимые реализованному engine;
+- DNS `Name` и bounded name decompression/encoding;
+- `DomainPattern` и `DomainMatcher<T>` с детерминированным приоритетом
+  exact/suffix/wildcard;
+- `UpstreamGroupId` и `SplitDnsPolicy`.
 
-Конкретные имена типов и трейтов определяются для каждого слоя реализации и
-фиксируются как ADR до стабилизации в первом релизе 0.x.
+Некорректный input должен возвращать typed error, а не panic или бесконечный
+цикл. Hardening стадии 0.6 добавляет детерминированное property-style покрытие
+parsing, compression bounds и matcher precedence.
 
-## Сквозные аспекты
+## Контракт кэша
 
-- **Наблюдаемость**: движок передаёт структурированные события (запрос
-  получен, попадание/промах кэша, выбран апстрим, выделен Fake IP, сбой)
-  через предоставляемый вызывающим кодом trait-приёмник, а не через
-  жёстко заданный фреймворк логирования.
-- **Конкурентность**: движок безопасен для конкурентных вызовов; в
-  публичном API не экспонируется внутренняя изменяемость без синхронизации.
-- **Привилегии**: ядро крейта их не требует. Любая привилегированная
-  операция относится к `net-lattice` либо к сетевому стеку ОС, вызываемому
-  через реализации транспорта `upstream`.
-- **Тестирование**: обычные тесты детерминированы и используют
-  внутрипроцессные фейковые апстрим-бэкенды; тесты, требующие реальной сети
-  или повышенных привилегий, помечаются `#[ignore]` и запускаются только в
-  выделенных привилегированных CI-задачах.
+Resolver владеет in-memory answer cache с учётом positive TTL и RFC 2308-style
+negative caching. Cache identity включает effective upstream group вместе с
+идентичностью DNS question. Это необходимо для dynamic routing: ответ,
+полученный через один маршрут, не должен обслужить запрос, который hook
+направил в другую group.
 
-## Связь с `index.md` и `AGENTS.md`
+Terminal Fake IP ответы обходят обычный answer cache, поскольку их lifetime
+определяется самим Fake IP mapping.
 
-Этот документ — архитектурный ориентир, на который ссылаются `AGENTS.md` и
-`index.md`. `ROADMAP.md` (`ROADMAP.ru.md`) упорядочивает стадии, реализующие
-этот дизайн, и не дублирует его. Обновляйте оба документа вместе при
-изменении объёма стадии.
+## Контракт Fake IP
+
+`fakeip::FakeIpPool` синхронный и внутренне синхронизированный, поэтому им
+можно делиться между конкурентными resolver calls. Pool может включать IPv4,
+IPv6 или оба семейства. Для каждого семейства он предоставляет:
+
+- детерминированное domain -> synthetic-address allocation/reuse;
+- address -> active-domain reverse lookup;
+- bounded inclusive address ranges;
+- per-family LRU eviction при заполнении диапазона;
+- обязательный whole-second TTL и expiry;
+- caller-owned in-memory snapshot/restore живых mappings и LRU state.
+
+`FakeIpPolicy` явно включает resolver synthesis. Совпавшие IN A/AAAA queries
+возвращают локальный synthetic answer; канонические PTR queries по
+сконфигурированным диапазонам возвращают active mapping либо NXDOMAIN.
+Выбранное, но отключённое address family возвращает local NODATA. DNS TTL
+никогда не превышает remaining lifetime mapping.
+
+Крейт не предоставляет durable persistence или serialization format для
+snapshots.
+
+## Контракт route hook
+
+`hooks::RouteHook` — optional one-at-a-time selection boundary. Hook получает
+первый DNS question и tentative static upstream group и возвращает одно из
+двух решений:
+
+- `Use(group)` — использовать выбранную caller существующую upstream group;
+- `Abstain` — оставить static candidate.
+
+Hook не получает resolver/backend handles, не переписывает DNS answers, не
+меняет cache policy, не выполняет resolver re-entry и не получает OS/network
+side-effect authority через DNS Lattice. Реализация hook сама владеет timeout,
+retry, cancellation cleanup и внешними интеграциями, которые она вызывает.
+
+Drop resolver future приводит к drop in-flight hook future. Re-entry в тот же
+resolver запрещён, поскольку создаёт recursion/deadlock semantics, которым не
+место в routing boundary.
+
+## Контракт observability
+
+`observability::ObservabilitySink` — opt-in, synchronous и
+non-authoritative. Resolver отправляет immutable bounded events о query
+receipt, terminal Fake IP behavior, route selection/hook outcomes, cache
+hit/miss, upstream attempts/outcomes, timeouts и terminal failures.
+
+Контракт sink имеет строгие свойства изоляции:
+
+- callback не может изменить resolver decision или answer;
+- callback не получает resolver/backend handles или privileged OS authority;
+- resolver locks освобождаются до вызова callback;
+- panic callback изолирован от корректности resolver;
+- DNS Lattice не создаёт background logging queue и не требует конкретного
+  logging framework.
+
+Приложение может адаптировать эти events к tracing, metrics, logs или telemetry
+за пределами крейта.
+
+## Контракт upstream transports
+
+`upstream::UpstreamBackend` асинхронный. Matched upstream group владеет
+упорядоченным списком backends. Resolver пробует их в порядке регистрации;
+timeout/transport/TLS failures могут переключить выполнение на следующий
+backend. Если все backends завершились ошибкой, возвращается последняя ошибка,
+а успешный answer в cache не вставляется.
+
+Реализованные transports:
+
+| Transport | Cargo feature | Примечание |
+|---|---|---|
+| UDP | default | Переходит на TCP при truncated response (`TC=1`). |
+| TCP | default | RFC 1035 length-prefixed framing. |
+| DoT | `dot` | TLS через `rustls`/`tokio-rustls`. |
+| DoH HTTP/1.1 + HTTP/2 | `doh` | TLS/HTTP через `hyper`/`hyper-rustls`. |
+| DoH HTTP/3 | `doh` | QUIC/HTTP3, ALPN `h3`, TLS 1.3. |
+| DoQ | `doq` | QUIC, ALPN `doq`, TLS 1.3. |
+
+Encrypted features по умолчанию выключены, поэтому baseline UDP/TCP build не
+получает TLS/HTTP/QUIC dependency weight.
+
+## Контракт inbound server
+
+`server::ServerBuilder` встраивает `Arc<Resolver>` и может bind несколько
+типов listeners:
+
+- UDP и TCP в baseline build;
+- DoT с `dot`;
+- DoH поверх HTTP/1.1/HTTP/2 и DoH3 поверх HTTP/3 с `doh`;
+- DoQ с `doq`.
+
+Host передаёт TLS/QUIC server configuration и certificate material. DNS Lattice
+не генерирует сертификаты и не запрашивает privileged ports. Resolver errors
+представляются DNS `SERVFAIL` answers там, где inbound protocol содержит
+валидный DNS request, на который можно ответить; malformed requests без
+надёжной DNS transaction identity обрабатываются согласно documented protocol
+validation конкретного listener.
+
+## Конкурентность и ownership
+
+- Resolver operations асинхронны и могут выполняться конкурентно.
+- Shared mutable state синхронизирован внутри и не выставляется как
+  unsynchronized public interior mutability.
+- Server lifecycle явный: configure, bind, serve, shutdown.
+- Нет process-wide resolver/cache/hook/sink/Fake IP singleton.
+- Cancellation выражается drop futures, а не скрытым worker ownership в core
+  resolver path.
+
+## Контракт платформ и валидации
+
+Стадия 0.6 делает cross-platform обещание исполняемым в CI. Linux, Windows и
+macOS запускают workspace format/lint/check/test/doc validation. Facade также
+проходит strict per-feature check/test/rustdoc для:
+
+- `--no-default-features`;
+- `dot`;
+- `doh`;
+- `doq`;
+- `--all-features`.
+
+CI дополнительно перечисляет package contents workspace и запускает hermetic
+release-automation regression. Эти validation paths не публикуют crates и не
+требуют privileged OS networking.
+
+## Граница стабилизации стадии 1.0
+
+Роадмап реализации до стадии 0.6 включительно завершён, но API не считается
+стабильным до 1.0. Стадия 1.0 намеренно посвящена обязательству по контракту,
+а не новой feature family. До `1.0.0` проект должен:
+
+- провести аудит каждого public module/type/trait/method и убрать случайно
+  выставленный surface;
+- определить и задокументировать compatibility surface, защищаемый SemVer;
+- согласовать naming и ergonomics там, где до 1.0 ещё оправдан breaking cleanup;
+- проверить package contents и docs.rs behavior для финального public surface;
+- синхронизировать README, architecture, roadmap, changelog, security/support
+  и crate documentation с замороженным API;
+- опубликовать первый стабильный crates.io release.
+
+После `1.0.0` к замороженному публичному контракту применяются обычные
+требования SemVer compatibility.

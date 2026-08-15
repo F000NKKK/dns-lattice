@@ -7,17 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Stage 0.6 hardening is tracked here: cross-platform verification,
-  parser and matcher fuzz/property coverage, structured observability, and
-  release/package validation improvements.
-- CI now lists every workspace package archive and runs the hermetic
-  GitHub-release automation regression alongside the existing strict,
-  per-feature rustdoc matrix. These checks do not publish crates or contact
-  external release services.
+No changes recorded after the stage-0.6 release boundary yet.
+
+## [0.6.0] - 2026-08-15
+
+- Completed stage 0.6 hardening and platform validation. Linux, Windows, and
+  macOS now run the workspace checks plus a facade feature matrix covering
+  `no-default-features`, `dot`, `doh`, `doq`, and `all-features`; each
+  supported feature selection also passes rustdoc with warnings denied.
+- Added deterministic property-style regression coverage for DNS message
+  parsing and compression bounds, domain-matcher precedence, resolver cache
+  identity, and Fake IP TTL/expiry/LRU eviction invariants.
 - Added the opt-in `observability::ObservabilitySink` boundary with immutable,
-  bounded query/cache/Fake IP/hook/upstream/timeout/error events. Sink output
-  is non-authoritative and isolated from resolver routing, caching, retries,
-  and answers.
+  bounded query/cache/Fake IP/route-hook/upstream/timeout/terminal events.
+  Sink output is non-authoritative, callbacks run without resolver locks,
+  callback panics are isolated, and sinks receive no resolver/backend handles
+  or authority to alter routing, caching, retries, or answers.
+- Hardened packaging and release validation: CI lists every workspace package
+  archive and runs the hermetic GitHub-release automation regression alongside
+  the strict feature/rustdoc matrix. These validation jobs do not publish
+  crates or contact external release services.
+- Reconciled public documentation, crate-local README files, security/support
+  policy, contribution guidance, architecture/status summaries, and EN/RU
+  roadmap state so stage 0.6 is recorded as complete. Stage 1.0 is now the
+  next development milestone and will freeze/audit the public API before the
+  first stable release.
 
 ## [0.5.0] - 2026-08-14
 

@@ -120,25 +120,31 @@ Status: done; published in 0.5.0
 
 ## Stage 0.6 — Hardening and platform validation
 
-Status: active
+Status: done; prepared for the 0.6.0 release
 
-- Implemented on `main`: Linux/Windows/macOS CI exercises every supported
-  feature selection with strict per-feature rustdoc checks; package contents
-  and release-automation regression are also checked hermetically.
-- Implemented on `main`: deterministic property-style coverage for message
-  parsing/compression bounds, matcher precedence, resolver cache identity,
-  and Fake IP expiry/eviction invariants.
-- Implemented on `main`: opt-in `observability::ObservabilitySink` emits
-  immutable, bounded query/cache/route/hook/upstream/terminal events without
-  client data, handles, or authority over resolution.
-- Remaining: external cross-platform CI confirmation and final release/docs
-  reconciliation; no stage 0.6 release has been published.
-- Keep English/Russian rustdoc, crate READMEs, root docs, CHANGELOG, SECURITY,
-  SUPPORT, and CONTRIBUTING synchronized as each hardening contract lands.
+- Linux/Windows/macOS CI exercises every supported feature selection with
+  strict per-feature rustdoc checks; package contents and release-automation
+  regression are also checked hermetically.
+- Deterministic property-style coverage protects message parsing/compression
+  bounds, matcher precedence, resolver cache identity, and Fake IP
+  expiry/eviction invariants.
+- Opt-in `observability::ObservabilitySink` emits immutable, bounded
+  query/cache/route/hook/upstream/terminal events without client data,
+  handles, or authority over resolution.
+- External cross-platform verification is complete: the final stage-0.6
+  `main` CI run passed the workspace checks on Linux, Windows, and macOS;
+  `no-default-features`, `dot`, `doh`, `doq`, and `all-features` facade
+  matrices; strict rustdoc; package listing; and release-automation smoke.
+- English/Russian public documentation, crate READMEs, CHANGELOG, SECURITY,
+  SUPPORT, CONTRIBUTING, architecture/status summaries, and release guidance
+  are reconciled as part of the stage-0.6 release preparation.
+- No implementation work remains in stage 0.6. The remaining release action
+  is the mechanical version bump/publication performed by the repository
+  release script.
 
 ## Stage 1.0 — Stable public API and first stable release
 
-Status: planned
+Status: planned; next development stage after 0.6.0 publication
 
 - Public API frozen; SemVer commitment recorded.
 - `cargo package` verified for the crate; docs.rs build verified.

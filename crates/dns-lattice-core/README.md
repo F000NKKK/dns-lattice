@@ -7,14 +7,14 @@ system dependency.
 ## What it provides
 
 - `Error`, one enum covering every DNS Lattice failure mode (message
-  decode/encode, domain pattern parsing, upstream transport, and Fake IP
-  pool configuration);
+  decode/encode, domain pattern parsing, upstream transport, Fake IP pool
+  configuration, route-hook validation, and related resolver failures);
 - `Result<T>`, the `Result<T, Error>` alias used across the workspace.
 
 Most applications should use these types through the `dns-lattice` crate
 rather than depending on this crate directly. Depend on it directly when
-implementing a component that needs to return `dns-lattice`'s error type
-without depending on the rest of `dns-lattice`.
+implementing a component that needs to return DNS Lattice's error type
+without depending on the rest of the facade crate.
 
 ## Usage
 
@@ -34,6 +34,7 @@ assert!(decode_class(9999).is_err());
 
 ## Status
 
-Version `0.5.0` is published and this crate remains pre-1.0. Types and
-variants may change without notice until `dns-lattice` reaches its first
-stable release.
+Stage 0.6 is complete and this crate is part of the `0.6.x` pre-1.0 release
+line. Its API may still change while DNS Lattice performs the stage-1.0
+public-API freeze and compatibility audit; ordinary stable SemVer guarantees
+begin with `1.0.0`.

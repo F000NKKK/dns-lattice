@@ -127,25 +127,31 @@
 
 ## Стадия 0.6 — Укрепление и валидация платформ
 
-Статус: active
+Статус: done; подготовлена к релизу 0.6.0
 
-- Реализовано в `main`: CI Linux/Windows/macOS проверяет каждую поддержанную
-  комбинацию фич со строгим per-feature rustdoc; package listings и regression
-  release automation также проверяются hermetic-режимом.
-- Реализовано в `main`: детерминированное property-style покрытие parsing/
-  compression bounds, matcher precedence, cache identity резолвера и
-  инвариантов Fake IP TTL/LRU.
-- Реализовано в `main`: opt-in `observability::ObservabilitySink` передаёт
-  неизменяемые ограниченные query/cache/route/hook/upstream/terminal события
-  без client data, handles и права влиять на резолвинг.
-- Осталось: внешнее подтверждение cross-platform CI и финальное согласование
-  release/docs; релиз стадии 0.6 ещё не опубликован.
-- Синхронизация EN/RU rustdoc, README крейтов, корневых документов,
-  CHANGELOG, SECURITY, SUPPORT и CONTRIBUTING при каждом изменении контракта.
+- CI Linux/Windows/macOS проверяет каждую поддержанную комбинацию фич со
+  строгим per-feature rustdoc; package listings и regression release
+  automation также проверяются hermetic-режимом.
+- Детерминированное property-style покрытие защищает parsing/compression
+  bounds, matcher precedence, cache identity резолвера и инварианты Fake IP
+  TTL/LRU.
+- Opt-in `observability::ObservabilitySink` передаёт неизменяемые
+  ограниченные query/cache/route/hook/upstream/terminal события без client
+  data, handles и права влиять на резолвинг.
+- Внешняя кроссплатформенная верификация завершена: финальный CI стадии 0.6
+  прошёл workspace-проверки на Linux, Windows и macOS; матрицы facade для
+  `no-default-features`, `dot`, `doh`, `doq` и `all-features`; строгий
+  rustdoc; package listing и smoke release automation.
+- Публичная документация EN/RU, README крейтов, CHANGELOG, SECURITY, SUPPORT,
+  CONTRIBUTING, архитектурные/status-сводки и release guidance согласованы в
+  рамках подготовки релиза стадии 0.6.
+- Реализационных задач в стадии 0.6 больше нет. Оставшееся действие релиза —
+  механический bump версий и публикация через штатный release-скрипт
+  репозитория.
 
 ## Стадия 1.0 — Стабильный публичный API и первый стабильный релиз
 
-Статус: planned
+Статус: planned; следующая стадия разработки после публикации 0.6.0
 
 - Заморозка публичного API; зафиксировано обязательство по SemVer.
 - Проверен `cargo package` для крейта; проверена сборка на docs.rs.
