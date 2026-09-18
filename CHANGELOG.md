@@ -7,12 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-09-18
+## [1.1.0] - 2026-09-18
 
-### Fixed
+### Changed
 
-- Documentation-only patch, no source or public API change. Reconciled every
-  published doc (`README.md`/`README.ru.md`, `ARCHITECTURE.md`/`.ru.md`,
+- Documentation-only release, no source or public API change. Reconciled
+  every published doc (`README.md`/`README.ru.md`, `ARCHITECTURE.md`/`.ru.md`,
   `ROADMAP.md`/`.ru.md`, `SECURITY.md`, `SUPPORT.md`, `CONTRIBUTING.md`,
   `index.md`, all three crate READMEs) that still read as pre-1.0.0 after the
   `1.0.0` release: stale `dns-lattice = "0.6"` installation snippets, crate
@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `README.md`/`README.ru.md` capability-status row still marked "⏳ Stage
   1.0" for the now-shipped SemVer guarantee, and present-tense "Stage 0.6
   validates/adds ..." phrasing that read as ongoing work rather than a
-  completed, historical stage.
+  completed, historical stage. Also generalized every hardcoded "1.0.0 is
+  published" status banner to reference the stable `1.x` line instead of a
+  single patch version, so this class of edit does not recur on every future
+  release.
 
 ## [1.0.0] - 2026-09-18
 
