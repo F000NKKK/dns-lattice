@@ -25,6 +25,6 @@ network or OS responsibilities into this crate.
 
 ## Status
 
-Stage 0.6 is complete and this crate is part of the `0.6.x` pre-1.0 release
-line. Its public model may still evolve during the stage-1.0 API freeze and
-compatibility audit; ordinary stable SemVer guarantees begin with `1.0.0`.
+**1.0.0 is published** on crates.io. The public model is frozen; ordinary
+SemVer guarantees apply within the `1.x` line — a breaking change requires
+an explicit major version bump.

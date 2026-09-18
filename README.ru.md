@@ -70,7 +70,7 @@ Baseline UDP/TCP не требует TLS/HTTP/QUIC features:
 
 ```toml
 [dependencies]
-dns-lattice = "0.6"
+dns-lattice = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -78,7 +78,7 @@ Encrypted transports включаются только при необходим
 
 ```toml
 [dependencies]
-dns-lattice = { version = "0.6", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.0", features = ["dot", "doh", "doq"] }
 ```
 
 Cargo features независимы и выключены по умолчанию:

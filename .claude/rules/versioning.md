@@ -7,17 +7,16 @@
   scoping issues. The historical `Sprint DL: 0.1` import (stages 0.0-0.2,
   see `DL-2`) predates per-stage Sprint tracking and does not itself imply a
   `0.1.x` release line beyond what already shipped.
-- Stages through 0.6 are complete. Stage 0.6 maps to the `0.6.x` release line
-  and is the final pre-1.0 implementation/hardening milestone in the current
-  roadmap. Stage 1.0 is next and establishes the first stable public API and
-  stable SemVer contract.
-- Before 1.0, a Sprint's release is allowed to change the public API
-  meaningfully — add, remove, or reshape public types/traits/methods — as
-  normal roadmap evolution, provided the change is recorded in an ADR (see
-  `@.claude/rules/youtrack.md`) and in `CHANGELOG.md`. Do not treat a pre-1.0
-  minor bump as a compatibility guarantee, and do not block a design on
-  preserving a pre-1.0 import path purely for compatibility's sake.
-- Once a crate reaches `1.0.0`, ordinary SemVer discipline applies within a
+- Stages through 1.0 are complete. `dns-lattice`, `dns-lattice-core`, and
+  `dns-lattice-model` are published as `1.0.0` on crates.io; the public API
+  is frozen and the stable SemVer contract is in effect.
+- Before 1.0 (historical: applied through the stage-0.6 release line), a
+  Sprint's release was allowed to change the public API meaningfully — add,
+  remove, or reshape public types/traits/methods — as normal roadmap
+  evolution, provided the change was recorded in an ADR (see
+  `@.claude/rules/youtrack.md`) and in `CHANGELOG.md`. A pre-1.0 minor bump
+  was never a compatibility guarantee.
+- Now that `1.0.0` has shipped, ordinary SemVer discipline applies within a
   major version (`1.x`, `2.x`, ...): additive public API belongs in minor
   releases, compatible fixes in patch releases, and breaking public-contract
   changes require an explicitly user-authorized major-version bump.

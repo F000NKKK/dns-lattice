@@ -14,7 +14,7 @@ Baseline UDP/TCP:
 
 ```toml
 [dependencies]
-dns-lattice = "0.6"
+dns-lattice = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -22,7 +22,7 @@ Encrypted DNS transports are opt-in:
 
 ```toml
 [dependencies]
-dns-lattice = { version = "0.6", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.0", features = ["dot", "doh", "doq"] }
 ```
 
 Features are independent and default-off:
@@ -254,17 +254,15 @@ their own hook/sink implementations are responsible for those effects.
 
 ## Status
 
-Stages 0.0 through 0.6 are complete. This crate belongs to the `0.6.x` pre-1.0
-release line, including Fake IP, dynamic route hooks, structured observability,
-cross-platform feature validation, deterministic hardening coverage, and
-package/release regression checks.
+**1.0.0 is published** on crates.io. Stages 0.0 through 1.0 are complete:
+Fake IP, dynamic route hooks, structured observability, cross-platform
+feature validation, deterministic hardening coverage, package/release
+regression checks, full rustdoc coverage, and the public-API freeze audit
+are all done.
 
-There is no remaining stage-0.6 implementation work. The next development
-milestone is stage 1.0: audit and freeze the public API, establish the stable
-SemVer contract, perform final package/docs.rs verification, and publish the
-first stable release.
-
-Until `1.0.0`, the public API may still change.
+Within the `1.x` line, ordinary SemVer now applies: additive changes are
+minor releases, fixes are patch releases, and a breaking change requires an
+explicit major version bump.
 
 Repository: https://github.com/F000NKKK/dns-lattice
 
