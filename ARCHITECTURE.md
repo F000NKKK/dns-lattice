@@ -3,12 +3,13 @@
 Status: implemented through stage 1.0. The code, tests, cross-platform feature
 matrix, observability boundary, package validation, release automation, and
 the public-API freeze audit are all complete. `dns-lattice`,
-`dns-lattice-core`, and `dns-lattice-model` are published as `1.0.0` on
-crates.io; the public API now follows ordinary SemVer within the `1.x` line.
+`dns-lattice-core`, and `dns-lattice-model` are published on crates.io as
+stable `1.x` releases (see `CHANGELOG.md` for the current version); the
+public API follows ordinary SemVer within the `1.x` line.
 
-This document describes the architecture at the stable 1.0.0 release
-boundary. Update it whenever a future minor/major release changes a public
-contract.
+This document describes the architecture at the stable `1.x` release
+boundary established by `1.0.0`. Update it whenever a future minor/major
+release changes a public contract.
 
 ## Scope and role in the Lattice ecosystem
 

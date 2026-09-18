@@ -34,6 +34,6 @@ assert!(decode_class(9999).is_err());
 
 ## Status
 
-**1.0.0 is published** on crates.io. The public API is frozen; ordinary
-SemVer guarantees apply within the `1.x` line — a breaking change requires
-an explicit major version bump.
+**Stable `1.x` releases are published** on crates.io. The public API is
+frozen; ordinary SemVer guarantees apply within the `1.x` line — a breaking
+change requires an explicit major version bump.

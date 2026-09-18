@@ -254,11 +254,11 @@ their own hook/sink implementations are responsible for those effects.
 
 ## Status
 
-**1.0.0 is published** on crates.io. Stages 0.0 through 1.0 are complete:
-Fake IP, dynamic route hooks, structured observability, cross-platform
-feature validation, deterministic hardening coverage, package/release
-regression checks, full rustdoc coverage, and the public-API freeze audit
-are all done.
+**Stable `1.x` releases are published** on crates.io. Stages 0.0 through 1.0
+are complete: Fake IP, dynamic route hooks, structured observability,
+cross-platform feature validation, deterministic hardening coverage,
+package/release regression checks, full rustdoc coverage, and the
+public-API freeze audit are all done.
 
 Within the `1.x` line, ordinary SemVer now applies: additive changes are
 minor releases, fixes are patch releases, and a breaking change requires an

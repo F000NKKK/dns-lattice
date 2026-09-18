@@ -8,8 +8,9 @@
   see `DL-2`) predates per-stage Sprint tracking and does not itself imply a
   `0.1.x` release line beyond what already shipped.
 - Stages through 1.0 are complete. `dns-lattice`, `dns-lattice-core`, and
-  `dns-lattice-model` are published as `1.0.0` on crates.io; the public API
-  is frozen and the stable SemVer contract is in effect.
+  `dns-lattice-model` are published as stable `1.x` releases on crates.io
+  (see `CHANGELOG.md` for the current version); the public API is frozen
+  and the stable SemVer contract is in effect since `1.0.0`.
 - Before 1.0 (historical: applied through the stage-0.6 release line), a
   Sprint's release was allowed to change the public API meaningfully — add,
   remove, or reshape public types/traits/methods — as normal roadmap

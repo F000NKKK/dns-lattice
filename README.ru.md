@@ -20,10 +20,11 @@ Rust. Он предоставляет split DNS, кэширование, Fake IP
 владеет процессом и конфигурацией, а DNS Lattice отвечает за DNS protocol
 handling, resolution, serving, routing, cache behavior и transport execution.
 
-> **Статус:** **1.0.0 опубликован** на crates.io (`dns-lattice`,
-> `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0 завершены:
-> публичный API заморожен, воркспейс следует обычной SemVer-дисциплине внутри
-> линейки `1.x` — breaking change требует явного мажорного бампа.
+> **Статус:** **стабильные релизы `1.x` опубликованы** на crates.io
+> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0
+> завершены: публичный API заморожен, воркспейс следует обычной
+> SemVer-дисциплине внутри линейки `1.x` — breaking change требует явного
+> мажорного бампа. Текущую версию см. в [CHANGELOG.md](CHANGELOG.md).
 
 ## Зачем нужен DNS Lattice
 

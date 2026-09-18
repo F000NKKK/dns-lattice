@@ -2,11 +2,11 @@
 
 Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks.
 
-This repository has reached its 1.0.0 stable release: repository workflow,
-policies, packaging, the DNS model, resolver/cache, upstream transports,
-inbound listeners, Fake IP, dynamic routing hooks, the stage-0.6 hardening
-surface, and the stage-1.0 public-API freeze are all implemented.
-`ARCHITECTURE.md` /
+This repository has reached its stable `1.x` release line: repository
+workflow, policies, packaging, the DNS model, resolver/cache, upstream
+transports, inbound listeners, Fake IP, dynamic routing hooks, the stage-0.6
+hardening surface, and the stage-1.0 public-API freeze are all implemented.
+See `CHANGELOG.md` for the current published version. `ARCHITECTURE.md` /
 `ARCHITECTURE.ru.md` record the design and `ROADMAP.md` / `ROADMAP.ru.md`
 sequence the delivery stages; read both before starting or continuing work.
 Task-specific plans, evidence, and decisions live in the YouTrack project

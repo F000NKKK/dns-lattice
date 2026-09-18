@@ -21,11 +21,12 @@ application owns the process and configuration, while DNS Lattice owns DNS
 protocol handling, resolution, serving, routing, cache behavior, and transport
 execution.
 
-> **Status:** **1.0.0 is published** on crates.io (`dns-lattice`,
-> `dns-lattice-core`, `dns-lattice-model`). Stages 0.0 through 1.0 are
-> complete: the public API is frozen and the workspace now follows ordinary
-> SemVer within the `1.x` line — a breaking change requires an explicit major
-> version bump.
+> **Status:** **stable `1.x` releases are published** on crates.io
+> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Stages 0.0
+> through 1.0 are complete: the public API is frozen and the workspace
+> follows ordinary SemVer within the `1.x` line — a breaking change requires
+> an explicit major version bump. See [CHANGELOG.md](CHANGELOG.md) for the
+> current version.
 
 ## Why DNS Lattice
 
