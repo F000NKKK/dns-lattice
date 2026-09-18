@@ -282,6 +282,8 @@
 //! use dns_lattice::DoqBackendConfig;
 //! ```
 
+#![warn(missing_docs)]
+
 pub mod engine;
 pub mod fakeip;
 /// Shared error and result types.

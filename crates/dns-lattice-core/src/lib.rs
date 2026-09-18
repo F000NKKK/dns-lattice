@@ -5,6 +5,8 @@
 //! operating-system dependency — those belong to `dns-lattice` itself and
 //! its future modules. See `ARCHITECTURE.md` for the full rationale.
 
+#![warn(missing_docs)]
+
 mod error;
 
 pub use error::Error;

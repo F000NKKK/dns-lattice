@@ -8,6 +8,8 @@
 //! No network I/O, no operating-system dependency — see `ARCHITECTURE.md`
 //! for the crate's non-goals at this stage.
 
+#![warn(missing_docs)]
+
 pub mod matcher;
 pub mod message;
 pub mod policy;
