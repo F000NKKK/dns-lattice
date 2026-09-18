@@ -159,7 +159,7 @@ Canonical public paths are:
 from that policy.
 
 The matching/model layer performs no network I/O and has no OS dependency.
-Stage-0.6 hardening adds deterministic property-style coverage for matcher
+Stage-0.6 hardening added deterministic property-style coverage for matcher
 precedence, message parsing, and DNS name compression bounds.
 
 ## Cache semantics
@@ -295,7 +295,7 @@ privileged-port setup.
 
 MSRV: **Rust 1.93**.
 
-Stage 0.6 validates the supported facade surface on:
+CI validates the supported facade surface on:
 
 - Linux;
 - Windows;

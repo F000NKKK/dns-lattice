@@ -19,7 +19,7 @@ crate rather than depending on this crate directly. Depend on it directly
 when implementing a component that needs the DNS model without the rest of
 `dns-lattice`.
 
-Stage-0.6 hardening adds deterministic property-style verification around
+Stage-0.6 hardening added deterministic property-style verification around
 message parsing/compression bounds and matcher precedence without introducing
 network or OS responsibilities into this crate.
 

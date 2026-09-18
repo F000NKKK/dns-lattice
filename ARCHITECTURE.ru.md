@@ -164,7 +164,7 @@ DNS Lattice не выполняет молчаливый fallback к друго�
 - `UpstreamGroupId` и `SplitDnsPolicy`.
 
 Некорректный input должен возвращать typed error, а не panic или бесконечный
-цикл. Hardening стадии 0.6 добавляет детерминированное property-style покрытие
+цикл. Hardening стадии 0.6 добавил детерминированное property-style покрытие
 parsing, compression bounds и matcher precedence.
 
 ## Контракт кэша
@@ -288,9 +288,9 @@ validation конкретного listener.
 
 ## Контракт платформ и валидации
 
-Стадия 0.6 делает cross-platform обещание исполняемым в CI. Linux, Windows и
-macOS запускают workspace format/lint/check/test/doc validation. Facade также
-проходит strict per-feature check/test/rustdoc для:
+Cross-platform обещание исполняемо в CI. Linux, Windows и macOS запускают
+workspace format/lint/check/test/doc validation. Facade также проходит
+strict per-feature check/test/rustdoc для:
 
 - `--no-default-features`;
 - `dot`;

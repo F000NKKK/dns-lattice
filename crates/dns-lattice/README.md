@@ -227,7 +227,7 @@ certificates remain host responsibilities.
 
 ## Platform and validation contract
 
-The 0.6 release surface is validated on Linux, Windows, and macOS. CI runs the
+The supported surface is validated on Linux, Windows, and macOS. CI runs the
 workspace format/lint/check/test/doc gates and strict facade check/test/rustdoc
 for:
 

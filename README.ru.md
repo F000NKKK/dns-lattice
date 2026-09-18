@@ -157,7 +157,7 @@ matching и `SplitDnsPolicy`. Resolver сначала получает стат�
 upstream group из этой policy.
 
 Model/matcher слой не выполняет network I/O и не зависит от ОС. Hardening
-стадии 0.6 добавляет детерминированное property-style покрытие matcher
+стадии 0.6 добавил детерминированное property-style покрытие matcher
 precedence, message parsing и DNS name compression bounds.
 
 ## Семантика кэша
@@ -291,7 +291,7 @@ DNS Lattice не выпускает сертификаты и не владее�
 
 MSRV: **Rust 1.93**.
 
-Стадия 0.6 валидирует поддерживаемый facade surface на:
+CI валидирует поддерживаемый facade surface на:
 
 - Linux;
 - Windows;

@@ -160,7 +160,7 @@ after the hook has failed or selected an invalid route.
 - `UpstreamGroupId` and `SplitDnsPolicy`.
 
 Malformed input must return typed errors rather than panic or loop. Stage-0.6
-hardening adds deterministic property-style coverage for parsing, compression
+hardening added deterministic property-style coverage for parsing, compression
 bounds, and matcher precedence.
 
 ## Cache contract
@@ -284,9 +284,9 @@ protocol validation behavior.
 
 ## Platform and validation contract
 
-Stage 0.6 makes the cross-platform promise executable in CI. Linux, Windows,
-and macOS run workspace format/lint/check/test/doc validation. The facade also
-runs strict per-feature check/test/rustdoc coverage for:
+The cross-platform promise is executable in CI. Linux, Windows, and macOS run
+workspace format/lint/check/test/doc validation. The facade also runs strict
+per-feature check/test/rustdoc coverage for:
 
 - `--no-default-features`;
 - `dot`;
