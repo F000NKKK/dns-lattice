@@ -4,26 +4,27 @@ Thank you for your interest in contributing to DNS Lattice.
 
 ## Project Status
 
-DNS Lattice is pre-1.0, but the implementation roadmap through stage 0.6 is
-complete. The repository now contains the DNS message/matcher/policy model,
-resolver/cache, UDP/TCP/DoT/DoH/DoQ upstream transports, failover, matching
-inbound server listeners, Fake IP synthesis and snapshots, dynamic
-route-selection hooks, structured observability, deterministic hardening
-coverage, cross-platform feature-matrix CI, strict per-feature rustdoc checks,
-package validation, and release-automation regression coverage.
+DNS Lattice reached its first stable release, `1.0.0` (`dns-lattice`,
+`dns-lattice-core`, `dns-lattice-model` on crates.io). The repository
+contains the DNS message/matcher/policy model, resolver/cache,
+UDP/TCP/DoT/DoH/DoQ upstream transports, failover, matching inbound server
+listeners, Fake IP synthesis and snapshots, dynamic route-selection hooks,
+structured observability, deterministic hardening coverage, cross-platform
+feature-matrix CI, strict per-feature rustdoc checks, package validation, and
+release-automation regression coverage.
 
-Stage 0.6 defines the `0.6.0` release line and has no remaining implementation
-work; the repository release script owns the mechanical version bump and
-publication step. The next development milestone is stage 1.0. Until the first
-stable release ships, the public API may still change.
+The public API is now frozen: within the `1.x` line, ordinary SemVer applies
+— additive changes land as minor releases, fixes as patch releases, and a
+breaking change requires an explicit major version bump.
 
 The most valuable contributions now are:
 
-- public-API audit and ergonomics review ahead of the 1.0 freeze;
-- compatibility and SemVer-boundary review across the facade modules;
-- documentation, examples, and docs.rs polish for the stable release;
+- documentation, examples, and docs.rs polish;
+- ergonomics review that stays within the frozen `1.x` compatibility
+  contract;
 - package/release reproducibility and cross-platform validation improvements;
-- focused bug fixes with deterministic regression coverage.
+- focused bug fixes with deterministic regression coverage;
+- design discussion for new capability domains beyond the current 1.0 scope.
 
 Please check open issues and discussions before starting significant work, to
 avoid duplicated effort.

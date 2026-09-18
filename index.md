@@ -2,10 +2,11 @@
 
 Programmable Rust DNS control plane for the Lattice networking stack: split DNS, Fake IP, address pools, and dynamic routing hooks.
 
-This repository is past its bootstrap and pre-1.0 implementation stages:
-repository workflow, policies, packaging, the DNS model, resolver/cache,
-upstream transports, inbound listeners, Fake IP, dynamic routing hooks, and
-the stage-0.6 hardening surface are all implemented. `ARCHITECTURE.md` /
+This repository has reached its 1.0.0 stable release: repository workflow,
+policies, packaging, the DNS model, resolver/cache, upstream transports,
+inbound listeners, Fake IP, dynamic routing hooks, the stage-0.6 hardening
+surface, and the stage-1.0 public-API freeze are all implemented.
+`ARCHITECTURE.md` /
 `ARCHITECTURE.ru.md` record the design and `ROADMAP.md` / `ROADMAP.ru.md`
 sequence the delivery stages; read both before starting or continuing work.
 Task-specific plans, evidence, and decisions live in the YouTrack project
@@ -57,19 +58,19 @@ implementation starts.
 
 ## Current status
 
-Stages 0.0 through 0.6 are complete. The 0.6 release line contains the full
+Stages 0.0 through 1.0 are complete. The 0.6 release line contains the full
 pre-1.0 implementation surface: DNS model and matching, static split DNS,
 resolver/cache, UDP/TCP/DoT/DoH/DoQ upstreams and inbound listeners, Fake IP,
 route-selection hooks, structured observability, deterministic hardening
 coverage, cross-platform feature-matrix CI, strict rustdoc gates, package
 validation, and release-automation regression checks.
 
-Stage 0.6 has no remaining implementation work. The repository release script
-owns the mechanical `0.6.0` version bump/publication step. The next development
-stage is 1.0, focused on freezing and auditing the public API, establishing the
-stable SemVer contract, final package/docs.rs verification, and the first
-stable crates.io release. Until that milestone ships, the API remains
-pre-1.0 and may still change.
+Stage 1.0 froze and audited the public API, established the stable SemVer
+contract, verified package/docs.rs behavior, and published `dns-lattice`,
+`dns-lattice-core`, and `dns-lattice-model` as `1.0.0` on crates.io. Within
+the `1.x` line, ordinary SemVer now applies: additive changes are minor
+releases, fixes are patch releases, and a breaking change requires an
+explicit major version bump.
 
 See `CONTRIBUTING.md` and `SUPPORT.md` for contributor and support guidance.
 

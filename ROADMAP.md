@@ -144,11 +144,16 @@ Status: done; prepared for the 0.6.0 release
 
 ## Stage 1.0 — Stable public API and first stable release
 
-Status: planned; next development stage after 0.6.0 publication
+Status: done; published as `1.0.0`
 
-- Public API frozen; SemVer commitment recorded.
-- `cargo package` verified for the crate; docs.rs build verified.
-- First stable release on crates.io.
+- Public API frozen; SemVer commitment recorded — within the `1.x` line,
+  additive changes are minor releases, fixes are patch releases, and a
+  breaking change requires an explicit major version bump.
+- Full rustdoc coverage enforced (`#![warn(missing_docs)]` on every
+  publishable crate; 0 warnings under strict rustdoc).
+- `cargo package` verified for every crate; docs.rs build verified.
+- `dns-lattice`, `dns-lattice-core`, and `dns-lattice-model` published as
+  `1.0.0` on crates.io.
 
 ## Explicitly out of scope for this crate's roadmap
 

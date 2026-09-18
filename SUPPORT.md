@@ -10,7 +10,7 @@ Thank you for your interest in DNS Lattice.
 
 ## Project Status
 
-DNS Lattice remains pre-1.0. Stages 0.1-0.3 delivered the DNS
+DNS Lattice reached its first stable release, `1.0.0`. Stages 0.1-0.3 delivered the DNS
 message/matcher/policy model, resolver/cache, upstream transports, failover,
 and inbound server listeners. Stage 0.4 added opt-in Fake IP synthesis,
 TTL-bound mappings, and caller-owned process-local snapshots. Stage 0.5 added
@@ -19,16 +19,16 @@ group before route-scoped cache lookup, has no OS/network side-effect
 authority, and does not silently fall back after hook failures or invalid
 selections.
 
-Stage 0.6 is complete and defines the `0.6.0` hardening release: the public
-surface now has Linux/Windows/macOS feature-matrix validation, deterministic
+Stage 0.6 defined the `0.6.0` hardening release: the public surface has
+Linux/Windows/macOS feature-matrix validation, deterministic
 parser/matcher/cache/Fake-IP invariant coverage, structured non-authoritative
 resolver observability, strict per-feature rustdoc gates, package-content
-checks, and release-automation regression coverage. The remaining 0.6 release
-operation is the repository's mechanical version bump/publication step; there
-is no remaining stage-0.6 implementation work.
+checks, and release-automation regression coverage.
 
-The next development milestone is stage 1.0: freeze and audit the public API,
-record the stable SemVer commitment, verify final package/docs.rs behavior,
-and publish the first stable release. Until 1.0 ships, the public API is still
-allowed to evolve. Durable Fake IP persistence remains outside the current
-crate scope. Questions, bug reports, and design discussion are welcome.
+Stage 1.0 froze and audited the public API, established the stable SemVer
+commitment, and published `dns-lattice`, `dns-lattice-core`, and
+`dns-lattice-model` as `1.0.0` on crates.io. Within the `1.x` line, the public
+API follows ordinary SemVer: additive changes are minor releases, fixes are
+patch releases, and a breaking change requires an explicit major version
+bump. Durable Fake IP persistence remains outside the current crate scope.
+Questions, bug reports, and design discussion are welcome.

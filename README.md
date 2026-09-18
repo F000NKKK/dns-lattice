@@ -21,12 +21,11 @@ application owns the process and configuration, while DNS Lattice owns DNS
 protocol handling, resolution, serving, routing, cache behavior, and transport
 execution.
 
-> **Status:** stages **0.0 through 0.6 are complete**. Stage 0.6 defines the
-> `0.6.x` hardening release line and has no remaining implementation work. The
-> repository release script owns the mechanical `0.6.0` Cargo version bump and
-> publication. The next development milestone is **1.0**, which freezes and
-> audits the public API before the first stable release. Until `1.0.0`, the API
-> remains pre-1.0 and may change.
+> **Status:** **1.0.0 is published** on crates.io (`dns-lattice`,
+> `dns-lattice-core`, `dns-lattice-model`). Stages 0.0 through 1.0 are
+> complete: the public API is frozen and the workspace now follows ordinary
+> SemVer within the `1.x` line — a breaking change requires an explicit major
+> version bump.
 
 ## Why DNS Lattice
 
@@ -364,16 +363,14 @@ Completed:
 5. **0.4** — Fake IP;
 6. **0.5** — dynamic route hooks;
 7. **0.6** — hardening, cross-platform validation, observability, package and
-   release checks.
+   release checks;
+8. **1.0** — audited/froze the public API, established the stable SemVer
+   contract, and published the first stable release (`dns-lattice`,
+   `dns-lattice-core`, `dns-lattice-model` `1.0.0` on crates.io).
 
-Stage 0.6 has no remaining implementation work. The `0.6.0` release operation
-is the repository's mechanical version bump/publication step.
-
-Next:
-
-8. **1.0** — audit/freeze the public API, establish the stable SemVer contract,
-   perform final package/docs.rs verification, and publish the first stable
-   release.
+The public API is now frozen: within the `1.x` line, additive changes land as
+minor releases and fixes as patch releases; a breaking change requires an
+explicit major version bump.
 
 See [ROADMAP.md](ROADMAP.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the
 full delivery and contract details.

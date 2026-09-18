@@ -1,14 +1,14 @@
 # DNS Lattice architecture
 
-Status: implemented through stage 0.6. The code, tests, cross-platform feature
-matrix, observability boundary, package validation, and release automation for
-the pre-1.0 implementation roadmap are complete. The next architectural
-milestone is stage 1.0: audit and freeze the public API, record the stable
-SemVer contract, and publish the first stable release.
+Status: implemented through stage 1.0. The code, tests, cross-platform feature
+matrix, observability boundary, package validation, release automation, and
+the public-API freeze audit are all complete. `dns-lattice`,
+`dns-lattice-core`, and `dns-lattice-model` are published as `1.0.0` on
+crates.io; the public API now follows ordinary SemVer within the `1.x` line.
 
-This document describes the architecture that exists at the stage-0.6 release
-boundary. Update it when implementation changes a public contract or when the
-stage-1.0 API audit intentionally freezes or reshapes that contract.
+This document describes the architecture at the stable 1.0.0 release
+boundary. Update it whenever a future minor/major release changes a public
+contract.
 
 ## Scope and role in the Lattice ecosystem
 
@@ -300,19 +300,24 @@ crates or require privileged OS networking.
 
 ## Stage 1.0 stabilization boundary
 
-The implementation roadmap through stage 0.6 is complete, but the API is not
-stable until 1.0. Stage 1.0 is intentionally about commitment rather than a
-new feature family. Before `1.0.0` the project must:
+Stage 1.0 was intentionally about commitment rather than a new feature
+family, and is now complete:
 
-- audit every public module/type/trait/method and remove accidental exposure;
-- decide and document the compatibility surface that will be protected by
-  SemVer;
-- reconcile naming and ergonomics where a pre-1.0 breaking cleanup is still
-  justified;
-- verify package contents and docs.rs behavior for the final public surface;
-- synchronize README, architecture, roadmap, changelog, security/support, and
-  crate documentation with the frozen API;
-- publish the first stable crates.io release.
+- audited every public module/type/trait/method for accidental exposure and
+  full rustdoc coverage (`#![warn(missing_docs)]` on every publishable
+  crate; 0 warnings under strict rustdoc);
+- decided and documented the compatibility surface protected by SemVer;
+- verified package contents and docs.rs behavior for the final public
+  surface;
+- synchronized README, architecture, roadmap, changelog, security/support,
+  and crate documentation with the frozen API;
+- published `dns-lattice`, `dns-lattice-core`, and `dns-lattice-model` as
+  `1.0.0` on crates.io.
+
+Within the `1.x` line, ordinary SemVer now applies: additive public API is a
+minor release, compatible fixes are patch releases, and a breaking change to
+anything documented above requires an explicit, user-authorized major
+version bump.
 
 After `1.0.0`, ordinary SemVer compatibility requirements apply to the frozen
 public contract.

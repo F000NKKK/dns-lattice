@@ -3,18 +3,15 @@
 ## Supported Versions
 
 DNS Lattice's crates (`dns-lattice`, `dns-lattice-model`, `dns-lattice-core`)
-use the `0.6.x` line as the supported pre-1.0 release line. Stage 0.6 is
-complete; work after that release moves to the 1.0 public-API stabilization
-milestone. No public API is stable until 1.0.0 ships.
+reached their first stable release, `1.0.0`, published on crates.io. The
+public API is now frozen and follows ordinary SemVer within the `1.x` line.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.6.x   | ✅ |
-| 0.5.x and earlier | ❌ |
+| 1.x     | ✅ |
+| 0.x     | ❌ |
 
-Security fixes target the latest supported `0.6.x` release and the current
-development state on `main` when a fix is also relevant to the upcoming 1.0
-line.
+Security fixes target the latest supported `1.x` release.
 
 ## Reporting a Vulnerability
 
@@ -37,7 +34,7 @@ informed as the issue is investigated and resolved.
 
 ## Scope
 
-The supported 0.6 release surface includes the hand-rolled DNS message model
+The supported `1.x` release surface includes the hand-rolled DNS message model
 (`dns-lattice-model`'s `message`/`record` modules), deterministic domain
 matcher and split-DNS policy types, the shared `dns-lattice-core` error
 boundary, resolver/cache, UDP/TCP/DoT/DoH/DoQ upstream transports and inbound

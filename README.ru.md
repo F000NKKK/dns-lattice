@@ -20,12 +20,10 @@ Rust. Он предоставляет split DNS, кэширование, Fake IP
 владеет процессом и конфигурацией, а DNS Lattice отвечает за DNS protocol
 handling, resolution, serving, routing, cache behavior и transport execution.
 
-> **Статус:** стадии **0.0–0.6 завершены**. Стадия 0.6 определяет
-> hardening-линейку `0.6.x`; реализационных задач в ней больше нет. Штатный
-> release-скрипт репозитория выполняет механический bump Cargo-версий до
-> `0.6.0` и публикацию. Следующий этап разработки — **1.0**: аудит и заморозка
-> публичного API перед первым стабильным релизом. До `1.0.0` API остаётся
-> pre-1.0 и может меняться.
+> **Статус:** **1.0.0 опубликован** на crates.io (`dns-lattice`,
+> `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0 завершены:
+> публичный API заморожен, воркспейс следует обычной SemVer-дисциплине внутри
+> линейки `1.x` — breaking change требует явного мажорного бампа.
 
 ## Зачем нужен DNS Lattice
 
@@ -361,15 +359,14 @@ DNS Lattice не изменяет OS DNS settings, не управляет TUN/T
 5. **0.4** — Fake IP;
 6. **0.5** — dynamic route hooks;
 7. **0.6** — hardening, cross-platform validation, observability, package и
-   release checks.
+   release checks;
+8. **1.0** — аудит/заморозка публичного API, фиксация stable SemVer contract
+   и первый stable release (`dns-lattice`, `dns-lattice-core`,
+   `dns-lattice-model` `1.0.0` на crates.io).
 
-В стадии 0.6 больше нет реализационных задач. Операция релиза `0.6.0` — это
-механический bump версий и публикация штатным release-скриптом.
-
-Следующая стадия:
-
-8. **1.0** — аудит/заморозка публичного API, фиксация stable SemVer contract,
-   финальная package/docs.rs validation и первый stable release.
+Публичный API теперь заморожен: внутри линейки `1.x` аддитивные изменения
+идут минорными релизами, фиксы — патчами; breaking change требует явного
+мажорного бампа.
 
 Полные детали см. в [ROADMAP.ru.md](ROADMAP.ru.md) и
 [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
