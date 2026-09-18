@@ -330,7 +330,7 @@ release automation. Эти проверки не публикуют crates.
 | Structured `ObservabilitySink` | ✅ |
 | Linux/Windows/macOS feature-matrix validation | ✅ |
 | Package/release automation hardening | ✅ |
-| Stable public API / SemVer guarantee | ⏳ Стадия 1.0 |
+| Stable public API / SemVer guarantee | ✅ |
 
 ## Границы экосистемы Lattice
 

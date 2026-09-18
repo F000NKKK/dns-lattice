@@ -7,13 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-18
+
 ### Added
 
-- Stage 1.0 prep: documented every previously-undocumented public item
-  (`dns_lattice::observability::ObserveEvent` variant fields) and added
-  `#![warn(missing_docs)]` to `dns-lattice`, `dns-lattice-core`, and
-  `dns-lattice-model` so full rustdoc coverage is enforced going forward.
-  No public API shape changed.
+- First stable release of `dns-lattice`, `dns-lattice-core`, and
+  `dns-lattice-model` on crates.io. The public API is frozen; within the
+  `1.x` line, additive changes ship as minor releases, compatible fixes as
+  patch releases, and a breaking change requires an explicit major version
+  bump.
+- Stage 1.0 public-API freeze audit: documented every previously-undocumented
+  public item (`dns_lattice::observability::ObserveEvent` variant fields) and
+  added `#![warn(missing_docs)]` to `dns-lattice`, `dns-lattice-core`, and
+  `dns-lattice-model` so full rustdoc coverage is enforced going forward. No
+  public API shape changed from `0.6.0`.
+- Verified `cargo package` contents and a strict, warnings-denied `cargo doc`
+  build across the full feature matrix (`no-default-features`, `dot`, `doh`,
+  `doq`, `all-features`) ahead of publication.
 
 ## [0.6.0] - 2026-08-15
 

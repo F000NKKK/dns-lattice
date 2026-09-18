@@ -334,7 +334,7 @@ the release automation. Those checks do not publish crates.
 | Structured `ObservabilitySink` | ✅ |
 | Linux/Windows/macOS feature-matrix validation | ✅ |
 | Package/release automation hardening | ✅ |
-| Stable public API / SemVer guarantee | ⏳ Stage 1.0 |
+| Stable public API / SemVer guarantee | ✅ |
 
 ## Lattice ecosystem boundaries
 
