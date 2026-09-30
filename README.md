@@ -73,15 +73,15 @@ Baseline UDP/TCP support has no TLS/HTTP/QUIC feature requirement:
 
 ```toml
 [dependencies]
-dns-lattice = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+dns-lattice = "1.1.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
 Enable encrypted transports only when needed:
 
 ```toml
 [dependencies]
-dns-lattice = { version = "1.0", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.1.1", features = ["dot", "doh", "doq"] }
 ```
 
 Cargo features are independent and default-off:

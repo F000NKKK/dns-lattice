@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.12, `rcgen` 0.14.10; `h3` 0.0.8 and `h3-quinn` 0.0.10 were already
   current), matching the versions used across the Lattice ecosystem. No
   public API change; the MSRV stays 1.93.
+- Updated the installation snippets in `README.md`/`README.ru.md` and the
+  `dns-lattice` crate README to `dns-lattice = "1.1.1"` and
+  `tokio = "1.53.1"`.
 
 ## [1.1.0] - 2026-09-18
 

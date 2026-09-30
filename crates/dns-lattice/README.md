@@ -14,15 +14,15 @@ Baseline UDP/TCP:
 
 ```toml
 [dependencies]
-dns-lattice = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+dns-lattice = "1.1.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
 Encrypted DNS transports are opt-in:
 
 ```toml
 [dependencies]
-dns-lattice = { version = "1.0", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.1.1", features = ["dot", "doh", "doq"] }
 ```
 
 Features are independent and default-off:
