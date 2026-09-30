@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised every workspace dependency requirement to its latest release
+  (`async-trait` 0.1.92, `tokio` 1.53.1, `rustls` 0.23.45,
+  `rustls-pki-types` 1.15.1, `tokio-rustls` 0.26.6, `webpki-roots` 1.0.9,
+  `hyper` 1.11.1, `hyper-util` 0.1.21, `hyper-rustls` 0.27.10, `http`
+  1.5.0, `http-body-util` 0.1.5, `bytes` 1.12.1, `base64` 0.23.1, `quinn`
+  0.11.12, `rcgen` 0.14.10; `h3` 0.0.8 and `h3-quinn` 0.0.10 were already
+  current), matching the versions used across the Lattice ecosystem. No
+  public API change; the MSRV stays 1.93.
+
 ## [1.1.0] - 2026-09-18
 
 ### Changed
