@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-01
+
+### Changed
+
+- Restyled the root and crate READMEs (English and Russian): centered
+  header with badges and navigation, grouped key features, a transport and
+  platform support matrix, installation per feature, quick start and new
+  examples (split DNS with failover, DoT upstream, Fake IP, observability,
+  graceful shutdown), performance design notes, a comparison section, API
+  overview, and collapsible troubleshooting. All existing technical
+  content is kept, and the crate READMEs use absolute links for crates.io.
+  Installation snippets now name `1.1.2`. No code change.
+
 ## [1.1.1] - 2026-09-30
 
 ### Changed

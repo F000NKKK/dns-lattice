@@ -1,31 +1,72 @@
-# dns-lattice
+<div align="center">
+
+# 🧭 dns-lattice
+
+### A Programmable, Embeddable DNS Resolver and Server Engine for Rust
+
+[![crates.io](https://img.shields.io/crates/v/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
+[![docs.rs](https://img.shields.io/docsrs/dns-lattice)](https://docs.rs/dns-lattice)
+[![Downloads](https://img.shields.io/crates/d/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
+[![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
+
+![Linux](https://img.shields.io/badge/Linux-supported-success)
+![Windows](https://img.shields.io/badge/Windows-supported-success)
+![macOS](https://img.shields.io/badge/macOS-supported-success)
+
+[Overview](#-overview) • [Features](#-key-features) • [Feature Flags](#-feature-flags) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Pipeline](#-resolver-pipeline) • [Transports](#-upstream-transports)
+
+</div>
+
+---
+
+## 📖 Overview
 
 Programmable, embeddable DNS resolver/server engine for Rust: split DNS,
 TTL-aware caching, Fake IP, dynamic route selection, structured observability,
 and UDP/TCP/DoT/DoH/DoQ transports.
 
-This is the recommended application-facing crate in the DNS Lattice workspace.
-It re-exports the protocol/model and shared error layers through canonical
+This is the recommended application-facing crate in the
+[DNS Lattice](https://github.com/F000NKKK/dns-lattice) workspace. It
+re-exports the protocol/model and shared error layers through canonical
 domain modules and contains the resolver/server runtime implementation.
 
-## Installation
+### 🎯 Why dns-lattice?
 
-Baseline UDP/TCP:
+- **🔀 Split DNS first**: every query is routed to a named upstream group by
+  deterministic exact/suffix/wildcard rules.
+- **🧊 Route-scoped cache**: equal questions sent to different groups never
+  share an answer.
+- **🎭 Fake IP built in**, as a terminal answer path before routing.
+- **🪝 Selection-only hooks**: pick the upstream group per question without
+  receiving any resolver, backend, or OS handle.
+- **🔐 Every transport, both directions**: UDP, TCP, DoT, DoH (HTTP/1.1,
+  HTTP/2, HTTP/3), and DoQ, as upstream clients and inbound listeners.
 
-```toml
-[dependencies]
-dns-lattice = "1.1.1"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
-```
+## 🌟 Key Features
 
-Encrypted DNS transports are opt-in:
+- ✅ `Resolver` / `ResolverBuilder`: static split DNS, optional route hook,
+  TTL and negative cache scoped by upstream group, ordered failover
+- ✅ `UpstreamBackend` with built-in UDP, TCP, DoT, DoH, DoH3, and DoQ
+  backends; implement the trait for your own transport
+- ✅ `Server` / `ServerBuilder`: inbound listeners on the same transports
+  over a shared `Arc<Resolver>`, with `serve` and `serve_until`
+- ✅ `FakeIpPool` / `FakeIpPolicy`: synthetic IPv4/IPv6 answers with reverse
+  lookup, LRU eviction, TTLs, and snapshots
+- ✅ `RouteHook` and `ObservabilitySink`: dynamic routing and structured
+  events without giving away control
 
-```toml
-[dependencies]
-dns-lattice = { version = "1.1.1", features = ["dot", "doh", "doq"] }
-```
+## 🎛️ Feature Flags
 
 Features are independent and default-off:
+
+| Feature | Adds | Main dependencies |
+|---------|------|-------------------|
+| *(none)* | UDP and TCP, client and server | `tokio` |
+| `dot` | DNS-over-TLS | `rustls`, `tokio-rustls`, `webpki-roots` |
+| `doh` | DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3 | `hyper`, `hyper-rustls`, `h3`, `quinn` |
+| `doq` | DNS-over-QUIC, without the HTTP stack | `quinn`, `rustls`, `webpki-roots` |
 
 - `dot` — DNS-over-TLS;
 - `doh` — DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3;
@@ -33,21 +74,89 @@ Features are independent and default-off:
 
 MSRV: Rust 1.93.
 
-## Public surface
+## 📦 Installation
+
+Baseline UDP/TCP:
+
+```toml
+[dependencies]
+dns-lattice = "1.1.2"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+```
+
+Encrypted DNS transports are opt-in:
+
+```toml
+[dependencies]
+dns-lattice = { version = "1.1.2", features = ["dot", "doh", "doq"] }
+```
+
+## 🎓 Quick Start
+
+```rust,no_run
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    model::{SplitDnsPolicy, UpstreamGroupId},
+    server::ServerBuilder,
+    upstream::{UdpBackend, UdpBackendConfig},
+};
+
+async fn run() -> Result<()> {
+    let group = UpstreamGroupId::new("default");
+    let policy = SplitDnsPolicy::builder()
+        .default_group(group.clone())
+        .build();
+
+    let resolver = Arc::new(
+        Resolver::builder(policy)
+            .backend(
+                group,
+                UdpBackend::new(UdpBackendConfig {
+                    server: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+                    timeout: Duration::from_secs(5),
+                    bind_addr: None,
+                }),
+            )
+            .build(),
+    );
+
+    let server = ServerBuilder::new(resolver)
+        .udp_addr("127.0.0.1:5353".parse().unwrap())
+        .bind()
+        .await?;
+
+    server.serve().await?;
+    Ok(())
+}
+```
+
+`Resolver` owns routing/cache/failover. `Server` owns inbound listening and
+protocol framing. `UpstreamBackend` implementations own outbound transport
+execution.
+
+More examples (split DNS with failover, DoT, Fake IP, observability, graceful
+shutdown) are in the
+[project README](https://github.com/F000NKKK/dns-lattice#-examples).
+
+## 🗂️ Public Surface
 
 Use canonical domain modules; flat root aliases are intentionally not exposed.
 
-- `dns_lattice::core` — shared `Error` / `Result`;
-- `dns_lattice::model` — DNS messages, records, names, domain matcher,
-  split-DNS policy, upstream-group identifiers;
-- `dns_lattice::engine` — `Resolver` / `ResolverBuilder`;
-- `dns_lattice::upstream` — `UpstreamBackend` and outbound transports;
-- `dns_lattice::server` — `Server` / `ServerBuilder` and inbound listeners;
-- `dns_lattice::fakeip` — synthetic-address pool, policy, TTL, snapshots;
-- `dns_lattice::hooks` — dynamic route-selection hook;
-- `dns_lattice::observability` — structured resolver event sink.
+| Module | Contents |
+|--------|----------|
+| `dns_lattice::core` | shared `Error` / `Result` |
+| `dns_lattice::model` | DNS messages, records, names, domain matcher, split-DNS policy, upstream-group identifiers |
+| `dns_lattice::engine` | `Resolver` / `ResolverBuilder` |
+| `dns_lattice::upstream` | `UpstreamBackend` and outbound transports |
+| `dns_lattice::server` | `Server` / `ServerBuilder` and inbound listeners |
+| `dns_lattice::fakeip` | synthetic-address pool, policy, TTL, snapshots |
+| `dns_lattice::hooks` | dynamic route-selection hook |
+| `dns_lattice::observability` | structured resolver event sink |
 
-## Resolver pipeline
+## 🔄 Resolver Pipeline
 
 For ordinary queries the resolver executes:
 
@@ -69,53 +178,7 @@ The in-memory answer cache respects DNS TTLs and negative caching. Ordinary
 cache identity includes the effective upstream group. Equal DNS questions
 routed to different groups cannot share an answer.
 
-## Quick start
-
-```rust,no_run
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-
-use dns_lattice::{
-    core::Result,
-    engine::Resolver,
-    model::{SplitDnsPolicy, UpstreamGroupId},
-    server::ServerBuilder,
-    upstream::{UdpBackend, UdpBackendConfig},
-};
-
-# async fn run() -> Result<()> {
-let group = UpstreamGroupId::new("default");
-let policy = SplitDnsPolicy::builder()
-    .default_group(group.clone())
-    .build();
-
-let resolver = Arc::new(
-    Resolver::builder(policy)
-        .backend(
-            group,
-            UdpBackend::new(UdpBackendConfig {
-                server: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
-                timeout: Duration::from_secs(5),
-                bind_addr: None,
-            }),
-        )
-        .build(),
-);
-
-let server = ServerBuilder::new(resolver)
-    .udp_addr("127.0.0.1:5353".parse().unwrap())
-    .bind()
-    .await?;
-
-server.serve().await?;
-# Ok(())
-# }
-```
-
-`Resolver` owns routing/cache/failover. `Server` owns inbound listening and
-protocol framing. `UpstreamBackend` implementations own outbound transport
-execution.
-
-## Dynamic route hook
+## 🪝 Dynamic Route Hook
 
 `ResolverBuilder::route_hook` accepts one caller-owned `hooks::RouteHook`.
 The hook receives the first DNS question and tentative static group:
@@ -153,7 +216,7 @@ impl RouteHook for PreferFiltered {
 
 Do not re-enter the same resolver from its route hook.
 
-## Fake IP
+## 🎭 Fake IP
 
 `FakeIpPool` provides deterministic concurrent synthetic-address state with:
 
@@ -176,7 +239,7 @@ never exceeds the mapping's remaining lifetime.
 The crate deliberately does not serialize snapshots or provide durable Fake IP
 persistence.
 
-## Observability
+## 📡 Observability
 
 `ResolverBuilder::observability_sink` accepts an optional
 `observability::ObservabilitySink`. Events cover query receipt, Fake IP
@@ -193,7 +256,7 @@ The sink is synchronous and non-authoritative:
 - the crate does not require a logging/tracing framework or own a background
   telemetry queue.
 
-## Upstream transports
+## 🔐 Upstream Transports
 
 `UpstreamBackend` is async. Backends registered for one upstream group are
 tried in registration order. Timeout/transport/TLS failures can fall over to
@@ -211,7 +274,7 @@ the next backend. If all fail, the last error is returned.
 Encrypted features are default-off so applications using only UDP/TCP do not
 inherit TLS/HTTP/QUIC dependency weight.
 
-## Inbound server
+## 🖥️ Inbound Server
 
 `ServerBuilder` embeds a shared `Arc<Resolver>` and supports:
 
@@ -225,7 +288,7 @@ The host provides TLS/QUIC server configuration and certificate material.
 Binding privileged ports, configuring the OS resolver, and provisioning
 certificates remain host responsibilities.
 
-## Platform and validation contract
+## ✅ Platform and Validation Contract
 
 The supported surface is validated on Linux, Windows, and macOS. CI runs the
 workspace format/lint/check/test/doc gates and strict facade check/test/rustdoc
@@ -242,7 +305,7 @@ doq
 CI also lists workspace package contents and runs the hermetic release
 automation regression. Validation does not publish crates.
 
-## Safety and responsibility boundaries
+## 🛡️ Safety and Responsibility Boundaries
 
 This crate performs ordinary socket/TLS/QUIC networking but does not mutate OS
 DNS configuration or manage TUN/TAP devices. Those responsibilities belong to
@@ -252,7 +315,7 @@ Route hooks and observability sinks do not receive privileged runtime handles
 from DNS Lattice. Applications that intentionally perform side effects from
 their own hook/sink implementations are responsible for those effects.
 
-## Status
+## 📌 Status
 
 **Stable `1.x` releases are published** on crates.io. Stages 0.0 through 1.0
 are complete: Fake IP, dynamic route hooks, structured observability,
@@ -264,6 +327,13 @@ Within the `1.x` line, ordinary SemVer now applies: additive changes are
 minor releases, fixes are patch releases, and a breaking change requires an
 explicit major version bump.
 
-Repository: https://github.com/F000NKKK/dns-lattice
+## 📖 Documentation
 
-License: MPL-2.0.
+- **API reference**: [docs.rs/dns-lattice](https://docs.rs/dns-lattice)
+- **Project**: [github.com/F000NKKK/dns-lattice](https://github.com/F000NKKK/dns-lattice)
+- **Architecture**: [ARCHITECTURE.md](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md)
+- **Changelog**: [CHANGELOG.md](https://github.com/F000NKKK/dns-lattice/blob/main/CHANGELOG.md)
+
+## 📄 License
+
+Licensed under the [Mozilla Public License 2.0](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE).

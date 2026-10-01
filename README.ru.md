@@ -1,15 +1,31 @@
-# DNS Lattice
+<div align="center">
 
-**Языки**
+<a id="top"></a>
 
-🇺🇸 [English](README.md) | 🇷🇺 **Русский**
+# 🧭 DNS Lattice
 
-[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
+### Программируемый встраиваемый DNS-резолвер и сервер для Rust
+
 [![crates.io](https://img.shields.io/crates/v/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
 [![docs.rs](https://img.shields.io/docsrs/dns-lattice)](https://docs.rs/dns-lattice)
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
+[![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
+
+![Linux](https://img.shields.io/badge/Linux-supported-success)
+![Windows](https://img.shields.io/badge/Windows-supported-success)
+![macOS](https://img.shields.io/badge/macOS-supported-success)
+
+🇺🇸 [English](README.md) | 🇷🇺 **Русский**
+
+[Возможности](#-ключевые-возможности) • [Транспорты](#-поддерживаемые-транспорты-и-платформы) • [Производительность](#-производительность) • [Установка](#-установка) • [Быстрый старт](#-быстрый-старт) • [Сравнение](#-сравнение)
+
+</div>
+
+---
+
+## 📖 Обзор
 
 **DNS Lattice** — программируемый встраиваемый DNS resolver/server engine для
 Rust. Он предоставляет split DNS, кэширование, Fake IP, динамический выбор
@@ -20,75 +36,163 @@ Rust. Он предоставляет split DNS, кэширование, Fake IP
 владеет процессом и конфигурацией, а DNS Lattice отвечает за DNS protocol
 handling, resolution, serving, routing, cache behavior и transport execution.
 
-> **Статус:** **стабильные релизы `1.x` опубликованы** на crates.io
-> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0
-> завершены: публичный API заморожен, воркспейс следует обычной
-> SemVer-дисциплине внутри линейки `1.x` — breaking change требует явного
-> мажорного бампа. Текущую версию см. в [CHANGELOG.md](CHANGELOG.md).
-
-## Зачем нужен DNS Lattice
-
 Приложениям с нестандартным DNS обычно приходится вручную собирать несколько
 разных задач: DNS wire parsing, split-DNS policy, cache semantics, transport
 fallback, encrypted DNS, Fake IP state, server listeners и
 application-specific routing. DNS Lattice разделяет эти ответственности, но
 оставляет их совместимыми внутри одного engine.
 
-Resolver pipeline явный:
+### 🎯 Почему DNS Lattice?
 
-```text
-DNS query
-  → terminal Fake IP handling, если выбрано policy
-  → static split-DNS candidate
-  → optional RouteHook
-  → validate effective upstream group
-  → route-scoped cache
-  → ordered upstream failover
-  → answer
-```
+- **🔀 Split DNS — основа, а не надстройка**: каждый запрос сначала
+  направляется в именованную upstream group по детерминированным правилам
+  exact/suffix/wildcard.
+- **🧊 Кэш, учитывающий маршрут**: ключ кэша включает effective upstream
+  group, поэтому один и тот же вопрос, отправленный по двум маршрутам, никогда
+  не делит ответ.
+- **🎭 Встроенный Fake IP**: конкурентный пул синтетических IPv4/IPv6-адресов
+  с обратным поиском, LRU-вытеснением, TTL и снапшотами, подключённый к
+  резолверу как терминальный путь ответа.
+- **🪝 Динамическая маршрутизация без потери контроля**: `RouteHook` выбирает
+  upstream group для каждого вопроса, но не получает ни резолвер, ни backend,
+  ни кэш, ни доступ к ОС.
+- **🔐 Все транспорты в обе стороны**: UDP, TCP, DoT, DoH (HTTP/1.1, HTTP/2,
+  HTTP/3) и DoQ — и как upstream-клиенты, *и* как входящие listeners;
+  шифрованные включаются отдельными Cargo features.
+- **📡 Observability без фреймворка**: ограниченные неизменяемые события
+  резолвера приходят в ваш собственный sink; logging- или tracing-крейт не
+  нужен.
+- **🧾 Стабильный API**: `1.x` следует SemVer; breaking change требует новой
+  мажорной версии.
 
-Inbound listeners используют тот же resolver pipeline:
+> **Статус:** **стабильные релизы `1.x` опубликованы** на crates.io
+> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0
+> завершены: публичный API заморожен, воркспейс следует обычной
+> SemVer-дисциплине внутри линейки `1.x` — breaking change требует явного
+> мажорного бампа. Текущую версию см. в [CHANGELOG.md](CHANGELOG.md).
 
-```text
-Client → Server → Resolver → Cache/Policy/Hook/Fake IP → UpstreamBackend → Resolver → Server → Client
-```
+## 🌟 Ключевые возможности
 
-## Workspace
+### Резолвинг
+- ✅ **Статический split DNS**: `SplitDnsPolicy` сопоставляет exact-, suffix-
+  и wildcard-шаблоны доменов с upstream groups, с необязательной группой по
+  умолчанию
+- ✅ **TTL и negative cache**: ответы в памяти истекают по своему DNS TTL;
+  NXDOMAIN и пустые ответы тоже кэшируются
+- ✅ **Упорядоченный failover**: backends одной группы пробуются в порядке
+  регистрации; timeout-, transport- и TLS-ошибки переводят на следующий
+- ✅ **Синтез Fake IP**: подходящие A/AAAA и PTR из диапазона отвечаются
+  локально из `FakeIpPool`
 
-DNS Lattice публикуется как три крейта:
+### Транспорты
+- ✅ **UDP и TCP** в сборке по умолчанию, с переходом UDP → TCP при `TC=1`
+- ✅ **DoT** (`dot`), **DoH** по HTTP/1.1, HTTP/2 и HTTP/3 (`doh`) и **DoQ**
+  (`doq`) — каждый отдельной, выключенной по умолчанию Cargo feature
+- ✅ **Входящий сервер** на тех же транспортах, с общим `Arc<Resolver>`
 
-| Крейт | Ответственность |
-|---|---|
-| `dns-lattice` | Public facade + runtime implementation resolver/server |
-| `dns-lattice-model` | DNS message model, names, matcher, split-DNS policy |
-| `dns-lattice-core` | Общая типизированная граница `Error` / `Result` |
+### Расширяемость
+- 🪝 **`RouteHook`**: асинхронный выбор upstream group для вопроса, только
+  выбор
+- 📡 **`ObservabilitySink`**: синхронные non-authoritative события резолвера
+- 🔌 **`UpstreamBackend`**: реализуйте свой транспорт и зарегистрируйте его
+  рядом со встроенными
 
-Большинству приложений достаточно зависимости только от `dns-lattice`.
+### Удобство разработки
+- 🧭 **Один типизированный `Error`** для ошибок сообщений, policy,
+  транспорта, TLS, hook и Fake IP
+- 🗂️ **Модули по доменам** (`engine`, `upstream`, `server`, `fakeip`, ...)
+  вместо плоского корневого пространства имён
+- 🧪 **Транспорты проверены на loopback**: каждый клиент и listener
+  прогоняется против локального сервера на Linux, Windows и macOS в CI
 
-## Установка
+## 💻 Поддерживаемые транспорты и платформы
 
-Baseline UDP/TCP не требует TLS/HTTP/QUIC features:
+| Транспорт | Feature | Upstream-клиент | Входящий сервер | Linux | Windows | macOS |
+|-----------|---------|:---------------:|:---------------:|:-----:|:-------:|:-----:|
+| **UDP** | default | ✅ `UdpBackend` | ✅ `udp_addr` | ✅ | ✅ | ✅ |
+| **TCP** | default | ✅ `TcpBackend` | ✅ `tcp_addr` | ✅ | ✅ | ✅ |
+| **DoT** (RFC 7858) | `dot` | ✅ `DotBackend` | ✅ `dot_addr` | ✅ | ✅ | ✅ |
+| **DoH** HTTP/1.1 + HTTP/2 (RFC 8484) | `doh` | ✅ `DohBackend` | ✅ `doh_addr` | ✅ | ✅ | ✅ |
+| **DoH** HTTP/3 | `doh` | ✅ `Doh3Backend` | ✅ `doh3_addr` | ✅ | ✅ | ✅ |
+| **DoQ** (RFC 9250) | `doq` | ✅ `DoqBackend` | ✅ `doq_addr` | ✅ | ✅ | ✅ |
+
+✅ для платформы означает, что CI на этой ОС запускает `cargo check`,
+`cargo test` и rustdoc с запретом предупреждений для этого набора features, а
+тесты включают обмен клиента и listener с локальным loopback-сервером
+(самоподписанные сертификаты для шифрованных транспортов). CI не обращается к
+публичным резолверам.
+
+> Привязка к привилегированному порту, например 53, — задача
+> host-приложения; самому DNS Lattice особые привилегии не нужны.
+
+## 🚀 Производительность
+
+### 🏆 Особенности устройства
+
+- **Попадание в кэш не трогает сеть**: попадание — это одна блокировка
+  mutex над картой в памяти и возврат ответа; hook при этом всё равно
+  выполняется первым, upstreams — нет.
+- **Одна задача на запрос, без общего воркера**: сервер запускает задачу
+  Tokio на каждую UDP-датаграмму, на каждое TCP/DoT/DoH-соединение и на
+  каждый DoQ-поток; все они делят один `Arc<Resolver>`.
+- **Без фоновых потоков и очередей**: резолвер не владеет ни потоками, ни
+  задачами, а callbacks observability выполняются синхронно после
+  освобождения блокировки кэша.
+- **Платите только за нужные транспорты**: без `dot`, `doh` и `doq` в сборке
+  нет зависимостей TLS, HTTP и QUIC.
+
+Текущие ограничения, прямо:
+
+- каждый upstream-запрос открывает новый сокет или соединение (UDP-сокет,
+  TCP- или TLS-соединение, DoH-клиент, QUIC-соединение); пула соединений
+  пока нет;
+- `UdpBackend` не отправляет запись EDNS0/OPT, поэтому ответы по UDP
+  ограничены 512 байтами, а более крупные идут через TCP;
+- у кэша ответов нет ограничения размера и фоновой очистки: истёкшая запись
+  остаётся в памяти, пока на тот же вопрос не придёт новый ответ.
+
+### 📊 Бенчмарки
+
+Бенчмарк, сравнивающий DNS Lattice с
+[hickory-resolver](https://github.com/hickory-dns/hickory-dns), в работе.
+Цифр пока нет; таблица результатов появится здесь.
+
+## 📦 Установка
 
 ```toml
 [dependencies]
-dns-lattice = "1.1.1"
+# Только UDP и TCP: без зависимостей TLS, HTTP и QUIC
+dns-lattice = "1.1.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Encrypted transports включаются только при необходимости:
+Шифрованные транспорты добавляйте только при необходимости. Features
+независимы и выключены по умолчанию:
 
 ```toml
-[dependencies]
-dns-lattice = { version = "1.1.1", features = ["dot", "doh", "doq"] }
-```
+# DNS-over-TLS
+dns-lattice = { version = "1.1.2", features = ["dot"] }
 
-Cargo features независимы и выключены по умолчанию:
+# DNS-over-HTTPS по HTTP/1.1, HTTP/2 и HTTP/3
+dns-lattice = { version = "1.1.2", features = ["doh"] }
+
+# DNS-over-QUIC, без HTTP-стека
+dns-lattice = { version = "1.1.2", features = ["doq"] }
+
+# Всё сразу
+dns-lattice = { version = "1.1.2", features = ["dot", "doh", "doq"] }
+```
 
 - `dot` — DNS-over-TLS;
 - `doh` — DNS-over-HTTPS по HTTP/1.1, HTTP/2 и HTTP/3;
 - `doq` — DNS-over-QUIC.
 
-## Быстрый старт: UDP resolver + server
+Для реализации `RouteHook` или `UpstreamBackend` в ваши зависимости также
+нужен `async-trait = "0.1"`.
+
+## 🎓 Быстрый старт
+
+### UDP resolver + server
 
 Используйте канонические domain modules; facade намеренно не предоставляет
 плоские root aliases.
@@ -104,90 +208,148 @@ use dns_lattice::{
     upstream::{UdpBackend, UdpBackendConfig},
 };
 
-# async fn run() -> Result<()> {
-let group = UpstreamGroupId::new("default");
-let policy = SplitDnsPolicy::builder()
-    .default_group(group.clone())
-    .build();
+async fn run() -> Result<()> {
+    let group = UpstreamGroupId::new("default");
+    let policy = SplitDnsPolicy::builder()
+        .default_group(group.clone())
+        .build();
 
-let resolver = Arc::new(
-    Resolver::builder(policy)
-        .backend(
-            group,
-            UdpBackend::new(UdpBackendConfig {
-                server: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
-                timeout: Duration::from_secs(5),
-                bind_addr: None,
-            }),
-        )
-        .build(),
-);
+    let resolver = Arc::new(
+        Resolver::builder(policy)
+            .backend(
+                group,
+                UdpBackend::new(UdpBackendConfig {
+                    server: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+                    timeout: Duration::from_secs(5),
+                    bind_addr: None,
+                }),
+            )
+            .build(),
+    );
 
-let server = ServerBuilder::new(resolver)
-    .udp_addr("127.0.0.1:5353".parse().unwrap())
-    .bind()
-    .await?;
+    let server = ServerBuilder::new(resolver)
+        .udp_addr("127.0.0.1:5353".parse().unwrap())
+        .bind()
+        .await?;
 
-server.serve().await?;
-# Ok(())
-# }
+    server.serve().await?;
+    Ok(())
+}
 ```
 
 `Resolver` владеет routing/cache/failover. `Server` владеет inbound listening и
 framing. Реализации `UpstreamBackend` владеют outbound transport execution.
 
-## Публичные модули
+## 📚 Примеры
 
-Канонические public paths:
+### Split DNS с failover
 
-| Модуль | Назначение |
-|---|---|
-| `dns_lattice::core` | Общие типизированные errors/results |
-| `dns_lattice::model` | DNS messages, records, names, matchers, policies |
-| `dns_lattice::engine` | `Resolver` / `ResolverBuilder` |
-| `dns_lattice::upstream` | Outbound backend trait и transports |
-| `dns_lattice::server` | Inbound listeners и lifecycle |
-| `dns_lattice::fakeip` | Fake IP pool, policy, TTL, snapshots |
-| `dns_lattice::hooks` | Dynamic route-selection hook |
-| `dns_lattice::observability` | Structured resolver events/sink |
+```rust,no_run
+use std::{net::SocketAddr, time::Duration};
 
-## Split DNS и matching
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    model::{DomainPattern, SplitDnsPolicy, UpstreamGroupId},
+    upstream::{TcpBackend, TcpBackendConfig, UdpBackend, UdpBackendConfig},
+};
 
-`dns-lattice-model` предоставляет детерминированный exact/suffix/wildcard
-matching и `SplitDnsPolicy`. Resolver сначала получает статического кандидата
-upstream group из этой policy.
+fn udp(server: &str) -> UdpBackend {
+    UdpBackend::new(UdpBackendConfig {
+        server: server.parse::<SocketAddr>().unwrap(),
+        timeout: Duration::from_secs(2),
+        bind_addr: None,
+    })
+}
 
-Model/matcher слой не выполняет network I/O и не зависит от ОС. Hardening
-стадии 0.6 добавил детерминированное property-style покрытие matcher
-precedence, message parsing и DNS name compression bounds.
+fn build() -> Result<Resolver> {
+    let corp = UpstreamGroupId::new("corp");
+    let public = UpstreamGroupId::new("public");
 
-## Семантика кэша
+    let policy = SplitDnsPolicy::builder()
+        .rule(DomainPattern::parse("corp.internal")?, corp.clone()) // corp.internal и ниже
+        .default_group(public.clone())
+        .build();
 
-Resolver имеет in-memory answer cache с учётом TTL, включая negative caching.
-Для обычных запросов cache identity включает **effective upstream group**.
-Это критично при route hook: одинаковые DNS questions, отправленные в разные
-маршруты, не могут разделить один answer.
+    Ok(Resolver::builder(policy)
+        .backend(
+            corp,
+            TcpBackend::new(TcpBackendConfig {
+                server: "10.0.0.53:53".parse().unwrap(),
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            }),
+        )
+        // По порядку: 9.9.9.9 — только после таймаута или transport-ошибки
+        // у 1.1.1.1.
+        .backend(public.clone(), udp("1.1.1.1:53"))
+        .backend(public, udp("9.9.9.9:53"))
+        .build())
+}
+```
 
-Terminal Fake IP ответы обходят обычный answer cache; их lifetime принадлежит
-самому Fake IP mapping.
+### Upstream DNS-over-TLS (`dot`)
 
-## Dynamic route hooks
+```rust,no_run
+use std::time::Duration;
 
-`ResolverBuilder::route_hook` устанавливает один caller-owned `RouteHook` для
-обычных запросов. Hook получает первый DNS question и tentative static group:
+use dns_lattice::{
+    engine::Resolver,
+    model::{SplitDnsPolicy, UpstreamGroupId},
+    upstream::{DotBackend, DotBackendConfig},
+};
 
-- `Use(group)` выбирает существующую непустую upstream group;
-- `Abstain` сохраняет static candidate.
+fn build() -> Resolver {
+    let group = UpstreamGroupId::new("encrypted");
+    let dot = DotBackend::new(DotBackendConfig::with_webpki_roots(
+        "1.1.1.1:853".parse().unwrap(),
+        "cloudflare-dns.com".try_into().unwrap(), // SNI и имя в сертификате
+        Duration::from_secs(3),                   // TCP connect
+        Duration::from_secs(5),                   // TLS handshake и каждое чтение/запись
+    ));
 
-Ошибка hook, неизвестная group или empty group завершают resolution ошибкой без
-молчаливого fallback на другой static route. Hook используется только для
-selection: DNS Lattice не передаёт ему resolver/backend handles, cache
-authority, client transport metadata или OS/network side-effect capability.
+    Resolver::builder(SplitDnsPolicy::builder().default_group(group.clone()).build())
+        .backend(group, dot)
+        .build()
+}
+```
 
-Реализация hook сама владеет timeout, retry, cancellation cleanup и внешними
-вызовами. Re-entry в тот же resolver из его hook запрещён.
+`DoqBackendConfig::with_webpki_roots` работает так же для DoQ; DoH принимает
+`DohBackendConfig` / `Doh3BackendConfig` с URI эндпоинта и клиентской
+конфигурацией `rustls`.
 
-### Пример hook
+### Fake IP
+
+```rust,no_run
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+use dns_lattice::{
+    core::Result,
+    engine::Resolver,
+    fakeip::{FakeIpPolicy, FakeIpPool},
+    model::{DomainPattern, SplitDnsPolicy},
+};
+
+fn build() -> Result<Resolver> {
+    let pool = Arc::new(
+        FakeIpPool::builder()
+            .ipv4_range(Ipv4Addr::new(198, 18, 0, 0), Ipv4Addr::new(198, 19, 255, 255))
+            .ttl(Duration::from_secs(300))
+            .build()?,
+    );
+    let policy = FakeIpPolicy::builder()
+        .rule(DomainPattern::parse("example.com")?)
+        .build();
+
+    // A-запросы к example.com и его поддоменам получают адреса из пула; AAAA
+    // получает локальный NODATA, потому что у пула нет IPv6-диапазона.
+    Ok(Resolver::builder(SplitDnsPolicy::builder().build())
+        .fake_ip(pool, policy)
+        .build())
+}
+```
+
+### Динамический route hook
 
 ```rust,no_run
 use async_trait::async_trait;
@@ -211,7 +373,130 @@ impl RouteHook for PreferFiltered {
 }
 ```
 
-## Fake IP
+Устанавливается через `ResolverBuilder::route_hook(PreferFiltered)`.
+
+### Observability sink
+
+```rust,no_run
+use std::sync::Arc;
+
+use dns_lattice::{
+    engine::Resolver,
+    model::SplitDnsPolicy,
+    observability::{ObservabilitySink, ObserveEvent},
+};
+
+struct PrintSink;
+
+impl ObservabilitySink for PrintSink {
+    fn record(&self, event: &ObserveEvent) {
+        println!("{event:?}");
+    }
+}
+
+fn build() -> Resolver {
+    Resolver::builder(SplitDnsPolicy::builder().build())
+        .observability_sink(Arc::new(PrintSink))
+        .build()
+}
+```
+
+### Корректная остановка
+
+```rust,no_run
+use std::sync::Arc;
+
+use dns_lattice::{core::Result, engine::Resolver, server::ServerBuilder};
+
+// Для `ctrl_c` нужна feature `signal` у tokio.
+async fn run(resolver: Arc<Resolver>) -> Result<()> {
+    let server = ServerBuilder::new(resolver)
+        .udp_addr("127.0.0.1:5353".parse().unwrap())
+        .tcp_addr("127.0.0.1:5353".parse().unwrap())
+        .bind()
+        .await?;
+
+    server
+        .serve_until(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+}
+```
+
+### Исполняемые примеры
+
+Исполняемые примеры находятся в
+[`crates/dns-lattice/examples`](crates/dns-lattice/examples):
+
+- `split_dns_policy` — matcher и static policy;
+- `message_round_trip` — DNS wire encode/decode;
+- `resolver` — in-process resolver/cache.
+
+Запуск:
+
+```bash
+cargo run -p dns-lattice --example <name>
+```
+
+## 🔄 Resolver pipeline
+
+Resolver pipeline явный:
+
+```text
+DNS query
+  → terminal Fake IP handling, если выбрано policy
+  → static split-DNS candidate
+  → optional RouteHook
+  → validate effective upstream group
+  → route-scoped cache
+  → ordered upstream failover
+  → answer
+```
+
+Inbound listeners используют тот же resolver pipeline:
+
+```text
+Client → Server → Resolver → Cache/Policy/Hook/Fake IP → UpstreamBackend → Resolver → Server → Client
+```
+
+## 🔀 Split DNS и matching
+
+`dns-lattice-model` предоставляет детерминированный exact/suffix/wildcard
+matching и `SplitDnsPolicy`. Resolver сначала получает статического кандидата
+upstream group из этой policy.
+
+Model/matcher слой не выполняет network I/O и не зависит от ОС. Hardening
+стадии 0.6 добавил детерминированное property-style покрытие matcher
+precedence, message parsing и DNS name compression bounds.
+
+## 🧊 Семантика кэша
+
+Resolver имеет in-memory answer cache с учётом TTL, включая negative caching.
+Для обычных запросов cache identity включает **effective upstream group**.
+Это критично при route hook: одинаковые DNS questions, отправленные в разные
+маршруты, не могут разделить один answer.
+
+Terminal Fake IP ответы обходят обычный answer cache; их lifetime принадлежит
+самому Fake IP mapping.
+
+## 🪝 Dynamic route hooks
+
+`ResolverBuilder::route_hook` устанавливает один caller-owned `RouteHook` для
+обычных запросов. Hook получает первый DNS question и tentative static group:
+
+- `Use(group)` выбирает существующую непустую upstream group;
+- `Abstain` сохраняет static candidate.
+
+Ошибка hook, неизвестная group или empty group завершают resolution ошибкой без
+молчаливого fallback на другой static route. Hook используется только для
+selection: DNS Lattice не передаёт ему resolver/backend handles, cache
+authority, client transport metadata или OS/network side-effect capability.
+
+Реализация hook сама владеет timeout, retry, cancellation cleanup и внешними
+вызовами. Re-entry в тот же resolver из его hook запрещён.
+
+## 🎭 Fake IP
 
 `fakeip::FakeIpPool` предоставляет детерминированное concurrent synthetic
 IPv4/IPv6 state:
@@ -236,7 +521,7 @@ mapping.
 DNS Lattice намеренно **не** определяет durable Fake IP persistence и формат
 сериализации snapshots.
 
-## Observability
+## 📡 Observability
 
 `ResolverBuilder::observability_sink` принимает optional
 `observability::ObservabilitySink`. Resolver выдаёт immutable bounded events
@@ -255,7 +540,7 @@ callbacks; panic callback изолирован от корректности res
 требует конкретный logging/tracing framework и не владеет background telemetry
 queue.
 
-## Upstream transports
+## 🔐 Upstream transports
 
 Resolver пробует backends внутри upstream group в порядке регистрации.
 Timeout/transport/TLS failures могут переключить выполнение на следующий
@@ -274,7 +559,7 @@ backend. Если все backends завершились ошибкой, воз�
 DoQ и HTTP/3 используют QUIC/TLS 1.3. TCP DoH поддерживает HTTP/1.1 и HTTP/2
 поверх TLS 1.2/1.3 согласно переданной конфигурации.
 
-## Inbound server
+## 🖥️ Inbound server
 
 `Server` / `ServerBuilder` предоставляют встраиваемый inbound DNS server поверх
 общего `Arc<Resolver>`:
@@ -288,7 +573,7 @@ DoQ и HTTP/3 используют QUIC/TLS 1.3. TCP DoH поддерживае�
 Host-приложение передаёт TLS/QUIC server configuration и certificate material.
 DNS Lattice не выпускает сертификаты и не владеет настройкой privileged ports.
 
-## Feature и platform constraints
+## ✅ Feature и platform constraints
 
 MSRV: **Rust 1.93**.
 
@@ -312,7 +597,7 @@ doq
 CI также проверяет package contents workspace и запускает hermetic regression
 release automation. Эти проверки не публикуют crates.
 
-## Статус возможностей
+## 📋 Статус возможностей
 
 | Возможность | Статус |
 |---|:---:|
@@ -333,23 +618,144 @@ release automation. Эти проверки не публикуют crates.
 | Package/release automation hardening | ✅ |
 | Stable public API / SemVer guarantee | ✅ |
 
-## Границы экосистемы Lattice
+## 🤝 Сравнение
 
-DNS Lattice — один компонент более широкой сетевой экосистемы Lattice:
+[hickory-resolver](https://docs.rs/hickory-resolver) — устоявшийся
+универсальный DNS-резолвер для Rust. У них разные задачи: hickory резолвит
+имена так, как это сделала бы ОС, а DNS Lattice маршрутизирует и обслуживает
+DNS внутри приложения. Утверждения о hickory ниже взяты с его страницы на
+docs.rs (версия 0.26.3).
 
-```text
-net-lattice      OS network configuration and inspection
-tunnel-lattice   TUN/TAP data-plane primitives
-dns-lattice      DNS resolver/server control plane
-flow-lattice     Policy compiler
-sdk-lattice      Application-facing composition
-```
+| Возможность | DNS Lattice | hickory-resolver |
+|-------------|-------------|------------------|
+| **Назначение** | Движок резолвера и входящий сервер в одном крейте | Stub-резолвер (сервер — отдельный крейт `hickory-server`) |
+| **UDP / TCP** | ✅ В сборке по умолчанию | ✅ В сборке по умолчанию |
+| **Upstreams DoT / DoH / DoH3 / DoQ** | ✅ Features `dot`, `doh`, `doq` | ✅ Features `tls-*`, `https-*`, `h3-*`, `quic-*` |
+| **TLS crypto provider** | `aws-lc-rs` | `aws-lc-rs` или `ring` |
+| **Входящий listener DoT / DoH / DoQ** | ✅ Встроен | ➖ Не входит в крейт резолвера |
+| **Split DNS по доменам в upstream groups** | ✅ `SplitDnsPolicy` | ➖ Не описан в его документации |
+| **Fake IP** | ✅ Встроен | ➖ Не описан в его документации |
+| **Hook маршрутизации на запрос** | ✅ `RouteHook` | ➖ Не описан в его документации |
+| **Валидация DNSSEC** | ❌ | ✅ Features `dnssec-*` |
+| **Системная конфигурация** (`/etc/resolv.conf`, Windows) | ❌ Намеренно; всё настраивает host | ✅ `system-config` (по умолчанию) |
+| **Переиспользование upstream-соединений** | ❌ Новое соединение на запрос | ✅ Пул name-серверов |
+| **EDNS0 по UDP** | ❌ 512 байт, затем переход на TCP | Не сравнивалось |
+| **Пропускная способность и задержка** | Ещё не измерены | Ещё не измерены |
+
+## 🛠️ Обзор API
+
+### Публичные модули
+
+Канонические public paths:
+
+| Модуль | Назначение |
+|---|---|
+| `dns_lattice::core` | Общие типизированные errors/results |
+| `dns_lattice::model` | DNS messages, records, names, matchers, policies |
+| `dns_lattice::engine` | `Resolver` / `ResolverBuilder` |
+| `dns_lattice::upstream` | Outbound backend trait и transports |
+| `dns_lattice::server` | Inbound listeners и lifecycle |
+| `dns_lattice::fakeip` | Fake IP pool, policy, TTL, snapshots |
+| `dns_lattice::hooks` | Dynamic route-selection hook |
+| `dns_lattice::observability` | Structured resolver events/sink |
+
+### Основные элементы
+
+| Элемент | Назначение |
+|---------|------------|
+| `Resolver::builder(SplitDnsPolicy)` | Начать резолвер со split-DNS policy |
+| `ResolverBuilder::backend(group, backend)` | Зарегистрировать backend в группе; порядок задаёт порядок failover |
+| `ResolverBuilder::fake_ip(pool, policy)` | Включить локальные Fake IP ответы |
+| `ResolverBuilder::route_hook` / `observability_sink` | Установить необязательные hook и sink событий |
+| `Resolver::resolve(&Message)` | Разрешить один декодированный запрос |
+| `ServerBuilder::new(Arc<Resolver>)` | Начать входящий сервер; добавить `udp_addr`, `tcp_addr`, `dot_addr`, `doh_addr`, `doh3_addr`, `doq_addr` |
+| `ServerBuilder::bind` → `Server::serve` / `serve_until` | Привязать все listeners и обслуживать до drop или до завершения future остановки |
+| `UpstreamBackend` | Async-трейт, который реализует каждый исходящий транспорт |
+| `Message::decode` / `encode` | DNS wire format |
+
+### Крейты воркспейса
+
+DNS Lattice публикуется как три крейта:
+
+| Крейт | Ответственность |
+|---|---|
+| [`dns-lattice`](crates/dns-lattice/README.md) | Public facade + runtime implementation resolver/server |
+| [`dns-lattice-model`](crates/dns-lattice-model/README.md) | DNS message model, names, matcher, split-DNS policy |
+| [`dns-lattice-core`](crates/dns-lattice-core/README.md) | Общая типизированная граница `Error` / `Result` |
+
+Большинству приложений достаточно зависимости только от `dns-lattice`.
+
+## 📖 Документация
+
+- **Справочник API**: [docs.rs/dns-lattice](https://docs.rs/dns-lattice)
+- **Архитектура**: [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md)
+- **Роадмап**: [ROADMAP.ru.md](ROADMAP.ru.md)
+- **Изменения**: [CHANGELOG.md](CHANGELOG.md)
+- **Поддержка и безопасность**: [SUPPORT.md](SUPPORT.md), [SECURITY.md](SECURITY.md)
+
+## 🐛 Решение проблем
+
+<details>
+<summary><b><code>Error::NoRoute</code> из <code>resolve</code></b></summary>
+
+Ни одно правило split DNS не подошло к имени и у policy нет группы по
+умолчанию, в запросе не было вопроса, или в выбранной группе (статически или
+через hook) не зарегистрирован ни один backend. Добавьте `default_group` или
+зарегистрируйте backend для каждой группы, которую могут вернуть правила и
+hook.
+</details>
+
+<details>
+<summary><b><code>bind</code> завершается с <code>Error::Transport</code></b></summary>
+
+Адрес уже занят, некорректен или требует привилегий (например, порт 53 на
+Unix). DNS Lattice не обрабатывает привилегированные порты особо; используйте
+непривилегированный порт, например 5353, или дайте процессу право на этот
+порт.
+</details>
+
+<details>
+<summary><b>Большие ответы приходят пустыми с битом <code>TC</code></b></summary>
+
+DNS Lattice пока не поддерживает EDNS0, поэтому ответы по UDP ограничены 512
+байтами. Входящий UDP listener отправляет пустой усечённый ответ, и клиент
+должен повторить запрос по TCP; слушайте и TCP (`tcp_addr`) на том же адресе.
+`UdpBackend` делает такой повтор по TCP сам.
+</details>
+
+<details>
+<summary><b>DoQ или DoH по HTTP/3 не проходит handshake</b></summary>
+
+QUIC требует TLS 1.3 и правильный ALPN. `DoqBackendConfig::with_webpki_roots`
+выставляет `doq` сам; собранный вручную клиентский `tls_config` должен
+включать `doq` самостоятельно. На стороне сервера `quinn::ServerConfig` для
+`doq_addr` должен объявлять `doq`, а для `doh3_addr` — `h3`. Для `doh_addr`
+настройте ALPN `h2` и `http/1.1`.
+</details>
+
+<details>
+<summary><b>Panic об отсутствующем рантайме Tokio</b></summary>
+
+Каждый встроенный backend и listener выполняет сокетный I/O через Tokio,
+поэтому вызывайте `Resolver::resolve`, `ServerBuilder::bind` и
+`Server::serve` внутри рантайма Tokio (например, под `#[tokio::main]`).
+</details>
+
+## 🌐 Экосистема Lattice
+
+| Крейт | Назначение |
+| --- | --- |
+| [net-lattice](https://github.com/F000NKKK/net-lattice) | Инспекция и настройка сетевого стека ОС (маршруты, DNS, интерфейсы) |
+| [tunnel-lattice](https://github.com/F000NKKK/tunnel-lattice) | TUN/TAP туннельные интерфейсы |
+| [dns-lattice](https://github.com/F000NKKK/dns-lattice) | Программируемый DNS control plane |
+| [flow-lattice](https://github.com/F000NKKK/flow-lattice) | Компилятор политик: правила в платформенно-нейтральные сетевые планы |
+| [sdk-lattice](https://github.com/F000NKKK/sdk-lattice) | Прикладной SDK, объединяющий крейты выше |
 
 DNS Lattice не изменяет OS DNS settings, не управляет TUN/TAP-устройствами, не
 компилирует язык правил и не поставляет standalone daemon product. Эти
 ответственности принадлежат host application или соседним компонентам Lattice.
 
-## Текущий статус и роадмап
+## 🗺️ Текущий статус и роадмап
 
 Завершены:
 
@@ -372,27 +778,42 @@ DNS Lattice не изменяет OS DNS settings, не управляет TUN/T
 Полные детали см. в [ROADMAP.ru.md](ROADMAP.ru.md) и
 [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).
 
-## Примеры
-
-Исполняемые примеры находятся в
-[`crates/dns-lattice/examples`](crates/dns-lattice/examples):
-
-- `split_dns_policy` — matcher и static policy;
-- `message_round_trip` — DNS wire encode/decode;
-- `resolver` — in-process resolver/cache.
-
-Запуск:
-
-```bash
-cargo run -p dns-lattice --example <name>
-```
-
-## Contributing и security
+## 🙏 Участие в разработке
 
 Требования к изменениям — в [CONTRIBUTING.md](CONTRIBUTING.md), private
 vulnerability reporting — в [SECURITY.md](SECURITY.md), текущая support policy
 — в [SUPPORT.md](SUPPORT.md).
 
-## Лицензия
+```bash
+git clone https://github.com/F000NKKK/dns-lattice.git
+cd dns-lattice
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo test -p dns-lattice --no-default-features --features doq   # одна feature отдельно
+```
 
-Mozilla Public License 2.0. См. [LICENSE](LICENSE).
+Ни одному тесту не нужны привилегии или сеть дальше loopback.
+
+## 📄 Лицензия
+
+Распространяется под [Mozilla Public License 2.0](LICENSE).
+
+## 🌟 Благодарности
+
+- [`rustls`](https://github.com/rustls/rustls), [`quinn`](https://github.com/quinn-rs/quinn),
+  [`hyper`](https://github.com/hyperium/hyper) и [`h3`](https://github.com/hyperium/h3),
+  на которых работают шифрованные транспорты
+- [Tokio](https://tokio.rs), на котором работает каждый сокет
+- [hickory-dns](https://github.com/hickory-dns/hickory-dns) — ориентир для
+  DNS в Rust
+
+---
+
+<div align="center">
+
+**[⬆ Наверх](#top)**
+
+Часть сетевого стека Lattice
+
+</div>
