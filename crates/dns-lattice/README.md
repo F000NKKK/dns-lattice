@@ -4,9 +4,9 @@
 
 ### A Programmable, Embeddable DNS Resolver and Server Engine for Rust
 
-[![crates.io](https://img.shields.io/crates/v/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
-[![docs.rs](https://img.shields.io/docsrs/dns-lattice)](https://docs.rs/dns-lattice)
-[![Downloads](https://img.shields.io/crates/d/dns-lattice.svg)](https://crates.io/crates/dns-lattice)
+[![crates.io](https://img.shields.io/crates/v/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
+[![docs.rs](https://img.shields.io/docsrs/dns-lattice?cacheSeconds=86400)](https://docs.rs/dns-lattice)
+[![Downloads](https://img.shields.io/crates/d/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
 [![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
