@@ -144,8 +144,10 @@ Current limits, stated plainly:
 - every upstream query opens a fresh socket or connection (UDP socket, TCP
   or TLS connection, DoH client, QUIC connection); there is no connection
   pooling yet;
-- `UdpBackend` sends no EDNS0/OPT record, so UDP answers are limited to 512
-  bytes and larger ones fall back to TCP;
+- `UdpBackend` adds no EDNS0/OPT record of its own: it forwards the query
+  unchanged, so a query without one gets UDP answers of at most 512 bytes
+  (larger ones fall back to TCP), while a query that carries one can get
+  answers up to the size it advertises;
 - the answer cache has no size limit and no background sweep: an expired
   entry stays in memory until the same question is answered again.
 
@@ -639,7 +641,7 @@ docs.rs page (version 0.26.3).
 | **DNSSEC validation** | ❌ | ✅ `dnssec-*` features |
 | **System resolver config** (`/etc/resolv.conf`, Windows) | ❌ By design; the host configures everything | ✅ `system-config` (default) |
 | **Upstream connection reuse** | ❌ New connection per query | ✅ Name-server pool |
-| **EDNS0 on UDP** | ❌ 512 bytes, then TCP fallback | Not compared |
+| **EDNS0 on UDP** | ➖ The client's OPT record is forwarded; none is added, and the inbound listener answers with at most 512 bytes | Not compared |
 | **Throughput and latency** | Not yet benchmarked | Not yet benchmarked |
 
 ## 🛠️ API Overview
@@ -716,8 +718,8 @@ the port.
 <details>
 <summary><b>Large answers are empty with the <code>TC</code> bit set</b></summary>
 
-DNS Lattice does not support EDNS0 yet, so UDP responses are capped at 512
-bytes. The inbound UDP listener sends an empty, truncated response and the
+The inbound UDP listener does not read EDNS0 yet, so it answers with at most
+512 bytes. For a larger answer it sends an empty, truncated response and the
 client is expected to retry over TCP; also listen on TCP (`tcp_addr`) at the
 same address. `UdpBackend` performs that TCP retry itself.
 </details>
