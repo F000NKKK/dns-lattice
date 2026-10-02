@@ -9,10 +9,13 @@
 //! timeout(s)), and one dedicated config struct per transport rather than a
 //! shared enum.
 //!
-//! [`UdpBackend`] does not support EDNS0/OPT: it sends
-//! queries with no OPT record and falls back to a TCP query to the same
-//! server whenever a UDP response arrives with the `TC` (truncated) bit
-//! set, rather than negotiating a larger UDP payload size.
+//! [`UdpBackend`] does not support EDNS0/OPT: it adds no OPT record of its
+//! own and falls back to a TCP query to the same server whenever a UDP
+//! response arrives with the `TC` (truncated) bit set, rather than
+//! negotiating a larger UDP payload size. It sends the query it is given
+//! unchanged, so a forwarded client query keeps the client's OPT record and
+//! the upstream may answer with more than 512 bytes; the backend receives
+//! any UDP DNS payload up to 65535 bytes.
 //!
 //! # Response validation
 //!
@@ -92,18 +95,22 @@ pub(crate) use doq::QuicStream;
 #[cfg(feature = "doq")]
 pub use doq::{DoqBackend, DoqBackendConfig};
 
-/// Maximum size, in bytes, of a UDP response this baseline backend accepts
-/// without EDNS0 payload-size negotiation (RFC 1035 §4.2.1's 512-byte
-/// standard UDP message size). A larger answer arrives with `TC=1` set and
-/// is size-truncated by the responding server itself; [`UdpBackend`] then
-/// falls back to a TCP query.
+/// RFC 1035 §4.2.1's 512-byte standard UDP message size: the largest
+/// response `crate::server`'s UDP listener sends before it truncates the
+/// answer and sets `TC=1`, since it negotiates no larger EDNS0 payload size.
 ///
-/// `pub(crate)` (not private) so `crate::server`'s UDP listener can reuse
-/// the same boundary when deciding whether to truncate an outbound response
-/// and set `TC=1` — the baseline server
-/// has no larger negotiated payload size to honor either, so it shares this
-/// exact constant rather than redefining an equivalent one.
+/// This is not the [`UdpBackend`] receive limit. The backend forwards a
+/// query unchanged, including any EDNS0 OPT record the original client
+/// added, so the upstream may legitimately answer with more than 512 bytes;
+/// see [`UDP_RECV_BUFFER_LEN`].
 pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
+
+/// Size of the [`UdpBackend`] receive buffer: the largest DNS message a UDP
+/// datagram can carry (the 16-bit UDP length bounds the payload, and a DNS
+/// message is addressable up to 65535 bytes). Receiving into a smaller
+/// buffer would cut an EDNS0-sized answer, which then fails to decode
+/// (Linux) or fails the receive call (Windows).
+const UDP_RECV_BUFFER_LEN: usize = 65_535;
 
 /// Whether [`validate_response`] requires the response's message id to
 /// equal the query's.
@@ -202,6 +209,10 @@ pub struct UdpBackendConfig {
 /// Baseline UDP upstream backend (RFC 1035 §4.2.1). No EDNS0/OPT support
 /// and falls back to a TCP query to the same server when a
 /// response arrives with the `TC` (truncated) bit set.
+///
+/// A response of any size up to 65535 bytes is accepted, so an answer
+/// larger than 512 bytes to a query that carries an OPT record is returned
+/// intact rather than cut off.
 pub struct UdpBackend {
     config: UdpBackendConfig,
 }
@@ -233,7 +244,8 @@ impl UpstreamBackend for UdpBackend {
         // off-path spoofed reply cannot displace the real one and cannot
         // extend the wait past the configured timeout either.
         let deadline = Instant::now() + self.config.timeout;
-        let mut buf = [0u8; UDP_MAX_RESPONSE_LEN];
+        // Heap-allocated: a 64 KiB array would bloat this future's size.
+        let mut buf = vec![0u8; UDP_RECV_BUFFER_LEN];
         let response = loop {
             let len = recv_udp(&socket, &mut buf, deadline).await?;
             let response = Message::decode(&buf[..len])?;
@@ -447,7 +459,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dns_lattice_model::{Class, Header, Name, Opcode, Question, Rcode, RecordType};
+    use dns_lattice_model::{
+        Class, Header, Name, Opcode, Question, RData, Rcode, RecordType, ResourceRecord,
+    };
     use tokio::net::TcpListener;
 
     fn query_for(name: &str) -> Message {
@@ -765,6 +779,88 @@ mod tests {
         assert_eq!(answer.header.id, 11);
         assert_eq!(answer.header.rcode, Rcode::NxDomain);
         responder.await.unwrap();
+    }
+
+    /// An EDNS0 OPT pseudo-record (RFC 6891 §6.1.2) advertising a 4096-byte
+    /// UDP payload, carried as an opaque record since the model has no
+    /// EDNS0 type.
+    fn opt_record() -> ResourceRecord {
+        ResourceRecord {
+            name: Name::root(),
+            rtype: RecordType::Other(41),
+            class: Class::Other(4096),
+            ttl: 0,
+            rdata: RData::Unknown {
+                rtype: 41,
+                data: vec![],
+            },
+        }
+    }
+
+    /// Sends `query` to a loopback UDP responder that answers with 100 A
+    /// records (well over 512 bytes) and asserts the backend returns the
+    /// whole answer.
+    async fn assert_udp_backend_receives_a_large_answer(query: Message) {
+        const ANSWERS: usize = 100;
+        let expect_opt = !query.additionals.is_empty();
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            let (len, from) = server.recv_from(&mut buf).await.unwrap();
+            let query = Message::decode(&buf[..len]).unwrap();
+            // The backend forwards the query unchanged, OPT included.
+            assert_eq!(!query.additionals.is_empty(), expect_opt);
+
+            let mut response = answer_for("example.com", query.header.id);
+            response.answers = (0..ANSWERS)
+                .map(|i| ResourceRecord {
+                    name: Name::from_ascii("example.com").unwrap(),
+                    rtype: RecordType::A,
+                    class: Class::In,
+                    ttl: 300,
+                    rdata: RData::A(Ipv4Addr::new(192, 0, 2, i as u8)),
+                })
+                .collect();
+            response.additionals = query.additionals.clone();
+            let bytes = response.encode().unwrap();
+            assert!(bytes.len() > UDP_MAX_RESPONSE_LEN, "{} bytes", bytes.len());
+            server.send_to(&bytes, from).await.unwrap();
+            bytes.len()
+        });
+
+        let backend = UdpBackend::new(UdpBackendConfig {
+            server: server_addr,
+            timeout: Duration::from_secs(2),
+            bind_addr: None,
+        });
+
+        let answer = backend
+            .resolve(&query)
+            .await
+            .expect("an answer larger than 512 bytes decodes intact");
+        let sent_len = responder.await.unwrap();
+        assert!(!answer.header.truncated);
+        assert_eq!(answer.answers.len(), ANSWERS);
+        for (i, record) in answer.answers.iter().enumerate() {
+            assert_eq!(record.rdata, RData::A(Ipv4Addr::new(192, 0, 2, i as u8)));
+        }
+        assert_eq!(answer.additionals, query.additionals);
+        assert_eq!(answer.encode().unwrap().len(), sent_len);
+    }
+
+    #[tokio::test]
+    async fn udp_backend_receives_an_answer_larger_than_512_bytes_for_an_edns_query() {
+        let mut query = query_for("example.com");
+        query.additionals.push(opt_record());
+        assert_udp_backend_receives_a_large_answer(query).await;
+    }
+
+    #[tokio::test]
+    async fn udp_backend_receives_an_answer_larger_than_512_bytes_without_edns() {
+        assert_udp_backend_receives_a_large_answer(query_for("example.com")).await;
     }
 
     #[tokio::test]

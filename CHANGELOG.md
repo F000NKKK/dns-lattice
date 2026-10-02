@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The UDP upstream backend received into a 512-byte buffer, although it
+  forwards a client's query unchanged, including an EDNS0 OPT record that
+  advertises a larger payload. An upstream answer over 512 bytes was cut
+  off: on Linux it then failed to decode and the client got `SERVFAIL`; on
+  Windows the receive failed and the resolver moved to the next upstream.
+  The backend now receives any UDP DNS payload up to 65535 bytes. A response
+  with `TC=1` still falls back to TCP as before. No public API change.
+
 ### Security
 
 - Every upstream backend (UDP, TCP, DoT, DoH, DoH3, DoQ) now checks that a
