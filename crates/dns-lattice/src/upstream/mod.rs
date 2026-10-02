@@ -14,6 +14,17 @@
 //! server whenever a UDP response arrives with the `TC` (truncated) bit
 //! set, rather than negotiating a larger UDP payload size.
 //!
+//! # Response validation
+//!
+//! Every built-in backend returns a response only if it answers the query:
+//! the `QR` bit is set and the question section matches the query's (name
+//! compared case-insensitively, plus type and class). [`UdpBackend`],
+//! [`TcpBackend`], and the DoT backend also require the message id to match;
+//! the DoH and DoQ backends do not compare it, because RFC 8484 and RFC 9250
+//! use id 0 on the wire. [`UdpBackend`] drops a mismatching datagram and
+//! keeps waiting until its timeout expires; the stream-based backends return
+//! [`Error::Transport`] for a mismatch, which the resolver fails over on.
+//!
 //! # DoT, DoH, and DoQ (feature-gated)
 //!
 //! Three additional backends land in this module, each behind its own
@@ -57,7 +68,7 @@ use dns_lattice_core::{Error, Result};
 use dns_lattice_model::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 #[cfg(feature = "dot")]
 mod dot;
@@ -93,6 +104,66 @@ pub use doq::{DoqBackend, DoqBackendConfig};
 /// has no larger negotiated payload size to honor either, so it shares this
 /// exact constant rather than redefining an equivalent one.
 pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
+
+/// Whether [`validate_response`] requires the response's message id to
+/// equal the query's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdCheck {
+    /// The response id must equal the query id (UDP, TCP, DoT).
+    Match,
+    /// The id is not compared. RFC 8484 §4.1 (DoH) and RFC 9250 §4.2.1
+    /// (DoQ) set the message id to 0 on the wire, so a conforming server
+    /// may answer with an id that differs from the caller's query id.
+    // Only the feature-gated DoH/DoQ backends construct this variant.
+    #[cfg_attr(not(any(feature = "doh", feature = "doq")), allow(dead_code))]
+    Ignore,
+}
+
+/// Checks that `response` answers `query`: the message id matches (unless
+/// `id_check` is [`IdCheck::Ignore`]), the `QR` bit is set, and the
+/// question section matches the query's in count, order, name (compared
+/// case-insensitively), type, and class.
+///
+/// Shared by every built-in upstream transport so a response for some other
+/// query, a reflected query, or a spoofed datagram is never returned to the
+/// resolver or cached. A mismatch is reported as [`Error::Transport`], which
+/// the resolver treats as retryable and fails over on; the UDP backend
+/// instead drops a mismatching datagram and keeps waiting for a valid one
+/// until its timeout expires.
+pub(crate) fn validate_response(
+    query: &Message,
+    response: &Message,
+    id_check: IdCheck,
+) -> Result<()> {
+    if id_check == IdCheck::Match && response.header.id != query.header.id {
+        return Err(Error::Transport(format!(
+            "upstream response id {} does not match query id {}",
+            response.header.id, query.header.id
+        )));
+    }
+    if !response.header.qr {
+        return Err(Error::Transport(
+            "upstream response does not have the QR (response) bit set".to_string(),
+        ));
+    }
+    let questions_match = response.questions.len() == query.questions.len()
+        && response
+            .questions
+            .iter()
+            .zip(&query.questions)
+            .all(|(answered, asked)| {
+                // `Name`'s equality is ASCII case-insensitive.
+                answered.name == asked.name
+                    && answered.qtype == asked.qtype
+                    && answered.qclass == asked.qclass
+            });
+    if !questions_match {
+        return Err(Error::Transport(
+            "upstream response question section does not match the query".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// A public, async, object-safe upstream DNS backend seam: given a query
 /// [`Message`], resolve it against this backend and return the answer.
@@ -156,9 +227,20 @@ impl UpstreamBackend for UdpBackend {
         let payload = query.encode()?;
         send_udp(&socket, &payload, self.config.timeout).await?;
 
+        // One deadline bounds the whole receive phase: a datagram that is
+        // not an answer to this query (wrong id, QR=0, or a different
+        // question) is dropped and the backend keeps waiting, so an
+        // off-path spoofed reply cannot displace the real one and cannot
+        // extend the wait past the configured timeout either.
+        let deadline = Instant::now() + self.config.timeout;
         let mut buf = [0u8; UDP_MAX_RESPONSE_LEN];
-        let len = recv_udp(&socket, &mut buf, self.config.timeout).await?;
-        let response = Message::decode(&buf[..len])?;
+        let response = loop {
+            let len = recv_udp(&socket, &mut buf, deadline).await?;
+            let response = Message::decode(&buf[..len])?;
+            if validate_response(query, &response, IdCheck::Match).is_ok() {
+                break response;
+            }
+        };
 
         if response.header.truncated {
             return tcp_query(
@@ -242,8 +324,8 @@ async fn send_udp(socket: &UdpSocket, payload: &[u8], budget: Duration) -> Resul
     Ok(())
 }
 
-async fn recv_udp(socket: &UdpSocket, buf: &mut [u8], budget: Duration) -> Result<usize> {
-    timeout(budget, socket.recv(buf))
+async fn recv_udp(socket: &UdpSocket, buf: &mut [u8], deadline: Instant) -> Result<usize> {
+    timeout_at(deadline, socket.recv(buf))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))
@@ -264,14 +346,19 @@ async fn tcp_query(
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
 
-    framed_query(&mut stream, read_timeout, query).await
+    framed_query(&mut stream, read_timeout, query, IdCheck::Match).await
 }
 
 /// Sends `query` over an already-established, ordered byte stream using
 /// RFC 1035 §4.2.2's 2-byte big-endian length-prefixed framing, and
 /// returns the decoded response. Shared by [`tcp_query`] (plaintext TCP)
-/// and, behind the `dot` feature, `dot::DotBackend` (the same framing over
-/// an established TLS stream).
+/// and, behind the `dot`/`doq` features, `dot::DotBackend` (the same
+/// framing over an established TLS stream) and `doq::DoqBackend` (one
+/// bidirectional QUIC stream).
+///
+/// The decoded response is checked with [`validate_response`] using
+/// `id_check`; a mismatch is returned as [`Error::Transport`] so the
+/// resolver fails over to the next backend.
 ///
 /// Implemented in terms of [`write_framed`] and [`read_framed`] — this
 /// one-shot write-then-read shape stays as the
@@ -281,12 +368,15 @@ pub(crate) async fn framed_query<S>(
     stream: &mut S,
     budget: Duration,
     query: &Message,
+    id_check: IdCheck,
 ) -> Result<Message>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     write_framed(stream, budget, query).await?;
-    read_framed(stream, budget).await
+    let response = read_framed(stream, budget).await?;
+    validate_response(query, &response, id_check)?;
+    Ok(response)
 }
 
 /// Writes `message` to `stream` using RFC 1035 §4.2.2's 2-byte big-endian
@@ -553,5 +643,274 @@ mod tests {
             .expect_err("a peer that closes before a DNS response is transport failure");
         assert!(matches!(err, Error::Transport(_)));
         responder.await.unwrap();
+    }
+
+    #[test]
+    fn validate_response_accepts_a_matching_answer() {
+        let query = query_for("example.com");
+        let answer = answer_for("example.com", query.header.id);
+        assert_eq!(validate_response(&query, &answer, IdCheck::Match), Ok(()));
+    }
+
+    #[test]
+    fn validate_response_matches_the_question_name_case_insensitively() {
+        let query = query_for("ExAmPlE.CoM");
+        let answer = answer_for("example.com", query.header.id);
+        assert_eq!(validate_response(&query, &answer, IdCheck::Match), Ok(()));
+        let query = query_for("example.com");
+        let answer = answer_for("EXAMPLE.COM", query.header.id);
+        assert_eq!(validate_response(&query, &answer, IdCheck::Match), Ok(()));
+    }
+
+    #[test]
+    fn validate_response_rejects_a_wrong_id_unless_ignored() {
+        let query = query_for("example.com");
+        let answer = answer_for("example.com", query.header.id.wrapping_add(1));
+        assert!(matches!(
+            validate_response(&query, &answer, IdCheck::Match),
+            Err(Error::Transport(_))
+        ));
+        // DoH/DoQ: RFC 8484/9250 put id 0 on the wire.
+        let answer = answer_for("example.com", 0);
+        assert_eq!(validate_response(&query, &answer, IdCheck::Ignore), Ok(()));
+    }
+
+    #[test]
+    fn validate_response_rejects_qr_zero_even_when_the_id_is_ignored() {
+        let query = query_for("example.com");
+        for id_check in [IdCheck::Match, IdCheck::Ignore] {
+            assert!(matches!(
+                validate_response(&query, &query, id_check),
+                Err(Error::Transport(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_response_rejects_a_different_question() {
+        let query = query_for("example.com");
+        let id = query.header.id;
+
+        let other_name = answer_for("example.org", id);
+        let mut other_type = answer_for("example.com", id);
+        other_type.questions[0].qtype = RecordType::Aaaa;
+        let mut other_class = answer_for("example.com", id);
+        other_class.questions[0].qclass = Class::Ch;
+        let mut no_question = answer_for("example.com", id);
+        no_question.questions.clear();
+        let mut extra_question = answer_for("example.com", id);
+        extra_question
+            .questions
+            .push(extra_question.questions[0].clone());
+
+        for answer in [
+            other_name,
+            other_type,
+            other_class,
+            no_question,
+            extra_question,
+        ] {
+            for id_check in [IdCheck::Match, IdCheck::Ignore] {
+                assert!(
+                    matches!(
+                        validate_response(&query, &answer, id_check),
+                        Err(Error::Transport(_))
+                    ),
+                    "{answer:?} must not be accepted for {query:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_backend_drops_mismatching_datagrams_and_accepts_the_valid_answer() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, from) = server.recv_from(&mut buf).await.unwrap();
+            let query = Message::decode(&buf[..len]).unwrap();
+            let id = query.header.id;
+
+            let wrong_id = answer_for("example.com", id.wrapping_add(1));
+            let mut not_a_response = answer_for("example.com", id);
+            not_a_response.header.qr = false;
+            let wrong_question = answer_for("example.org", id);
+            let mut wrong_type = answer_for("example.com", id);
+            wrong_type.questions[0].qtype = RecordType::Aaaa;
+            // The valid answer echoes the name in a different case.
+            let mut valid = answer_for("EXAMPLE.com", id);
+            valid.header.rcode = Rcode::NxDomain;
+
+            for response in [wrong_id, not_a_response, wrong_question, wrong_type, valid] {
+                server
+                    .send_to(&response.encode().unwrap(), from)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let backend = UdpBackend::new(UdpBackendConfig {
+            server: server_addr,
+            timeout: Duration::from_secs(2),
+            bind_addr: None,
+        });
+
+        let answer = backend
+            .resolve(&query_for("Example.COM"))
+            .await
+            .expect("the valid answer after the mismatching datagrams is accepted");
+        assert!(answer.header.qr);
+        assert_eq!(answer.header.id, 11);
+        assert_eq!(answer.header.rcode, Rcode::NxDomain);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_backend_times_out_when_only_mismatching_datagrams_arrive() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, from) = server.recv_from(&mut buf).await.unwrap();
+            let query = Message::decode(&buf[..len]).unwrap();
+            let spoofed = answer_for("example.com", query.header.id.wrapping_add(1));
+            server
+                .send_to(&spoofed.encode().unwrap(), from)
+                .await
+                .unwrap();
+        });
+
+        let backend = UdpBackend::new(UdpBackendConfig {
+            server: server_addr,
+            timeout: Duration::from_millis(200),
+            bind_addr: None,
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a mismatching datagram is never returned");
+        assert_eq!(err, Error::Timeout);
+        responder.await.unwrap();
+    }
+
+    /// Accepts one TCP connection, reads one framed query, and answers it
+    /// with `respond(query)`.
+    async fn serve_one_tcp_response(
+        listener: TcpListener,
+        respond: impl FnOnce(&Message) -> Message,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        let query = Message::decode(&payload).unwrap();
+
+        let bytes = respond(&query).encode().unwrap();
+        let framed_len: u16 = bytes.len().try_into().unwrap();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&framed_len.to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        stream.write_all(&framed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_backend_rejects_mismatching_responses_as_transport_errors() {
+        let responders: [fn(&Message) -> Message; 3] = [
+            |query| answer_for("example.com", query.header.id.wrapping_add(1)),
+            |query| {
+                let mut reply = answer_for("example.com", query.header.id);
+                reply.header.qr = false;
+                reply
+            },
+            |query| answer_for("example.org", query.header.id),
+        ];
+
+        for respond in responders {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let responder = tokio::spawn(serve_one_tcp_response(listener, respond));
+
+            let backend = TcpBackend::new(TcpBackendConfig {
+                server: addr,
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            });
+
+            let err = backend
+                .resolve(&query_for("example.com"))
+                .await
+                .expect_err("a mismatching tcp response is rejected");
+            assert!(matches!(err, Error::Transport(_)), "{err:?}");
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_backend_accepts_a_case_different_question_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_tcp_response(listener, |query| {
+            answer_for("EXAMPLE.COM", query.header.id)
+        }));
+
+        let backend = TcpBackend::new(TcpBackendConfig {
+            server: addr,
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+        });
+
+        let answer = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("the name comparison is case-insensitive");
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_over_when_an_upstream_answers_the_wrong_question() {
+        use crate::engine::Resolver;
+        use dns_lattice_model::{SplitDnsPolicy, UpstreamGroupId};
+
+        let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad.local_addr().unwrap();
+        let bad_responder = tokio::spawn(serve_one_tcp_response(bad, |query| {
+            answer_for("example.org", query.header.id)
+        }));
+        let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good.local_addr().unwrap();
+        let good_responder = tokio::spawn(serve_one_tcp_response(good, |query| {
+            answer_for("example.com", query.header.id)
+        }));
+
+        let tcp = |server| {
+            TcpBackend::new(TcpBackendConfig {
+                server,
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            })
+        };
+        let group = UpstreamGroupId::new("default");
+        let policy = SplitDnsPolicy::builder()
+            .default_group(group.clone())
+            .build();
+        let resolver = Resolver::builder(policy)
+            .backend(group.clone(), tcp(bad_addr))
+            .backend(group, tcp(good_addr))
+            .build();
+
+        let answer = resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("the resolver fails over to the matching upstream");
+        assert_eq!(answer.questions, query_for("example.com").questions);
+        bad_responder.await.unwrap();
+        good_responder.await.unwrap();
     }
 }

@@ -22,7 +22,7 @@ use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
-use super::{UpstreamBackend, framed_query};
+use super::{IdCheck, UpstreamBackend, framed_query};
 
 /// The ALPN protocol identifier for DNS-over-QUIC (RFC 9250 §4.1.1).
 const DOQ_ALPN: &[u8] = b"doq";
@@ -135,7 +135,13 @@ impl UpstreamBackend for DoqBackend {
             .map_err(connection_error_to_lattice_error)?;
 
         let mut stream = QuicStream { send, recv };
-        let response = framed_query(&mut stream, self.config.read_timeout, query).await;
+        let response = framed_query(
+            &mut stream,
+            self.config.read_timeout,
+            query,
+            IdCheck::Ignore,
+        )
+        .await;
 
         // Per RFC 9250 §4.2, the client SHOULD close the send side of the
         // stream gracefully after sending the query. Attempted for both
@@ -361,6 +367,84 @@ mod tests {
             .await
             .expect("doq backend resolves");
         assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    /// Accepts one QUIC connection and one bidirectional stream, reads one
+    /// framed query, and answers it with `respond(query)`.
+    async fn serve_one_doq_response(endpoint: Endpoint, respond: fn(&Message) -> Message) {
+        let incoming = endpoint.accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        recv.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        recv.read_exact(&mut payload).await.unwrap();
+        let query = Message::decode(&payload).unwrap();
+
+        let bytes = respond(&query).encode().unwrap();
+        let framed_len: u16 = bytes.len().try_into().unwrap();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&framed_len.to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        send.write_all(&framed).await.unwrap();
+        let _ = send.finish();
+        // See `doq_backend_resolves_against_a_loopback_quic_server`: keep
+        // the connection alive until the client has read the response.
+        let _ = send.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn doq_backend_accepts_a_response_with_id_zero() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        // RFC 9250 §4.2.1 puts message id 0 on the wire; the id is not
+        // compared for DoQ, only QR and the question.
+        let responder = tokio::spawn(serve_one_doq_response(endpoint, |_query| {
+            answer_for("EXAMPLE.com", 0)
+        }));
+
+        let backend = DoqBackend::new(DoqBackendConfig {
+            server: addr,
+            server_name,
+            tls_config: Arc::new(client_config),
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+        });
+
+        let answer = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("a DoQ response with id 0 and a matching question is accepted");
+        assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doq_backend_rejects_a_response_for_a_different_question() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let responder = tokio::spawn(serve_one_doq_response(endpoint, |_query| {
+            answer_for("example.org", 0)
+        }));
+
+        let backend = DoqBackend::new(DoqBackendConfig {
+            server: addr,
+            server_name,
+            tls_config: Arc::new(client_config),
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a DoQ response for another question is rejected");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
         responder.await.unwrap();
     }
 

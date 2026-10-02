@@ -29,7 +29,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 #[cfg(feature = "doh")]
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 
-use super::UpstreamBackend;
+use super::{IdCheck, UpstreamBackend, validate_response};
 
 /// The DoH request's HTTP method (RFC 8484 §4.1). Both wire formats carry
 /// the DNS query in `application/dns-message` wire format; they differ
@@ -190,7 +190,7 @@ impl UpstreamBackend for DohBackend {
             .map_err(|err| Error::Transport(err.to_string()))?
             .to_bytes();
 
-        Message::decode(&body)
+        decode_validated(query, &body)
     }
 }
 
@@ -288,8 +288,19 @@ impl UpstreamBackend for Doh3Backend {
         }
         endpoint.close(0u32.into(), b"request complete");
         driver_task.abort();
-        Message::decode(&body)
+        decode_validated(query, &body)
     }
+}
+
+/// Decodes a DoH response body and checks it against `query` with
+/// [`validate_response`]. The message id is not compared: RFC 8484 §4.1
+/// has DoH clients use id 0 and the HTTP exchange itself pairs the request
+/// with its response, so a conforming server may answer with an id that
+/// differs from the caller's query id.
+fn decode_validated(query: &Message, body: &[u8]) -> Result<Message> {
+    let response = Message::decode(body)?;
+    validate_response(query, &response, IdCheck::Ignore)?;
+    Ok(response)
 }
 
 /// Maps QUIC handshake failures onto the crate's stable error boundary.
@@ -705,6 +716,92 @@ mod tests {
         });
         let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh3_backend_rejects_a_response_with_qr_zero() {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let mut reflected = answer_for("example.com", 0);
+        reflected.header.qr = false;
+        let responder = tokio::spawn(serve_one_doh3_response(
+            endpoint,
+            reflected,
+            hyper::Method::GET,
+        ));
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            server: addr,
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a DoH3 response with QR=0 is rejected");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_backend_rejects_a_response_for_a_different_question() {
+        let (server_config, client_config) = self_signed_fixture();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder = tokio::spawn(serve_one_doh_response(
+            listener,
+            acceptor,
+            answer_for("example.org", 0),
+        ));
+
+        let backend = DohBackend::new(DohBackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            method: DohMethod::Post,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a DoH response for another question is rejected");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_backend_accepts_id_zero_and_a_case_different_name() {
+        let (server_config, client_config) = self_signed_fixture();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder = tokio::spawn(serve_one_doh_response(
+            listener,
+            acceptor,
+            answer_for("EXAMPLE.COM", 0),
+        ));
+
+        let backend = DohBackend::new(DohBackendConfig {
+            uri: Uri::from_str(&format!("https://localhost:{}/dns-query", addr.port())).unwrap(),
+            method: DohMethod::Get,
+            tls_config: Arc::new(client_config),
+            timeout: Duration::from_secs(2),
+        });
+
+        let answer = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("RFC 8484 id 0 and a case-different name are accepted");
+        assert_eq!(answer.header.id, 0);
         responder.await.unwrap();
     }
 

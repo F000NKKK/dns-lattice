@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Every upstream backend (UDP, TCP, DoT, DoH, DoH3, DoQ) now checks that a
+  response answers its query before returning it: `QR` must be set and the
+  question section must match (name compared case-insensitively, plus type
+  and class). UDP, TCP, and DoT also require the message id to match; DoH
+  and DoQ skip the id check because RFC 8484 and RFC 9250 use id 0.
+  Previously a response for a different question, a reflected query, or on
+  UDP a spoofed datagram with any id could be returned to the client and
+  cached. The UDP backend now drops a mismatching datagram and keeps waiting
+  until its timeout; the stream transports report a mismatch as
+  `Error::Transport`, so the resolver fails over to the next backend. No
+  public API change.
+
 ## [1.1.2] - 2026-10-01
 
 ### Changed

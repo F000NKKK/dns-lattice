@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ClientConfig;
 
-use super::{UpstreamBackend, framed_query};
+use super::{IdCheck, UpstreamBackend, framed_query};
 
 /// Configuration for [`DotBackend`].
 #[derive(Clone)]
@@ -110,7 +110,13 @@ impl UpstreamBackend for DotBackend {
         .map_err(|_| Error::Timeout)?
         .map_err(map_tls_connect_error)?;
 
-        framed_query(&mut tls_stream, self.config.read_timeout, query).await
+        framed_query(
+            &mut tls_stream,
+            self.config.read_timeout,
+            query,
+            IdCheck::Match,
+        )
+        .await
     }
 }
 
@@ -250,6 +256,50 @@ mod tests {
             .await
             .expect("dot backend resolves");
         assert!(answer.header.qr);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dot_backend_rejects_a_response_with_a_different_id() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+
+            let mut len_buf = [0u8; 2];
+            tls_stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            tls_stream.read_exact(&mut payload).await.unwrap();
+            let query = Message::decode(&payload).unwrap();
+
+            let response = answer_for("example.com", query.header.id.wrapping_add(1));
+            let bytes = response.encode().unwrap();
+            let framed_len: u16 = bytes.len().try_into().unwrap();
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&framed_len.to_be_bytes());
+            framed.extend_from_slice(&bytes);
+            tls_stream.write_all(&framed).await.unwrap();
+        });
+
+        let backend = DotBackend::new(DotBackendConfig {
+            server: addr,
+            server_name,
+            tls_config: Arc::new(client_config),
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+        });
+
+        let err = backend
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("a DoT response with another id is rejected");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
         responder.await.unwrap();
     }
 

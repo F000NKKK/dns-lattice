@@ -242,6 +242,15 @@ timeout/transport/TLS failures may advance to the next backend. If all
 backends fail, the last failure is returned and no successful answer is
 inserted into the cache.
 
+Every built-in backend checks that a decoded response answers its query
+before returning it: `QR` must be set and the question section must match the
+query's (name compared case-insensitively, plus type and class). UDP, TCP,
+and DoT also require the response message id to equal the query id; DoH and
+DoQ do not compare it, because RFC 8484 and RFC 9250 use id 0 on the wire.
+The UDP backend drops a mismatching datagram and keeps waiting until its
+timeout; the stream transports report a mismatch as a transport error, so the
+resolver fails over to the next backend.
+
 Implemented transports:
 
 | Transport | Cargo feature | Notes |
