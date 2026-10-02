@@ -296,10 +296,12 @@ impl UpstreamBackend for Doh3Backend {
 /// [`validate_response`]. The message id is not compared: RFC 8484 §4.1
 /// has DoH clients use id 0 and the HTTP exchange itself pairs the request
 /// with its response, so a conforming server may answer with an id that
-/// differs from the caller's query id.
+/// differs from the caller's query id. The returned response carries the
+/// caller's query id, so it can be relayed to the original client as is.
 fn decode_validated(query: &Message, body: &[u8]) -> Result<Message> {
-    let response = Message::decode(body)?;
+    let mut response = Message::decode(body)?;
     validate_response(query, &response, IdCheck::Ignore)?;
+    response.header.id = query.header.id;
     Ok(response)
 }
 
@@ -801,7 +803,8 @@ mod tests {
             .resolve(&query_for("example.com"))
             .await
             .expect("RFC 8484 id 0 and a case-different name are accepted");
-        assert_eq!(answer.header.id, 0);
+        // The caller's query id is restored on the returned response.
+        assert_eq!(answer.header.id, query_for("example.com").header.id);
         responder.await.unwrap();
     }
 

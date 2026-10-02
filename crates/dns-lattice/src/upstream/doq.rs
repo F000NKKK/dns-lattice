@@ -134,14 +134,23 @@ impl UpstreamBackend for DoqBackend {
             .map_err(|_| Error::Timeout)?
             .map_err(connection_error_to_lattice_error)?;
 
+        // RFC 9250 §4.2.1: the message id on the wire MUST be 0. The
+        // caller's id is put back on the response below.
+        let mut wire_query = query.clone();
+        wire_query.header.id = 0;
+
         let mut stream = QuicStream { send, recv };
         let response = framed_query(
             &mut stream,
             self.config.read_timeout,
-            query,
+            &wire_query,
             IdCheck::Ignore,
         )
-        .await;
+        .await
+        .map(|mut response| {
+            response.header.id = query.header.id;
+            response
+        });
 
         // Per RFC 9250 §4.2, the client SHOULD close the send side of the
         // stream gracefully after sending the query. Attempted for both
@@ -403,7 +412,8 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         // RFC 9250 §4.2.1 puts message id 0 on the wire; the id is not
         // compared for DoQ, only QR and the question.
-        let responder = tokio::spawn(serve_one_doq_response(endpoint, |_query| {
+        let responder = tokio::spawn(serve_one_doq_response(endpoint, |query| {
+            assert_eq!(query.header.id, 0, "a DoQ query is sent with id 0");
             answer_for("EXAMPLE.com", 0)
         }));
 
@@ -420,6 +430,9 @@ mod tests {
             .await
             .expect("a DoQ response with id 0 and a matching question is accepted");
         assert!(answer.header.qr);
+        // The caller's query id is restored on the returned response.
+        assert_eq!(answer.header.id, query_for("example.com").header.id);
+        assert_ne!(answer.header.id, 0);
         responder.await.unwrap();
     }
 

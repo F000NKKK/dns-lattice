@@ -24,8 +24,10 @@
 //! compared case-insensitively, plus type and class). [`UdpBackend`],
 //! [`TcpBackend`], and the DoT backend also require the message id to match;
 //! the DoH and DoQ backends do not compare it, because RFC 8484 and RFC 9250
-//! use id 0 on the wire. [`UdpBackend`] drops a mismatching datagram and
-//! keeps waiting until its timeout expires; the stream-based backends return
+//! use id 0 on the wire (the DoQ backend sends its query with id 0); both
+//! return the response with the caller's query id. [`UdpBackend`] drops a
+//! datagram that does not decode or does not match, and keeps waiting until
+//! its timeout expires; the stream-based backends return
 //! [`Error::Transport`] for a mismatch, which the resolver fails over on.
 //!
 //! # DoT, DoH, and DoQ (feature-gated)
@@ -238,17 +240,20 @@ impl UpstreamBackend for UdpBackend {
         let payload = query.encode()?;
         send_udp(&socket, &payload, self.config.timeout).await?;
 
-        // One deadline bounds the whole receive phase: a datagram that is
-        // not an answer to this query (wrong id, QR=0, or a different
-        // question) is dropped and the backend keeps waiting, so an
-        // off-path spoofed reply cannot displace the real one and cannot
-        // extend the wait past the configured timeout either.
+        // One deadline bounds the whole receive phase: a datagram that does
+        // not decode, or is not an answer to this query (wrong id, QR=0, or
+        // a different question), is dropped and the backend keeps waiting,
+        // so an off-path spoofed reply cannot displace the real one, cannot
+        // end the query early, and cannot extend the wait past the
+        // configured timeout either.
         let deadline = Instant::now() + self.config.timeout;
         // Heap-allocated: a 64 KiB array would bloat this future's size.
         let mut buf = vec![0u8; UDP_RECV_BUFFER_LEN];
         let response = loop {
             let len = recv_udp(&socket, &mut buf, deadline).await?;
-            let response = Message::decode(&buf[..len])?;
+            let Ok(response) = Message::decode(&buf[..len]) else {
+                continue;
+            };
             if validate_response(query, &response, IdCheck::Match).is_ok() {
                 break response;
             }
@@ -757,6 +762,9 @@ mod tests {
             let mut valid = answer_for("EXAMPLE.com", id);
             valid.header.rcode = Rcode::NxDomain;
 
+            // A datagram that does not even decode (shorter than a header)
+            // is dropped too, rather than ending the query.
+            server.send_to(&[0xff; 3], from).await.unwrap();
             for response in [wrong_id, not_a_response, wrong_question, wrong_type, valid] {
                 server
                     .send_to(&response.encode().unwrap(), from)

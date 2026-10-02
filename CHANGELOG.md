@@ -12,10 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The UDP upstream backend received into a 512-byte buffer, although it
   forwards a client's query unchanged, including an EDNS0 OPT record that
   advertises a larger payload. An upstream answer over 512 bytes was cut
-  off: on Linux it then failed to decode and the client got `SERVFAIL`; on
-  Windows the receive failed and the resolver moved to the next upstream.
-  The backend now receives any UDP DNS payload up to 65535 bytes. A response
-  with `TC=1` still falls back to TCP as before. No public API change.
+  off: on Linux and macOS it then failed to decode and the client got
+  `SERVFAIL`; on Windows the receive failed and the resolver moved to the
+  next upstream. The backend now receives any UDP DNS payload up to 65535
+  bytes. A response with `TC=1` still falls back to TCP as before. No public
+  API change.
+- The DoQ backend sent the caller's message id, although RFC 9250 requires
+  id 0 on the wire; it now sends id 0. The DoH and DoQ backends now return
+  the response with the caller's query id, so a forwarded answer from a
+  server that replies with id 0 reaches the client with its own id. No
+  public API change.
 
 ### Security
 
@@ -26,8 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and DoQ skip the id check because RFC 8484 and RFC 9250 use id 0.
   Previously a response for a different question, a reflected query, or on
   UDP a spoofed datagram with any id could be returned to the client and
-  cached. The UDP backend now drops a mismatching datagram and keeps waiting
-  until its timeout; the stream transports report a mismatch as
+  cached. The UDP backend now drops a mismatching or undecodable datagram
+  (previously an undecodable one ended the query with `SERVFAIL`) and keeps
+  waiting until its timeout; the stream transports report a mismatch as
   `Error::Transport`, so the resolver fails over to the next backend. No
   public API change.
 

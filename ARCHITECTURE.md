@@ -246,9 +246,10 @@ Every built-in backend checks that a decoded response answers its query
 before returning it: `QR` must be set and the question section must match the
 query's (name compared case-insensitively, plus type and class). UDP, TCP,
 and DoT also require the response message id to equal the query id; DoH and
-DoQ do not compare it, because RFC 8484 and RFC 9250 use id 0 on the wire.
-The UDP backend drops a mismatching datagram and keeps waiting until its
-timeout; the stream transports report a mismatch as a transport error, so the
+DoQ do not compare it, because RFC 8484 and RFC 9250 use id 0 on the wire
+(the DoQ backend sends its query with id 0). DoH and DoQ return the response
+with the caller's query id. The UDP backend drops a datagram that does not
+decode or does not match, and keeps waiting until its timeout; the stream transports report a mismatch as a transport error, so the
 resolver fails over to the next backend.
 
 Implemented transports:

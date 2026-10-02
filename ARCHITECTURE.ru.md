@@ -251,8 +251,10 @@ response отвечает на его query: бит `QR` должен быть �
 section должна совпадать с query (имя сравнивается без учёта регистра, плюс
 type и class). UDP, TCP и DoT дополнительно требуют, чтобы message id ответа
 совпадал с id запроса; DoH и DoQ его не сравнивают, потому что RFC 8484 и
-RFC 9250 передают по сети id 0. UDP backend отбрасывает несовпадающую
-датаграмму и продолжает ждать до своего timeout; stream transports сообщают о
+RFC 9250 передают по сети id 0 (DoQ backend сам отправляет query с id 0).
+DoH и DoQ возвращают response с id исходного query. UDP backend отбрасывает
+датаграмму, которая не декодируется или не совпадает, и продолжает ждать до
+своего timeout; stream transports сообщают о
 несовпадении как о transport error, и resolver переключается на следующий
 backend.
 
