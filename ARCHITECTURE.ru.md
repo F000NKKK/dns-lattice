@@ -174,7 +174,16 @@ Resolver владеет in-memory answer cache с учётом positive TTL и R
 negative caching. Cache identity включает effective upstream group вместе с
 идентичностью DNS question. Это необходимо для dynamic routing: ответ,
 полученный через один маршрут, не должен обслужить запрос, который hook
-направил в другую group.
+направил в другую group. Бит RD запроса тоже входит в identity.
+
+Сохраняются только чистые ответы (opcode QUERY, `TC=0`, расширенный RCODE
+EDNS 0 и `NOERROR` с записями, `NXDOMAIN` или `NODATA`); TTL записей
+ограничены сутками (positive) или часом (negative), а время жизни
+negative-ответа равно min(TTL SOA, `MINIMUM` SOA). Попадание уменьшает каждый
+TTL на целые прошедшие секунды, не трогая запись EDNS OPT, повторяет id,
+question и бит RD текущего запроса, сбрасывает AA и сохраняет порядок
+записей. Блокировка кэша покрывает только поиск и увеличение счётчика ссылок;
+ответ собирается после её освобождения.
 
 Terminal Fake IP ответы обходят обычный answer cache, поскольку их lifetime
 определяется самим Fake IP mapping.

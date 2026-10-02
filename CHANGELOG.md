@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Resolver cache, default behaviour (no public API change):
+  - a stored record TTL is clamped to at most 86 400 s in a positive answer
+    and 3 600 s in a negative one; neither was capped before;
+  - a positive entry lives for the minimum TTL over every record in the
+    answer, authority and additional sections, not the answer section only;
+  - a negative answer without an SOA is still cached for 60 s, but no
+    longer than any other record it carries;
+  - a cache hit echoes the current query's RD bit and returns AA=0; it
+    used to replay the first client's header flags. Record order in every
+    section is kept as received;
+  - the query's RD bit is part of the cache identity;
+  - a query with more or fewer than one question, or an opcode other than
+    QUERY, bypasses the cache: it goes to the upstream group (reported as a
+    cache miss) and its answer is not stored.
+
+### Fixed
+
+- A cache hit replayed the TTLs the upstream sent, however long the answer
+  had been cached. Every record TTL now counts down by the whole seconds
+  elapsed since the answer was stored, and stays at least 1 while the entry
+  is fresh. The EDNS OPT pseudo-record is never counted down or clamped,
+  because its TTL field holds the extended RCODE, version and flags.
+- The negative-cache TTL was the SOA `MINIMUM` field alone. It is now
+  min(SOA TTL, SOA `MINIMUM`) as RFC 2308 §5 requires, and the served SOA's
+  TTL is rewritten to that value and counts down.
+- A `SERVFAIL`, `REFUSED` or other error response that carried records was
+  cached as a positive answer, and truncated (`TC=1`) answers were cached.
+  Only `NOERROR` answers with records, `NXDOMAIN` and `NODATA` answers with
+  opcode QUERY, `TC=0` and an EDNS extended RCODE of 0 are cached now; an
+  answer whose OPT record does not parse is not cached.
+- An answer with a TTL of 0 was inserted into the cache although it could
+  never be served, so unique zero-TTL names grew the cache. Such answers are
+  no longer stored, and an expired entry is removed when a lookup finds it.
+- A cache hit cloned the whole stored answer while holding the cache lock.
+  The lock now covers only a reference-count increment; the response is
+  built after it is released.
+
 ## [1.1.3] - 2026-10-02
 
 ### Changed

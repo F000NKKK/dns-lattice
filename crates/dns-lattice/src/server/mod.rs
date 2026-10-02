@@ -1434,7 +1434,7 @@ mod tests {
                 CountingBackend {
                     answer: answer_with_a(
                         "cache.example.test",
-                        0,
+                        300,
                         "203.0.113.203".parse().unwrap(),
                     ),
                     calls: backend_calls.clone(),
@@ -1463,12 +1463,9 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let first_query = query_for("cache.example.test", 91);
-        let mut second_query = query_for("cache.example.test", 92);
-        second_query.questions.push(Question {
-            name: Name::from_ascii("extra.example.test").unwrap(),
-            qtype: RecordType::Aaaa,
-            qclass: Class::In,
-        });
+        // Same question with different letter case: a cache hit that must
+        // echo this request's own question spelling.
+        let second_query = query_for("Cache.EXAMPLE.test", 92);
         let first = tcp_round_trip(&mut stream, &first_query).await;
         let second = tcp_round_trip(&mut stream, &second_query).await;
         assert_eq!(

@@ -477,7 +477,22 @@ precedence, message parsing и DNS name compression bounds.
 Resolver имеет in-memory answer cache с учётом TTL, включая negative caching.
 Для обычных запросов cache identity включает **effective upstream group**.
 Это критично при route hook: одинаковые DNS questions, отправленные в разные
-маршруты, не могут разделить один answer.
+маршруты, не могут разделить один answer. Бит RD запроса тоже входит в
+identity.
+
+- **Что кэшируется**: ответы `NOERROR` с записями, `NXDOMAIN` и `NODATA`,
+  только с opcode QUERY, `TC=0` и расширенным RCODE EDNS, равным 0.
+  `SERVFAIL`, `REFUSED`, другие коды ошибок, усечённые ответы и ответы с
+  TTL 0 возвращаются, но не сохраняются. Запросы, в которых не ровно один
+  question или другой opcode, идут мимо кэша.
+- **Время жизни**: сохранённые TTL ограничены 86 400 с (positive) и 3 600 с
+  (negative). Positive-запись живёт по наименьшему TTL записей во всех
+  секциях, negative — min(TTL SOA, `MINIMUM` SOA) (RFC 2308) или 60 с без
+  SOA.
+- **Попадания**: TTL уменьшаются на целое число секунд, прошедших с
+  сохранения ответа; запись EDNS OPT не трогается. Попадание несёт id,
+  question и бит RD текущего запроса, ставит AA=0 и сохраняет исходный
+  порядок всех записей.
 
 Terminal Fake IP ответы обходят обычный answer cache; их lifetime принадлежит
 самому Fake IP mapping.

@@ -170,7 +170,17 @@ The resolver owns an in-memory answer cache that respects positive TTLs and
 RFC 2308-style negative caching. Cache identity includes the effective
 upstream group in addition to the DNS question identity. This is required by
 dynamic routing: a response obtained from one route must never satisfy a query
-that the hook routes to another group.
+that the hook routes to another group. The query's RD bit is also part of the
+identity.
+
+Only clean answers are stored (opcode QUERY, `TC=0`, EDNS extended RCODE 0,
+and `NOERROR` with records, `NXDOMAIN`, or `NODATA`), with record TTLs capped
+at one day (positive) or one hour (negative) and a negative lifetime of
+min(SOA TTL, SOA `MINIMUM`). A hit counts every TTL down by whole elapsed
+seconds, never touching the EDNS OPT record, echoes the current query's id,
+question, and RD bit, clears AA, and preserves record order. The cache lock
+covers only the lookup and a reference-count increment; the response is built
+after it is released.
 
 Fake IP terminal answers bypass the ordinary answer cache because their
 lifetime is governed by the Fake IP mapping itself.

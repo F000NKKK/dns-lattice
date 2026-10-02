@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{
-    Class, Message, Name, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy, UpstreamGroupId,
+    Class, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy,
+    UpstreamGroupId,
 };
 
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
@@ -34,10 +35,39 @@ use crate::observability::{
 };
 use crate::upstream::UpstreamBackend;
 
-/// Fixed negative-cache TTL floor (RFC 2308 §5) used when a negative
-/// response carries no SOA record in its authority section to derive a
-/// `minimum` from. It is not user-configurable.
-const NEGATIVE_CACHE_FLOOR: Duration = Duration::from_secs(60);
+/// Fixed negative-cache TTL, in seconds, used when a negative response
+/// carries no SOA record in its authority section to derive one from. It is
+/// capped by [`NEGATIVE_TTL`]'s maximum and is not user-configurable.
+const NEGATIVE_TTL_WITHOUT_SOA: u32 = 60;
+
+/// The `TYPE` value of the EDNS(0) OPT pseudo-record (RFC 6891). Its `TTL`
+/// field holds the extended RCODE, version and flags, so it is never
+/// clamped, counted down, or used to compute a cache lifetime.
+const OPT_RTYPE: u16 = 41;
+
+/// Inclusive bounds, in seconds, that every stored record TTL of one cache
+/// entry class (positive or negative) is clamped into.
+#[derive(Clone, Copy)]
+struct TtlBounds {
+    min: u32,
+    max: u32,
+}
+
+impl TtlBounds {
+    fn clamp(self, ttl: u32) -> u32 {
+        ttl.clamp(self.min, self.max)
+    }
+}
+
+/// Record TTL bounds for positive answers: at most one day.
+const POSITIVE_TTL: TtlBounds = TtlBounds {
+    min: 0,
+    max: 86_400,
+};
+
+/// Record TTL bounds for negative answers (NXDOMAIN and NODATA): at most one
+/// hour, following RFC 2308 §5's guidance.
+const NEGATIVE_TTL: TtlBounds = TtlBounds { min: 0, max: 3_600 };
 
 /// A source of the current time, abstracted so tests can advance it
 /// deterministically instead of relying on real `sleep`.
@@ -92,20 +122,30 @@ impl Clock for FakeClock {
 
 /// Cache key: the fields that identify a question's matching intent,
 /// equivalent to a [`dns_lattice_model::Question`]'s name/type/class but
-/// independent of that struct's exact field set.
+/// independent of that struct's exact field set, plus the effective upstream
+/// group and the query's RD bit (an upstream may answer RD=0 and RD=1
+/// queries differently).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     name: Name,
     rtype: RecordType,
     class: Class,
     group: UpstreamGroupId,
+    recursion_desired: bool,
 }
 
-/// A cached answer plus its absolute expiry instant, computed at insert
-/// time.
-struct CacheEntry {
-    answer: Message,
-    expires_at: Instant,
+/// A normalised cached answer, shared through an [`Arc`] so a hit clones
+/// only the pointer while the cache lock is held.
+struct CachedAnswer {
+    /// The upstream answer with every non-OPT record TTL clamped into the
+    /// entry class's bounds (and, for a negative answer with an SOA, the
+    /// SOA TTL rewritten to the negative TTL).
+    message: Message,
+    /// The instant captured before the upstream call; TTLs count down from
+    /// here.
+    inserted: Instant,
+    /// `inserted` plus the entry TTL; the entry is a miss from this instant.
+    expires: Instant,
 }
 
 /// An in-process DNS query orchestrator.
@@ -129,7 +169,7 @@ pub struct Resolver {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     clock: Box<dyn Clock + Send + Sync>,
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<HashMap<CacheKey, Arc<CachedAnswer>>>,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
     observability_sink: Option<Arc<dyn ObservabilitySink>>,
@@ -169,7 +209,7 @@ impl Resolver {
     /// the in-memory answer cache; on a miss its backends are tried in
     /// registration order: the first
     /// backend to return `Ok` wins and its answer is
-    /// cached (per the existing TTL rules) and returned immediately. A
+    /// cached (per the rules below) and returned immediately. A
     /// backend failing with [`Error::Timeout`], [`Error::Transport`], or
     /// [`Error::Tls`] is treated as retryable — resolution moves on to the
     /// next backend in the group rather than failing the whole call. Once
@@ -177,6 +217,41 @@ impl Resolver {
     /// attempted backend's error is propagated as-is; this exhausted-group
     /// failure is never cached. A group with exactly one backend behaves
     /// exactly as before: success or that one backend's own error.
+    ///
+    /// # Cache
+    ///
+    /// A query uses the cache only when it has exactly one question and
+    /// opcode `QUERY`; any other query goes straight to the upstream group
+    /// (reported as a cache miss) and its answer is not stored. The cache
+    /// identity is the question's name (case-insensitively), type and class,
+    /// the effective upstream group, and the query's RD bit.
+    ///
+    /// An answer is stored only when its opcode is `QUERY`, `TC` is clear,
+    /// it carries either no EDNS OPT record or a well-formed one whose
+    /// extended RCODE is 0, and it is either positive (`NOERROR` with at least one answer record)
+    /// or negative (`NXDOMAIN`, or `NOERROR` with an empty answer section).
+    /// `SERVFAIL`, `REFUSED` and every other response code are returned but
+    /// never stored. Before storing, every record TTL except the EDNS OPT
+    /// pseudo-record's is clamped to at most 86 400 s for a positive answer
+    /// or 3 600 s for a negative one. The entry then lives for:
+    ///
+    /// - positive: the minimum record TTL over the answer, authority and
+    ///   additional sections;
+    /// - negative with an SOA in the authority section: min(SOA TTL, SOA
+    ///   `MINIMUM`) (RFC 2308 §5), to which the stored SOA's TTL is
+    ///   rewritten, or less if another record's TTL is lower;
+    /// - negative without an SOA: 60 s, or less if a record's TTL is lower.
+    ///
+    /// An answer whose lifetime works out to 0 s is not stored. The lifetime
+    /// is measured from the moment the query was received, before the
+    /// upstream call.
+    ///
+    /// A hit returns the stored answer in its original record order with
+    /// every TTL except the OPT record's reduced by the whole seconds
+    /// elapsed since it was stored (never below 1 while it is fresh), the
+    /// current query's message id, question section and RD bit, and AA
+    /// cleared. The entry is a miss from the instant its lifetime ends and
+    /// is removed when such a lookup finds it.
     ///
     /// # Errors
     ///
@@ -242,31 +317,26 @@ impl Resolver {
                 return Err(error);
             }
         };
-        let key = CacheKey {
+        let mut key = query_uses_cache(query).then(|| CacheKey {
             name: question.name.clone(),
             rtype: question.qtype,
             class: question.qclass,
             group: group.clone(),
-        };
+            recursion_desired: query.header.recursion_desired,
+        });
 
         let now = self.clock.now();
-        {
-            let cache = self.cache.lock().expect("cache mutex poisoned");
-            if let Some(entry) = cache.get(&key)
-                && entry.expires_at > now
-            {
-                let answer = cache_hit_response(query, &entry.answer);
-                drop(cache);
-                self.emit(ObserveEvent::CacheHit {
-                    correlation_id,
-                    group: group.clone(),
-                });
-                self.emit(ObserveEvent::Completed {
-                    correlation_id,
-                    rcode: answer.header.rcode,
-                });
-                return Ok(answer);
-            }
+        if let Some(cached) = key.as_ref().and_then(|key| self.cache_lookup(key, now)) {
+            let answer = cache_hit_response(query, &cached, now);
+            self.emit(ObserveEvent::CacheHit {
+                correlation_id,
+                group: group.clone(),
+            });
+            self.emit(ObserveEvent::Completed {
+                correlation_id,
+                rcode: answer.header.rcode,
+            });
+            return Ok(answer);
         }
         self.emit(ObserveEvent::CacheMiss {
             correlation_id,
@@ -288,15 +358,14 @@ impl Resolver {
                         backend_index,
                         outcome: UpstreamObserveOutcome::Success,
                     });
-                    if let Some(ttl) = cacheable_ttl(&answer) {
-                        let mut cache = self.cache.lock().expect("cache mutex poisoned");
-                        cache.insert(
-                            key,
-                            CacheEntry {
-                                answer: answer.clone(),
-                                expires_at: now + ttl,
-                            },
-                        );
+                    if let Some(key) = key.take()
+                        && let Some(entry) = cacheable_answer(&answer, now)
+                    {
+                        let entry = Arc::new(entry);
+                        self.cache
+                            .lock()
+                            .expect("cache mutex poisoned")
+                            .insert(key, entry);
                     }
                     self.emit(ObserveEvent::Completed {
                         correlation_id,
@@ -340,6 +409,20 @@ impl Resolver {
     fn emit(&self, event: ObserveEvent) {
         if let Some(sink) = &self.observability_sink {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(&event)));
+        }
+    }
+
+    /// Returns the fresh entry for `key`, cloning only its [`Arc`] under the
+    /// cache lock. An entry found expired at `now` is removed.
+    fn cache_lookup(&self, key: &CacheKey, now: Instant) -> Option<Arc<CachedAnswer>> {
+        let mut cache = self.cache.lock().expect("cache mutex poisoned");
+        match cache.get(key) {
+            Some(entry) if entry.expires > now => Some(Arc::clone(entry)),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
         }
     }
 
@@ -397,18 +480,48 @@ impl Resolver {
     }
 }
 
-/// Projects the transaction-specific parts of `query` onto a cached DNS
-/// response.
+/// Whether `query` may be answered from, and stored in, the cache: exactly
+/// one question and opcode `QUERY`.
+fn query_uses_cache(query: &Message) -> bool {
+    query.questions.len() == 1 && query.header.opcode == Opcode::Query
+}
+
+/// Whether `record` is an EDNS(0) OPT pseudo-record, whose `TTL` field is
+/// not a lifetime.
+fn is_opt(record: &ResourceRecord) -> bool {
+    record.rtype == RecordType::Other(OPT_RTYPE)
+}
+
+/// Every record of every section except OPT pseudo-records, mutably.
+fn ttl_records_mut(message: &mut Message) -> impl Iterator<Item = &mut ResourceRecord> {
+    message
+        .answers
+        .iter_mut()
+        .chain(message.authorities.iter_mut())
+        .chain(message.additionals.iter_mut())
+        .filter(|record| !is_opt(record))
+}
+
+/// Projects a cached entry onto a response for `query` at `now`.
 ///
 /// Cache entries represent reusable answer content, not a prior client's DNS
-/// transaction. The cache key intentionally covers only the first question's
-/// matching fields and effective upstream group, while a response must echo
-/// the current request's transaction ID and question section. All cached
-/// response flags and record sections remain unchanged.
-fn cache_hit_response(query: &Message, cached: &Message) -> Message {
-    let mut response = cached.clone();
+/// transaction. The response echoes the current query's message id,
+/// question section and RD bit, clears AA (a cached answer is not
+/// authoritative data), and reduces every non-OPT record TTL by the whole
+/// seconds elapsed since the entry was stored, keeping it at least 1. The
+/// QR, RA and RCODE header fields and the order of every record in every
+/// section are kept exactly as stored.
+fn cache_hit_response(query: &Message, cached: &CachedAnswer, now: Instant) -> Message {
+    let elapsed = now.saturating_duration_since(cached.inserted).as_secs();
+    let elapsed = u32::try_from(elapsed).unwrap_or(u32::MAX);
+    let mut response = cached.message.clone();
     response.header.id = query.header.id;
+    response.header.recursion_desired = query.header.recursion_desired;
+    response.header.authoritative = false;
     response.questions = query.questions.clone();
+    for record in ttl_records_mut(&mut response) {
+        record.ttl = record.ttl.saturating_sub(elapsed).max(1);
+    }
     response
 }
 
@@ -594,41 +707,74 @@ fn observe_failure(error: &Error) -> ObserveFailure {
     }
 }
 
-/// Determines the [`Duration`] an `answer` should be cached for, or `None`
-/// if it should not be cached at all.
+/// Gates and normalises an upstream `answer` for storage, or returns `None`
+/// if it must not be cached.
 ///
-/// Positive answers (`NoError` with at least one answer record) use the
-/// minimum `ttl` across their answer records. Negative
-/// answers (`NxDomain`, or `NoError` with an empty answer section) use the
-/// `minimum` field of an SOA record in the authority section when present
-/// (RFC 2308 §5), else [`NEGATIVE_CACHE_FLOOR`].
-fn cacheable_ttl(answer: &Message) -> Option<Duration> {
-    let is_negative = matches!(answer.header.rcode, Rcode::NxDomain)
-        || (matches!(answer.header.rcode, Rcode::NoError) && answer.answers.is_empty());
-
-    if is_negative {
-        let ttl = answer
-            .authorities
-            .iter()
-            .find_map(|rr| match &rr.rdata {
-                RData::Soa { minimum, .. } => Some(*minimum),
-                _ => None,
-            })
-            .map(|minimum| Duration::from_secs(u64::from(minimum)))
-            .unwrap_or(NEGATIVE_CACHE_FLOOR);
-        return Some(ttl);
-    }
-
-    if answer.answers.is_empty() {
+/// Only a clean answer is stored: opcode `QUERY`, `TC` clear, an EDNS
+/// extended RCODE of 0 (an answer whose OPT record does not parse is not
+/// stored), and either positive (`NoError` with at least one answer record)
+/// or negative (`NxDomain`, or `NoError` with an empty answer section).
+///
+/// Every non-OPT record TTL is clamped into [`POSITIVE_TTL`] or
+/// [`NEGATIVE_TTL`]. The entry TTL is the minimum non-OPT record TTL over
+/// all sections. For a negative answer it is further limited to the
+/// negative TTL: min(SOA TTL, SOA `MINIMUM`) (RFC 2308 §5) clamped into
+/// [`NEGATIVE_TTL`], written back to the first authority SOA's TTL so it
+/// counts down on hits (RFC 2308 §6), or [`NEGATIVE_TTL_WITHOUT_SOA`]
+/// (clamped likewise) when the authority section has no SOA. An entry TTL
+/// of 0 is not stored. `inserted` anchors the countdown and expiry.
+fn cacheable_answer(answer: &Message, inserted: Instant) -> Option<CachedAnswer> {
+    if answer.header.opcode != Opcode::Query || answer.header.truncated {
         return None;
     }
+    match answer.edns() {
+        Ok(None) => {}
+        Ok(Some(edns)) if edns.extended_rcode() == 0 => {}
+        Ok(Some(_)) | Err(_) => return None,
+    }
+    let negative = match answer.header.rcode {
+        Rcode::NoError => answer.answers.is_empty(),
+        Rcode::NxDomain => true,
+        _ => return None,
+    };
+    let bounds = if negative { NEGATIVE_TTL } else { POSITIVE_TTL };
 
-    answer
-        .answers
-        .iter()
-        .map(|rr| rr.ttl)
-        .min()
-        .map(|ttl| Duration::from_secs(u64::from(ttl)))
+    let mut message = answer.clone();
+    for record in ttl_records_mut(&mut message) {
+        record.ttl = bounds.clamp(record.ttl);
+    }
+    let negative_ttl = if negative {
+        let soa = message.authorities.iter_mut().find_map(|record| {
+            if let RData::Soa { minimum, .. } = record.rdata {
+                Some((record, minimum))
+            } else {
+                None
+            }
+        });
+        Some(match soa {
+            Some((record, minimum)) => {
+                record.ttl = bounds.clamp(record.ttl.min(minimum));
+                record.ttl
+            }
+            None => bounds.clamp(NEGATIVE_TTL_WITHOUT_SOA),
+        })
+    } else {
+        None
+    };
+    let records_ttl = ttl_records_mut(&mut message).map(|record| record.ttl).min();
+    let ttl = match (negative_ttl, records_ttl) {
+        (Some(negative), Some(records)) => negative.min(records),
+        (Some(ttl), None) | (None, Some(ttl)) => ttl,
+        (None, None) => return None,
+    };
+    if ttl == 0 {
+        return None;
+    }
+    Some(CachedAnswer {
+        message,
+        inserted,
+        expires: inserted + Duration::from_secs(u64::from(ttl)),
+    })
 }
 
 /// Builds a [`Resolver`] from a split-DNS policy and one or more upstream
@@ -1529,12 +1675,9 @@ mod tests {
             FakeClock::new(),
         );
         let first = query_for_type("example.com", RecordType::A, Class::In, 91);
-        let mut second = query_for_type("example.com", RecordType::A, Class::In, 92);
-        second.questions.push(Question {
-            name: n("extra.example.com"),
-            qtype: RecordType::Aaaa,
-            qclass: Class::In,
-        });
+        // Names match case-insensitively, but the response must echo the
+        // current query's own spelling.
+        let second = query_for_type("ExAmPlE.CoM", RecordType::A, Class::In, 92);
 
         resolver
             .resolve(&first)
@@ -1547,6 +1690,7 @@ mod tests {
 
         assert_eq!(cached.header.id, 92);
         assert_eq!(cached.questions, second.questions);
+        assert_eq!(cached.questions[0].name.to_string(), "ExAmPlE.CoM.");
         assert_eq!(
             cached.answers[0].rdata,
             RData::A(Ipv4Addr::new(203, 0, 113, 1))
@@ -1950,7 +2094,10 @@ mod tests {
     async fn cache_is_scoped_to_the_effective_hook_selected_group() {
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
+        // A fixed clock keeps the cached TTLs equal to the first answer's:
+        // with the real clock a slow run would see them counted down.
         let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .clock(FakeClock::new())
             .backend(
                 UpstreamGroupId::new("first"),
                 CountingBackend {
@@ -2417,6 +2564,655 @@ mod tests {
         assert!(a.answers.is_empty());
         assert!(ipv6_only_pool.snapshot().mappings.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // --- Cache correctness: countdown, negative TTL, clamps, gating, hit
+    // projection, and golden record order ------------------------------------
+
+    use dns_lattice_model::Edns;
+
+    /// A fake backend that returns its answers in order, repeating the last
+    /// one, and counts its calls.
+    struct SequencedBackend {
+        answers: Mutex<Vec<Message>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpstreamBackend for SequencedBackend {
+        async fn resolve(&self, _query: &Message) -> Result<Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = self.answers.lock().expect("answers mutex poisoned");
+            Ok(if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0].clone()
+            })
+        }
+    }
+
+    fn record(name: &str, rtype: RecordType, ttl: u32, rdata: RData) -> ResourceRecord {
+        ResourceRecord {
+            name: n(name),
+            rtype,
+            class: Class::In,
+            ttl,
+            rdata,
+        }
+    }
+
+    fn a_record(name: &str, ttl: u32, last_octet: u8) -> ResourceRecord {
+        record(
+            name,
+            RecordType::A,
+            ttl,
+            RData::A(Ipv4Addr::new(203, 0, 113, last_octet)),
+        )
+    }
+
+    fn soa_record(ttl: u32, minimum: u32) -> ResourceRecord {
+        record(
+            "example.com",
+            RecordType::Soa,
+            ttl,
+            RData::Soa {
+                mname: n("ns1.example.com"),
+                rname: n("hostmaster.example.com"),
+                serial: 1,
+                refresh: 3600,
+                retry: 600,
+                expire: 604_800,
+                minimum,
+            },
+        )
+    }
+
+    /// A resolver with one default group backed by a counting fake that
+    /// always returns `answer`, on a fake clock.
+    fn cache_resolver(answer: Message) -> (Resolver, Arc<AtomicUsize>, FakeClock) {
+        let clock = FakeClock::new();
+        let (resolver, calls) = resolver_with_counting_backend(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+            "g",
+            answer,
+            clock.clone(),
+        );
+        (resolver, calls, clock)
+    }
+
+    /// The TTLs of every record in every section, in order.
+    fn ttls(message: &Message) -> Vec<u32> {
+        message
+            .answers
+            .iter()
+            .chain(&message.authorities)
+            .chain(&message.additionals)
+            .map(|record| record.ttl)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cached_ttls_count_down_by_whole_elapsed_seconds_in_every_section() {
+        let mut answer = a_answer("example.com", 300);
+        answer.authorities.push(record(
+            "example.com",
+            RecordType::Ns,
+            600,
+            RData::Ns(n("ns1.example.com")),
+        ));
+        answer
+            .additionals
+            .push(a_record("ns1.example.com", 400, 53));
+        let (resolver, calls, clock) = cache_resolver(answer);
+
+        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(ttls(&first), [300, 600, 400]);
+
+        clock.advance(Duration::from_millis(120_900));
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ttls(&hit),
+            [180, 480, 280],
+            "120.9 s elapsed counts as 120 whole seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_entry_is_a_miss_exactly_when_its_ttl_elapses() {
+        let (resolver, calls, clock) = cache_resolver(a_answer("example.com", 300));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+
+        clock.advance(Duration::from_secs(299));
+        let last_hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(last_hit.answers[0].ttl, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        clock.advance(Duration::from_secs(1));
+        let refreshed = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a miss at inserted + ttl");
+        assert_eq!(refreshed.answers[0].ttl, 300);
+    }
+
+    #[tokio::test]
+    async fn opt_record_is_never_clamped_counted_down_or_used_as_a_lifetime() {
+        // OPT TTL field 0: counting it would make the entry TTL 0.
+        let mut plain = a_answer("example.com", 300);
+        plain.set_edns(Some(Edns::new(1232)));
+        let (resolver, calls, clock) = cache_resolver(plain);
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        clock.advance(Duration::from_secs(100));
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "OPT TTL 0 does not block");
+        assert_eq!(hit.answers[0].ttl, 200);
+        assert_eq!(hit.additionals[0].ttl, 0);
+        assert_eq!(hit.edns().unwrap(), Some(Edns::new(1232)));
+
+        // OPT TTL field 98 304 (version 1, DO): above the positive clamp and
+        // above the answer TTL, so clamping or counting would both show.
+        let mut edns = Edns::new(1232);
+        edns.set_version(1).set_dnssec_ok(true);
+        let mut flagged = a_answer("example.com", 300);
+        flagged.set_edns(Some(edns.clone()));
+        let opt_ttl = flagged.additionals[0].ttl;
+        assert!(opt_ttl > POSITIVE_TTL.max);
+        let (resolver, calls, clock) = cache_resolver(flagged);
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        clock.advance(Duration::from_secs(299));
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(hit.additionals[0].ttl, opt_ttl);
+        assert_eq!(hit.edns().unwrap(), Some(edns));
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "lifetime is the A TTL");
+    }
+
+    #[tokio::test]
+    async fn negative_ttl_is_the_minimum_of_soa_ttl_and_soa_minimum() {
+        // SOA TTL 3600, MINIMUM 300: 300 wins and the SOA TTL is rewritten.
+        let (resolver, calls, clock) =
+            cache_resolver(nxdomain_answer("missing.example.com", Some(300)));
+        let first = resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(first.authorities[0].ttl, 3600, "upstream answer unchanged");
+        let hit = resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(hit.authorities[0].ttl, 300);
+        clock.advance(Duration::from_secs(100));
+        let hit = resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(hit.authorities[0].ttl, 200, "the SOA counts down");
+        clock.advance(Duration::from_secs(200));
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // SOA TTL 120, MINIMUM 900: the SOA TTL wins (this was MINIMUM only).
+        let mut answer = query_for_response("missing.example.com");
+        answer.header.rcode = Rcode::NxDomain;
+        answer.authorities.push(soa_record(120, 900));
+        let (resolver, calls, clock) = cache_resolver(answer);
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(119));
+        let hit = resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(hit.authorities[0].ttl, 1);
+        clock.advance(Duration::from_secs(1));
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn negative_answer_without_soa_lives_sixty_seconds() {
+        for answer in [
+            nxdomain_answer("missing.example.com", None),
+            nodata_answer("missing.example.com"),
+        ] {
+            let (resolver, calls, clock) = cache_resolver(answer);
+            resolver
+                .resolve(&query_for("missing.example.com"))
+                .await
+                .unwrap();
+            clock.advance(Duration::from_secs(59));
+            resolver
+                .resolve(&query_for("missing.example.com"))
+                .await
+                .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            clock.advance(Duration::from_secs(1));
+            resolver
+                .resolve(&query_for("missing.example.com"))
+                .await
+                .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_entry_never_outlives_another_record_in_the_answer() {
+        // An NXDOMAIN that follows a CNAME: the CNAME's 30 s TTL caps the
+        // 300 s negative TTL.
+        let mut answer = nxdomain_answer("alias.example.com", Some(300));
+        answer.answers.push(record(
+            "alias.example.com",
+            RecordType::Cname,
+            30,
+            RData::Cname(n("gone.example.com")),
+        ));
+        let (resolver, calls, clock) = cache_resolver(answer);
+        resolver
+            .resolve(&query_for("alias.example.com"))
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(29));
+        let hit = resolver
+            .resolve(&query_for("alias.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(hit.answers[0].ttl, 1);
+        assert_eq!(hit.authorities[0].ttl, 271);
+        clock.advance(Duration::from_secs(1));
+        resolver
+            .resolve(&query_for("alias.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn record_ttls_are_clamped_to_one_day_and_negative_ones_to_one_hour() {
+        let (resolver, calls, clock) = cache_resolver(a_answer("example.com", 1_000_000));
+        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(first.answers[0].ttl, 1_000_000, "upstream answer unchanged");
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(hit.answers[0].ttl, 86_400);
+        clock.advance(Duration::from_secs(86_399));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let mut answer = query_for_response("missing.example.com");
+        answer.header.rcode = Rcode::NxDomain;
+        answer.authorities.push(soa_record(172_800, 86_400));
+        let (resolver, calls, clock) = cache_resolver(answer);
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        let hit = resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(hit.authorities[0].ttl, 3_600);
+        clock.advance(Duration::from_secs(3_600));
+        resolver
+            .resolve(&query_for("missing.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn answers_that_are_not_clean_are_returned_but_never_cached() {
+        let with_rcode = |rcode| {
+            let mut answer = a_answer("example.com", 300);
+            answer.header.rcode = rcode;
+            answer
+        };
+        let mut truncated = a_answer("example.com", 300);
+        truncated.header.truncated = true;
+        let mut truncated_negative = nxdomain_answer("example.com", Some(300));
+        truncated_negative.header.truncated = true;
+        let mut extended_rcode = a_answer("example.com", 300);
+        let mut edns = Edns::new(1232);
+        edns.set_extended_rcode(1);
+        extended_rcode.set_edns(Some(edns));
+        let mut malformed_opt = a_answer("example.com", 300);
+        malformed_opt.additionals.push(ResourceRecord {
+            name: n("not-root.example.com"),
+            rtype: RecordType::Other(OPT_RTYPE),
+            class: Class::Other(1232),
+            ttl: 0,
+            rdata: RData::Unknown {
+                rtype: OPT_RTYPE,
+                data: Vec::new(),
+            },
+        });
+        let mut status_opcode = a_answer("example.com", 300);
+        status_opcode.header.opcode = Opcode::Status;
+
+        let cases = [
+            ("SERVFAIL with records", with_rcode(Rcode::ServFail)),
+            ("REFUSED with records", with_rcode(Rcode::Refused)),
+            ("FORMERR with records", with_rcode(Rcode::FormErr)),
+            ("NOTIMP with records", with_rcode(Rcode::NotImp)),
+            ("unassigned rcode", with_rcode(Rcode::Other(11))),
+            ("TC=1 positive", truncated),
+            ("TC=1 negative", truncated_negative),
+            ("TTL 0 positive", a_answer("example.com", 0)),
+            (
+                "SOA MINIMUM 0 negative",
+                nxdomain_answer("example.com", Some(0)),
+            ),
+            ("extended RCODE 1", extended_rcode),
+            ("malformed OPT", malformed_opt),
+            ("opcode STATUS", status_opcode),
+        ];
+        for (label, answer) in cases {
+            let (resolver, calls, _clock) = cache_resolver(answer.clone());
+            let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+            assert_eq!(first, answer, "{label}: the answer is returned as-is");
+            resolver.resolve(&query_for("example.com")).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{label}: not cached");
+            assert!(resolver.cache.lock().unwrap().is_empty(), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queries_without_exactly_one_question_or_with_another_opcode_bypass_the_cache() {
+        let sink = Arc::new(RecordingSink::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .clock(FakeClock::new())
+        .backend(
+            UpstreamGroupId::new("g"),
+            CountingBackend {
+                answer: a_answer("example.com", 300),
+                calls: calls.clone(),
+            },
+        )
+        .observability_sink(sink.clone())
+        .build();
+
+        let mut two_questions = query_for("example.com");
+        two_questions.questions.push(Question {
+            name: n("extra.example.com"),
+            qtype: RecordType::Aaaa,
+            qclass: Class::In,
+        });
+        let mut notify = query_for("example.com");
+        notify.header.opcode = Opcode::Notify;
+        for query in [&two_questions, &two_questions, &notify, &notify] {
+            resolver.resolve(query).await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(resolver.cache.lock().unwrap().is_empty());
+        let misses = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ObserveEvent::CacheMiss { .. }))
+            .count();
+        assert_eq!(misses, 4, "a bypassed query is reported as a cache miss");
+
+        // An ordinary query is still cached and is not served by the
+        // bypassed ones.
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_echoes_the_query_rd_bit_and_clears_aa() {
+        let mut answer = a_answer("example.com", 300);
+        answer.header.authoritative = true;
+        answer.header.recursion_available = true;
+        let (resolver, calls, _clock) = cache_resolver(answer);
+
+        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert!(first.header.authoritative, "upstream answer unchanged");
+        let hit = resolver
+            .resolve(&query_for_type("example.com", RecordType::A, Class::In, 7))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hit.header.id, 7);
+        assert!(!hit.header.authoritative);
+        assert!(hit.header.recursion_desired);
+        assert!(hit.header.recursion_available);
+        assert!(hit.header.qr);
+        assert_eq!(hit.header.rcode, Rcode::NoError);
+
+        // RD is part of the cache identity: RD=0 is a separate entry.
+        let mut no_rd = query_for_type("example.com", RecordType::A, Class::In, 8);
+        no_rd.header.recursion_desired = false;
+        resolver.resolve(&no_rd).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let hit = resolver.resolve(&no_rd).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!hit.header.recursion_desired, "RD echoes the query");
+        assert!(!hit.header.authoritative);
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_is_removed_when_a_lookup_finds_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut servfail = query_for_response("example.com");
+        servfail.header.rcode = Rcode::ServFail;
+        let clock = FakeClock::new();
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .clock(clock.clone())
+        .backend(
+            UpstreamGroupId::new("g"),
+            SequencedBackend {
+                answers: Mutex::new(vec![a_answer("example.com", 10), servfail]),
+                calls: calls.clone(),
+            },
+        )
+        .build();
+
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(resolver.cache.lock().unwrap().len(), 1);
+        clock.advance(Duration::from_secs(10));
+        let refreshed = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(refreshed.header.rcode, Rcode::ServFail);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            resolver.cache.lock().unwrap().is_empty(),
+            "the expired entry is gone and SERVFAIL was not stored"
+        );
+    }
+
+    /// Clears the parts of `message` a cache hit may legitimately change
+    /// (message id and non-OPT record TTLs) so the rest can be compared.
+    fn without_id_and_ttls(message: &Message) -> Message {
+        let mut message = message.clone();
+        message.header.id = 0;
+        for record in ttl_records_mut(&mut message) {
+            record.ttl = 0;
+        }
+        message
+    }
+
+    /// Resolves `answer`'s question twice, 7 s apart, and checks that the
+    /// hit equals the upstream answer field for field and byte for byte
+    /// except for the id and the counted-down TTLs.
+    async fn assert_cache_hit_is_golden(answer: Message) -> Message {
+        let mut query = query_for("unused.example");
+        query.questions = answer.questions.clone();
+        let (resolver, calls, clock) = cache_resolver(answer.clone());
+        let first = resolver.resolve(&query).await.unwrap();
+        assert_eq!(first, answer);
+        clock.advance(Duration::from_secs(7));
+        let mut again = query.clone();
+        again.header.id = 0xBEEF;
+        let hit = resolver.resolve(&again).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "served from the cache");
+        assert_eq!(hit.header.id, 0xBEEF);
+
+        assert_eq!(without_id_and_ttls(&hit), without_id_and_ttls(&answer));
+        assert_eq!(
+            without_id_and_ttls(&hit).encode().unwrap(),
+            without_id_and_ttls(&answer).encode().unwrap(),
+            "the wire form differs only in id and TTLs"
+        );
+        let expected: Vec<u32> = answer
+            .answers
+            .iter()
+            .chain(&answer.authorities)
+            .chain(&answer.additionals)
+            .map(|record| {
+                if is_opt(record) {
+                    record.ttl
+                } else {
+                    record.ttl - 7
+                }
+            })
+            .collect();
+        assert_eq!(ttls(&hit), expected);
+        hit
+    }
+
+    #[tokio::test]
+    async fn golden_cname_chain_keeps_cnames_first_and_in_chain_order() {
+        let mut answer = query_for_response("www.example.com");
+        answer.header.recursion_available = true;
+        answer.answers = vec![
+            record(
+                "www.example.com",
+                RecordType::Cname,
+                3600,
+                RData::Cname(n("edge.cdn.example.net")),
+            ),
+            record(
+                "edge.cdn.example.net",
+                RecordType::Cname,
+                300,
+                RData::Cname(n("lb.cdn.example.net")),
+            ),
+            a_record("lb.cdn.example.net", 60, 7),
+            a_record("lb.cdn.example.net", 60, 3),
+            a_record("lb.cdn.example.net", 60, 5),
+        ];
+
+        let hit = assert_cache_hit_is_golden(answer).await;
+        let types: Vec<_> = hit.answers.iter().map(|record| record.rtype).collect();
+        assert_eq!(
+            types,
+            [
+                RecordType::Cname,
+                RecordType::Cname,
+                RecordType::A,
+                RecordType::A,
+                RecordType::A
+            ],
+            "CNAME records stay ahead of the records they lead to"
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_mixed_sections_keep_their_section_and_record_order() {
+        let mut answer = query_for_response("example.com");
+        answer.header.recursion_available = true;
+        answer.answers = vec![
+            a_record("example.com", 300, 2),
+            a_record("example.com", 300, 1),
+        ];
+        answer.authorities = vec![
+            record(
+                "example.com",
+                RecordType::Ns,
+                3600,
+                RData::Ns(n("ns2.example.com")),
+            ),
+            record(
+                "example.com",
+                RecordType::Ns,
+                3600,
+                RData::Ns(n("ns1.example.com")),
+            ),
+        ];
+        answer.additionals = vec![
+            a_record("ns2.example.com", 1800, 54),
+            record(
+                "ns2.example.com",
+                RecordType::Aaaa,
+                1800,
+                RData::Aaaa("2001:db8::54".parse().unwrap()),
+            ),
+            a_record("ns1.example.com", 1800, 53),
+        ];
+        let mut edns = Edns::new(1232);
+        edns.set_dnssec_ok(true);
+        answer.set_edns(Some(edns));
+
+        let hit = assert_cache_hit_is_golden(answer).await;
+        assert!(is_opt(hit.additionals.last().unwrap()), "OPT stays last");
+    }
+
+    #[tokio::test]
+    async fn golden_multi_record_rrsets_keep_their_order() {
+        let mut answer = query_for_response("example.com");
+        answer.questions[0].qtype = RecordType::Txt;
+        answer.answers = vec![
+            record(
+                "example.com",
+                RecordType::Txt,
+                900,
+                RData::Txt(vec![b"z-last-alphabetically".to_vec()]),
+            ),
+            record(
+                "example.com",
+                RecordType::Txt,
+                900,
+                RData::Txt(vec![b"a-first".to_vec(), b"second-string".to_vec()]),
+            ),
+            record(
+                "example.com",
+                RecordType::Txt,
+                900,
+                RData::Txt(vec![b"m-middle".to_vec()]),
+            ),
+        ];
+        let query_type = RecordType::Txt;
+        let (resolver, calls, clock) = cache_resolver(answer.clone());
+        let query = query_for_type("example.com", query_type, Class::In, 1);
+        assert_eq!(resolver.resolve(&query).await.unwrap(), answer);
+        clock.advance(Duration::from_secs(7));
+        let hit = resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(without_id_and_ttls(&hit), without_id_and_ttls(&answer));
+        assert_eq!(
+            without_id_and_ttls(&hit).encode().unwrap(),
+            without_id_and_ttls(&answer).encode().unwrap()
+        );
+        assert_eq!(ttls(&hit), [893, 893, 893]);
+
+        let mut a_rrset = query_for_response("example.com");
+        a_rrset.answers = (1..=8)
+            .rev()
+            .map(|octet| a_record("example.com", 120, octet))
+            .collect();
+        assert_cache_hit_is_golden(a_rrset).await;
     }
 
     #[test]

@@ -475,7 +475,22 @@ precedence, message parsing, and DNS name compression bounds.
 The resolver has an in-memory TTL-respecting answer cache, including negative
 caching. Ordinary cache identity includes the **effective upstream group**.
 That matters when a route hook sends equal DNS questions to different routes:
-an answer obtained from one group cannot be reused for another group.
+an answer obtained from one group cannot be reused for another group. The
+query's RD bit is part of the identity too.
+
+- **What is cached**: `NOERROR` answers with records, `NXDOMAIN`, and
+  `NODATA`, only with opcode QUERY, `TC=0`, and an EDNS extended RCODE of 0.
+  `SERVFAIL`, `REFUSED`, other error codes, truncated answers, and answers
+  with a TTL of 0 are returned but never stored. Queries with more or fewer
+  than one question, or another opcode, bypass the cache.
+- **Lifetimes**: stored TTLs are capped at 86 400 s (positive) and 3 600 s
+  (negative). A positive entry lives for its lowest record TTL across all
+  sections; a negative one for min(SOA TTL, SOA `MINIMUM`) (RFC 2308), or
+  60 s without an SOA.
+- **Hits**: TTLs count down by the whole seconds since the answer was
+  stored; the EDNS OPT record is never touched. A hit carries the current
+  query's id, question, and RD bit, sets AA=0, and keeps every record in its
+  original order.
 
 Fake IP terminal answers bypass the ordinary answer cache; their lifetime is
 owned by the Fake IP mapping.
