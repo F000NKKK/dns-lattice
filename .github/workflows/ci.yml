@@ -110,3 +110,48 @@ jobs:
 
       - name: cargo doc --no-deps --workspace --all-features
         run: cargo doc --no-deps --workspace --all-features
+
+  # Compile and lint gate for the unpublished resolver benchmark harness, a
+  # standalone workspace outside `--workspace` above (it pulls in hickory,
+  # which must stay out of the published crates' graph). It runs on every
+  # push so the harness keeps building against the current crates; the
+  # benchmarks themselves only run on demand.
+  bench-resolver:
+    name: bench-resolver (check)
+    runs-on: ubuntu-latest
+    # The standalone workspace would otherwise build into
+    # bench/resolver/target/, which the root .gitignore does not cover.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/bench-resolver
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # rust-cache's workspace mapping is `<workspace> -> <target dir>`,
+      # relative to the workspace, so it saves the directory set above.
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: bench-resolver
+          workspaces: bench/resolver -> ../../target/bench-resolver
+
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path bench/resolver/Cargo.toml
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --manifest-path bench/resolver/Cargo.toml --all-targets -- -D warnings
+
+      # Wire-format tests, cross-checked against both libraries' decoders.
+      - name: cargo test
+        run: cargo test --manifest-path bench/resolver/Cargo.toml
+
+      - name: cargo bench --no-run
+        run: cargo bench --manifest-path bench/resolver/Cargo.toml --no-run
+
+      - name: bash -n and shellcheck scripts/bench-resolver.sh
+        run: |
+          bash -n scripts/bench-resolver.sh
+          shellcheck scripts/bench-resolver.sh

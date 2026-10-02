@@ -1,0 +1,58 @@
+# Resolver benchmark harness: dns-lattice measured next to hickory 0.26.x
+# on identical inputs (see README.md and scripts/bench-resolver.sh).
+#
+# A standalone workspace, deliberately NOT a member of the root workspace:
+# - scripts/release.sh and `cargo package --workspace` only see crates/*,
+#   and this package must never be published;
+# - the root CI builds `--workspace --all-features` on three platforms, and
+#   hickory must stay out of the published crates' dependency graph;
+# - benchmark-only dependencies stay out of the library's preflight.
+#
+# Cargo.lock is not committed (the repository ignores lockfiles); the
+# resolved versions are recorded with each benchmark run instead.
+[workspace]
+
+[package]
+name = "dns-lattice-bench-resolver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MPL-2.0"
+publish = false
+description = "Unpublished benchmark harness comparing the dns-lattice resolver with hickory."
+readme = "README.md"
+
+# The harness library (`src/`) parses and builds DNS bytes by hand, so it
+# depends on neither library under test. Requirements are kept identical to
+# the root workspace's [workspace.dependencies] where they share one;
+# update them together.
+[dev-dependencies]
+dns-lattice = { path = "../../crates/dns-lattice", features = ["dot", "doh", "doq"] }
+# Codec and name comparison only: `std` (its only default feature), no
+# DNSSEC and no `ring`.
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+async-trait = "0.1.92"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
+# The library has no libtest benchmarks; keeping it out of `cargo bench`
+# lets criterion options (`--warm-up-time`, `--save-baseline`, ...) pass
+# through without libtest rejecting them.
+[lib]
+bench = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "name"
+harness = false
+
+[[bench]]
+name = "matcher"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false

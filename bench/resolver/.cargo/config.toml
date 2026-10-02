@@ -1,0 +1,5 @@
+# Local `cd bench/resolver && cargo ...` builds into the repository's
+# ignored target/ directory instead of an untracked bench/resolver/target/.
+# CARGO_TARGET_DIR (set by scripts/bench-resolver.sh and CI) overrides this.
+[build]
+target-dir = "../../target/bench-resolver"
