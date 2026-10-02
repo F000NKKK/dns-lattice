@@ -41,14 +41,16 @@
 //! answered with a synthesized [`Rcode::ServFail`] response instead, so a
 //! client is never left silently unanswered or hanging. A query whose EDNS(0)
 //! OPT record is malformed, or which carries more than one, is answered
-//! with `FORMERR`, and an OPT record with a version above 0 is answered with
-//! `BADVERS`; neither reaches the resolver (see "EDNS(0)" below).
+//! with `FORMERR` carrying a bare server OPT record (RFC 6891 §7), and an
+//! OPT record with a version above 0 is answered with `BADVERS`; neither
+//! reaches the resolver (see "EDNS(0)" below).
 //!
 //! # EDNS(0)
 //!
 //! Every transport answers EDNS(0) queries (RFC 6891) the same way. A
 //! response to a query with an OPT record carries exactly one OPT record —
-//! including `SERVFAIL`, truncated, cache-hit and Fake IP responses — which
+//! including `FORMERR`, `SERVFAIL`, truncated, cache-hit and Fake IP
+//! responses — which
 //! advertises the server's own maximum UDP payload size
 //! ([`ServerBuilder::edns_udp_payload_size`], 1232 bytes by default) with
 //! version 0; a response to a query without one carries none.
@@ -1014,8 +1016,12 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
 /// handling is identical everywhere. `edns_max` is the server's maximum
 /// EDNS UDP payload size.
 ///
-/// 1. A query whose OPT record is malformed (for example more than one OPT
-///    record) gets `FORMERR` without an OPT record (RFC 6891 §6.1.1).
+/// 1. A query whose OPT record is malformed (a non-root owner name, an
+///    option that overruns the record data, or more than one OPT record)
+///    gets `FORMERR` with one bare OPT record: payload size `edns_max`,
+///    version 0, DO clear and no options. RFC 6891 §7 requires the OPT so
+///    an EDNS client can tell a format error within EDNS from a server
+///    that does not implement EDNS.
 /// 2. A well-formed OPT record with a version above 0 gets `BADVERS`
 ///    (RFC 6891 §6.1.3): header RCODE 0 and an OPT record with extended
 ///    RCODE 1, version 0, payload size `edns_max`, the query's DO bit and no
@@ -1029,7 +1035,14 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
 async fn answer(query: &Message, resolver: &Resolver, edns_max: u16) -> Message {
     let query_edns = match query.edns() {
         Ok(edns) => edns,
-        Err(_) => return local_response(query, Rcode::FormErr),
+        Err(_) => {
+            // RFC 6891 §7: a FORMERR caused by the OPT record must itself
+            // carry an OPT record. The query's DO bit is unknown, so it
+            // stays clear.
+            let mut response = local_response(query, Rcode::FormErr);
+            response.set_edns(Some(Edns::new(edns_max)));
+            return response;
+        }
     };
     if let Some(query_edns) = &query_edns
         && query_edns.version() > 0
@@ -2252,20 +2265,98 @@ mod tests {
         expected.set_extended_rcode(1).set_dnssec_ok(true);
         assert_eq!(response.edns().unwrap(), Some(expected));
 
-        // Two OPT records: FORMERR without an OPT, on UDP and TCP.
+        // Two OPT records (`CountMismatch`): FORMERR with exactly one bare
+        // server OPT (RFC 6891 §7), on UDP and TCP.
         let mut query = edns_query("r1.example", 2, 1232, false);
         let opt = query.additionals[0].clone();
         query.additionals.push(opt);
-        let (_, response) = server.udp(&query).await;
-        assert_eq!(response.header.rcode, Rcode::FormErr);
-        assert_eq!(response.header.id, 2);
-        assert_eq!(response.questions, query.questions);
-        assert!(response.additionals.is_empty());
+        assert_formerr_with_bare_opt(&server, &query).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the resolver is never called"
+        );
+        server.stop().await;
+    }
+
+    /// Sends `query` over UDP and over TCP and asserts both answers are a
+    /// local `FORMERR` echoing the query's id and question, with no answer
+    /// records and exactly one bare server OPT record (default 1232-byte
+    /// payload, version 0, extended RCODE 0, DO clear, no options), as RFC
+    /// 6891 §7 requires.
+    async fn assert_formerr_with_bare_opt(server: &TestServer, query: &Message) {
+        let (len, udp_response) = server.udp(query).await;
+        assert!(len <= 512, "{len} bytes");
         let mut stream = TcpStream::connect(server.tcp).await.unwrap();
-        let response = tcp_round_trip(&mut stream, &query).await;
-        assert_eq!(response.header.rcode, Rcode::FormErr);
-        assert!(response.additionals.is_empty());
+        let tcp_response = tcp_round_trip(&mut stream, query).await;
         drop(stream);
+        for response in [udp_response, tcp_response] {
+            assert!(response.header.qr);
+            assert_eq!(response.header.rcode, Rcode::FormErr);
+            assert_eq!(response.header.id, query.header.id);
+            assert_eq!(response.questions, query.questions);
+            assert!(response.answers.is_empty());
+            assert!(response.authorities.is_empty());
+            assert_eq!(opt_count(&response), 1);
+            assert_eq!(response.additionals.len(), 1);
+            assert_eq!(response.edns().unwrap(), Some(Edns::new(1232)));
+        }
+    }
+
+    /// A query for `name` whose single OPT record has `owner`, a 4096-byte
+    /// payload, the DO bit set and raw option bytes `data`.
+    fn raw_opt_query(name: &str, id: u16, owner: Name, data: Vec<u8>) -> Message {
+        let mut query = query_for(name, id);
+        query.additionals.push(ResourceRecord {
+            name: owner,
+            rtype: RecordType::Other(41),
+            class: Class::Other(4096),
+            ttl: 0x0000_8000,
+            rdata: RData::Unknown { rtype: 41, data },
+        });
+        query
+    }
+
+    #[tokio::test]
+    async fn formerr_for_an_option_overrun_carries_a_bare_opt() {
+        let (resolver, calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        // Option code 10 declares 8 data bytes, but only 2 follow.
+        let query = raw_opt_query(
+            "r1.example",
+            7,
+            Name::root(),
+            vec![0x00, 0x0A, 0x00, 0x08, 1, 2],
+        );
+        assert!(matches!(
+            query.edns(),
+            Err(Error::RDataLengthMismatch { .. })
+        ));
+        assert_formerr_with_bare_opt(&server, &query).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the resolver is never called"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn formerr_for_a_non_root_opt_owner_carries_a_bare_opt() {
+        let (resolver, calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        let query = raw_opt_query(
+            "r1.example",
+            8,
+            Name::from_ascii("example.com.").unwrap(),
+            Vec::new(),
+        );
+        assert_eq!(query.edns(), Err(Error::InvalidName));
+        assert_formerr_with_bare_opt(&server, &query).await;
 
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),

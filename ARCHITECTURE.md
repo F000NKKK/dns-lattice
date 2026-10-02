@@ -302,7 +302,11 @@ protocol validation behavior.
 Every listener answers through one shared EDNS(0) path (RFC 6891):
 
 - a query with more than one OPT record, or an OPT record that does not
-  parse, gets a local `FORMERR` without an OPT record;
+  parse (a non-root owner name, or an option that overruns the record
+  data), gets a local `FORMERR` carrying one bare server OPT record
+  (the server's payload size, version 0, DO clear, no options), as RFC 6891
+  §7 requires so the client can tell a format error within EDNS from a
+  server without EDNS;
 - a query with an EDNS version above 0 gets a local `BADVERS` (extended
   RCODE 1) carrying the server's OPT record;
 - neither reaches the resolver; any other query is resolved, and its answer

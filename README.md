@@ -149,7 +149,8 @@ Current limits, stated plainly:
   (larger ones fall back to TCP), while a query that carries one can get
   answers up to the size it advertises;
 - the inbound server answers UDP EDNS(0) clients with at most
-  min(client payload size, 1232 bytes) (`ServerBuilder::edns_udp_payload_size`
+  min(client payload size raised to 512, 1232 bytes)
+  (`ServerBuilder::edns_udp_payload_size`
   changes the 1232) and non-EDNS clients with at most 512 bytes; larger
   answers are sent empty with `TC=1`, so clients retry over TCP;
 - the answer cache has no size limit and no background sweep: an expired

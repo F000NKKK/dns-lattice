@@ -28,9 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     OPT record's options and DO bit are kept. An answer to a query without
     an OPT record never carries one;
   - a query with more than one OPT record, or an OPT record that does not
-    parse, gets a local `FORMERR` without an OPT record; a query with an
-    EDNS version above 0 gets a local `BADVERS` (extended RCODE 1). Neither
-    reaches the resolver.
+    parse, gets a local `FORMERR` carrying one bare server OPT record
+    (server payload size, version 0, DO clear, no options; RFC 6891 §7);
+    a query with an EDNS version above 0 gets a local `BADVERS` (extended
+    RCODE 1). Neither reaches the resolver.
 - Resolver EDNS(0), default behaviour (no public API change):
   - the query's DO bit is part of the cache identity, so a DNSSEC-aware and
     a plain client no longer share an entry;
