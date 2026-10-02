@@ -3,6 +3,7 @@
 
 use dns_lattice_core::{Error, Result};
 
+use super::edns::{Edns, OPT_RTYPE, opt_class, opt_data};
 use super::record::{Class, RData, RecordType};
 
 /// An owned, case-preserving DNS domain name.
@@ -255,6 +256,11 @@ pub struct ResourceRecord {
     pub class: Class,
     /// Seconds this record may be cached, clamped to zero if the wire
     /// value read as negative under RFC 2181's signed framing.
+    ///
+    /// An OPT pseudo-record (`TYPE` 41) is the exception: its `TTL` field
+    /// holds the extended `RCODE`, EDNS version and flags rather than a
+    /// lifetime, so it is decoded as received without the clamp. See
+    /// [`Message::edns`].
     pub ttl: u32,
     /// The record's type-specific data.
     pub rdata: RData,
@@ -339,6 +345,79 @@ impl Message {
         }
         Ok(())
     }
+
+    /// Parses the EDNS(0) OPT pseudo-record (RFC 6891) in the additional
+    /// section.
+    ///
+    /// An OPT record is a record in [`additionals`](Self::additionals)
+    /// whose `rdata` is [`RData::Unknown`] with `rtype` 41. Records in the
+    /// answer and authority sections are not inspected. A `version` other
+    /// than 0 is returned as-is, not rejected.
+    ///
+    /// Returns `Ok(None)` when there is no OPT record.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::CountMismatch`] if there is more than one OPT record;
+    /// - [`Error::InvalidName`] if the OPT owner name is not the root;
+    /// - [`Error::RDataLengthMismatch`] if an option header or option data
+    ///   runs past the end of the record's data, or 1–3 bytes are left over
+    ///   after the last option.
+    pub fn edns(&self) -> Result<Option<Edns>> {
+        let mut found = None;
+        for record in &self.additionals {
+            if let Some(data) = opt_data(&record.rdata) {
+                if found.is_some() {
+                    return Err(Error::CountMismatch);
+                }
+                found = Some((record, data));
+            }
+        }
+        found
+            .map(|(record, data)| Edns::from_record(record, data))
+            .transpose()
+    }
+
+    /// Replaces the EDNS(0) OPT pseudo-record in the additional section.
+    ///
+    /// Every existing OPT record is removed from
+    /// [`additionals`](Self::additionals); with `Some(edns)`, exactly one
+    /// OPT record built from `edns` is then appended at the end. Other
+    /// additional records keep their relative order.
+    ///
+    /// ```
+    /// use dns_lattice_model::{Edns, Header, Message, Opcode, Rcode};
+    ///
+    /// let mut message = Message {
+    ///     header: Header {
+    ///         id: 1,
+    ///         qr: false,
+    ///         opcode: Opcode::Query,
+    ///         authoritative: false,
+    ///         truncated: false,
+    ///         recursion_desired: true,
+    ///         recursion_available: false,
+    ///         rcode: Rcode::NoError,
+    ///     },
+    ///     questions: vec![],
+    ///     answers: vec![],
+    ///     authorities: vec![],
+    ///     additionals: vec![],
+    /// };
+    /// message.set_edns(Some(Edns::new(1232)));
+    /// let decoded = Message::decode(&message.encode().unwrap()).unwrap();
+    /// assert_eq!(decoded.edns().unwrap(), Some(Edns::new(1232)));
+    ///
+    /// message.set_edns(None);
+    /// assert!(message.additionals.is_empty());
+    /// ```
+    pub fn set_edns(&mut self, edns: Option<Edns>) {
+        self.additionals
+            .retain(|record| opt_data(&record.rdata).is_none());
+        if let Some(edns) = edns {
+            self.additionals.push(edns.to_record());
+        }
+    }
 }
 
 fn to_u16_count(len: usize) -> Result<u16> {
@@ -414,13 +493,23 @@ fn encode_question(question: &Question, buf: &mut Vec<u8>) -> Result<()> {
 
 fn decode_rr(buf: &[u8], pos: &mut usize) -> Result<ResourceRecord> {
     let name = decode_name(buf, pos)?;
-    let rtype = RecordType::from_u16(read_u16(buf, pos)?);
-    let class = Class::from_u16(read_u16(buf, pos)?)?;
+    let rtype_raw = read_u16(buf, pos)?;
+    let rtype = RecordType::from_u16(rtype_raw);
+    let is_opt = rtype_raw == OPT_RTYPE;
+    let class_raw = read_u16(buf, pos)?;
+    // An OPT record's CLASS is a UDP payload size (RFC 6891 §6.1.2), so 0
+    // is a legal value there and nowhere else.
+    let class = if is_opt {
+        opt_class(class_raw)
+    } else {
+        Class::from_u16(class_raw)?
+    };
     let ttl_raw = read_u32(buf, pos)?;
     // RFC 2181 frames TTL as a signed 32-bit value; a wire value with the
     // sign bit set is non-conformant and clamped to zero rather than kept
-    // negative.
-    let ttl = if ttl_raw & 0x8000_0000 != 0 {
+    // negative. An OPT record's TTL carries the extended RCODE, version and
+    // flags (RFC 6891 §6.1.3) and is kept as received.
+    let ttl = if !is_opt && ttl_raw & 0x8000_0000 != 0 {
         0
     } else {
         ttl_raw

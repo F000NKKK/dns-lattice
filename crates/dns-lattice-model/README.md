@@ -34,6 +34,10 @@ operating-system dependency.
   `ResourceRecord`, `Message`) with wire encode/decode.
 - ✅ **`record`**: DNS record types and resource-data (`RecordType`, `Class`,
   `RData`).
+- ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
+  through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
+  an ordinary additional record; a message whose OPT is never touched
+  round-trips byte-for-byte. Options are kept as raw code/data pairs.
 - ✅ **`matcher`**: a zone/domain matcher (`DomainPattern`,
   `DomainMatcher<T>`) with deterministic exact/suffix/wildcard precedence.
 - ✅ **`policy`**: split-DNS policy types (`UpstreamGroupId`,

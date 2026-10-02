@@ -32,7 +32,9 @@ pub enum Error {
     /// not permitted in that position.
     InvalidName,
     /// The header's declared section count does not match the number of
-    /// records actually present after parsing.
+    /// records actually present after parsing, or a message holds more
+    /// records of a kind than the protocol permits (for example more than
+    /// one EDNS(0) OPT pseudo-record).
     CountMismatch,
     /// A resource record's declared `RDLENGTH` does not match the number
     /// of bytes actually available or consumed for its `RDATA`.

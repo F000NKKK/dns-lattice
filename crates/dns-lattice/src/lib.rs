@@ -308,8 +308,9 @@ pub mod observability;
 /// `dns_lattice::model::Name`.
 pub mod model {
     pub use dns_lattice_model::{
-        Class, DomainMatcher, DomainPattern, Header, Message, Name, Opcode, Question, RData, Rcode,
-        RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder, UpstreamGroupId,
+        Class, DomainMatcher, DomainPattern, Edns, EdnsOption, Header, Message, Name, Opcode,
+        Question, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder,
+        UpstreamGroupId,
     };
 }
 pub mod server;
@@ -325,6 +326,10 @@ mod facade_path_tests {
         let _: Option<model::DomainMatcher<()>> = Some(model::DomainMatcher::new());
         let _: fn(model::Name) -> model::DomainPattern = model::DomainPattern::suffix;
         let _: fn(model::SplitDnsPolicy) -> engine::ResolverBuilder = engine::Resolver::builder;
+        let _: model::Edns = model::Edns::new(1232);
+        let _: fn(u16, Vec<u8>) -> core::Result<model::EdnsOption> = model::EdnsOption::new;
+        let _: fn(&model::Message) -> core::Result<Option<model::Edns>> = model::Message::edns;
+        let _: fn(&mut model::Message, Option<model::Edns>) = model::Message::set_edns;
 
         let _: Option<hooks::RouteDecision> = Some(hooks::RouteDecision::Abstain);
         let _: Option<&dyn hooks::RouteHook> = None;

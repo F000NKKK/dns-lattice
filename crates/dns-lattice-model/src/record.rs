@@ -64,6 +64,11 @@ impl RecordType {
 }
 
 /// A DNS record class (RFC 1035 §3.2.4). `0` is reserved and rejected.
+///
+/// The one exception is the EDNS(0) OPT pseudo-record (`TYPE` 41), whose
+/// `CLASS` field carries a UDP payload size instead of a class: there `0`
+/// decodes as [`Other(0)`](Class::Other). Read the payload size through
+/// [`Edns::udp_payload_size`](crate::edns::Edns::udp_payload_size).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
     /// The Internet.
