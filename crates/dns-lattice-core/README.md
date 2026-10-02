@@ -9,7 +9,8 @@
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
 
-[Overview](#-overview) • [Features](#-key-features) • [Installation](#-installation) • [Quick Start](#-quick-start)
+[Overview](#-overview) • [Features](#-key-features)
+• [Installation](#-installation) • [Quick Start](#-quick-start)
 
 </div>
 
@@ -41,7 +42,7 @@ No Cargo features and no dependencies.
 
 ```toml
 [dependencies]
-dns-lattice-core = "1.1.2"
+dns-lattice-core = "1.1"
 ```
 
 ## 🎓 Quick Start
