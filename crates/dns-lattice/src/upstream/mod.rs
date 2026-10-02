@@ -190,6 +190,10 @@ pub trait UpstreamBackend: Send + Sync {
     /// Resolves `query` against this backend, returning the answer
     /// [`Message`] or an [`Error`] if the backend itself fails (transport
     /// error, timeout, malformed response).
+    ///
+    /// The resolver forwards a fresh answer to the client unchanged, so an
+    /// implementation should return it with `query`'s message id, as every
+    /// built-in backend does.
     async fn resolve(&self, query: &Message) -> Result<Message>;
 }
 
@@ -885,6 +889,8 @@ mod tests {
                 .send_to(&spoofed.encode().unwrap(), from)
                 .await
                 .unwrap();
+            // An undecodable datagram does not end the query early either.
+            server.send_to(&[0xff; 3], from).await.unwrap();
         });
 
         let backend = UdpBackend::new(UdpBackendConfig {

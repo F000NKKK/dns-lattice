@@ -158,7 +158,8 @@ Upstream backends are async. A group's backends are tried in registration order;
 transport, and TLS failures can fall over to the next one, and if all fail the last error is
 returned. Each built-in backend checks that a response answers its query before returning
 it: `QR` must be set and the question must match; the message id must match too, except on
-DoH and DoQ, which use id 0 on the wire.
+DoH and DoQ, where a server may answer with id 0 (the response is returned with the
+caller's id).
 
 - **UDP** (default): `UdpBackend` / `udp_addr`; falls back to TCP when a response has `TC=1`.
 - **TCP** (default): `TcpBackend` / `tcp_addr`, RFC 1035 framing.
