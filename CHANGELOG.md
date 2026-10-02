@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-02
+
+### Changed
+
+- Compacted the crate READMEs for crates.io: short sections without
+  tables that link to the repository README and ARCHITECTURE. The root
+  README installation snippets now name `1.1.3`. No code change.
+
 ### Fixed
 
 - The UDP upstream backend received into a 512-byte buffer, although it

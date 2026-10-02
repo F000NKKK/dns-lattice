@@ -164,7 +164,7 @@ application-specific routing. DNS Lattice разделяет эти ответс
 ```toml
 [dependencies]
 # Только UDP и TCP: без зависимостей TLS, HTTP и QUIC
-dns-lattice = "1.1.2"
+dns-lattice = "1.1.3"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -173,16 +173,16 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
 ```toml
 # DNS-over-TLS
-dns-lattice = { version = "1.1.2", features = ["dot"] }
+dns-lattice = { version = "1.1.3", features = ["dot"] }
 
 # DNS-over-HTTPS по HTTP/1.1, HTTP/2 и HTTP/3
-dns-lattice = { version = "1.1.2", features = ["doh"] }
+dns-lattice = { version = "1.1.3", features = ["doh"] }
 
 # DNS-over-QUIC, без HTTP-стека
-dns-lattice = { version = "1.1.2", features = ["doq"] }
+dns-lattice = { version = "1.1.3", features = ["doq"] }
 
 # Всё сразу
-dns-lattice = { version = "1.1.2", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.1.3", features = ["dot", "doh", "doq"] }
 ```
 
 - `dot` — DNS-over-TLS;
