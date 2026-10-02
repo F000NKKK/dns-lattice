@@ -7,8 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ServerBuilder::edns_udp_payload_size` sets the largest UDP answer the
+  inbound server sends to an EDNS(0) client and advertises in its OPT
+  record. The default is 1232 bytes; smaller values are raised to 512, and
+  setting 512 restores the 1.1 UDP answer size.
+
 ### Changed
 
+- Inbound server EDNS(0), default behaviour:
+  - a UDP answer to a client that sends an OPT record may now be up to
+    min(the client's advertised payload size raised to 512, 1232 bytes)
+    long; it used to be truncated above 512 bytes. A client without an OPT
+    record still gets at most 512 bytes;
+  - every answer to a query with an OPT record carries exactly one OPT
+    record, on every transport: cache hits, Fake IP answers, `SERVFAIL`
+    answers and truncated (`TC=1`) UDP answers included. It advertises the
+    server's payload size, version 0 and the query's DO bit; an upstream
+    OPT record's options and DO bit are kept. An answer to a query without
+    an OPT record never carries one;
+  - a query with more than one OPT record, or an OPT record that does not
+    parse, gets a local `FORMERR` without an OPT record; a query with an
+    EDNS version above 0 gets a local `BADVERS` (extended RCODE 1). Neither
+    reaches the resolver.
+- Resolver EDNS(0), default behaviour (no public API change):
+  - the query's DO bit is part of the cache identity, so a DNSSEC-aware and
+    a plain client no longer share an entry;
+  - a cached answer is stored without its OPT record, so a hit never
+    replays the first client's OPT record or options. A hit for a query
+    with an OPT record gets a fresh one (1232 bytes, version 0, the query's
+    DO bit, no options); a hit for a query without one gets none;
+  - a fresh upstream answer or a Fake IP answer has its OPT record removed
+    when the query had none, and gets the fresh OPT record above when the
+    query had one but the answer did not.
 - Resolver cache, default behaviour (no public API change):
   - a stored record TTL is clamped to at most 86 400 s in a positive answer
     and 3 600 s in a negative one; neither was capped before;

@@ -170,17 +170,23 @@ The resolver owns an in-memory answer cache that respects positive TTLs and
 RFC 2308-style negative caching. Cache identity includes the effective
 upstream group in addition to the DNS question identity. This is required by
 dynamic routing: a response obtained from one route must never satisfy a query
-that the hook routes to another group. The query's RD bit is also part of the
-identity.
+that the hook routes to another group. The query's RD bit and EDNS DO bit
+(RFC 3225) are also part of the identity.
 
-Only clean answers are stored (opcode QUERY, `TC=0`, EDNS extended RCODE 0,
-and `NOERROR` with records, `NXDOMAIN`, or `NODATA`), with record TTLs capped
-at one day (positive) or one hour (negative) and a negative lifetime of
-min(SOA TTL, SOA `MINIMUM`). A hit counts every TTL down by whole elapsed
-seconds, never touching the EDNS OPT record, echoes the current query's id,
-question, and RD bit, clears AA, and preserves record order. The cache lock
-covers only the lookup and a reference-count increment; the response is built
-after it is released.
+Only clean answers are stored (opcode QUERY, `TC=0`, a well-formed OPT record
+with EDNS extended RCODE 0 if any, and `NOERROR` with records, `NXDOMAIN`, or
+`NODATA`), with the OPT record removed, record TTLs capped at one day
+(positive) or one hour (negative) and a negative lifetime of min(SOA TTL, SOA
+`MINIMUM`). A hit counts every TTL down by whole elapsed seconds, echoes the
+current query's id, question, and RD bit, clears AA, and preserves record
+order. The cache lock covers only the lookup and a reference-count increment;
+the response is built after it is released.
+
+Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
+answer — is aligned with the query's EDNS(0) state: without a query OPT
+record the answer has none; with one, an answer lacking a valid OPT record
+gets a fresh one (1232 bytes, version 0, the query's DO bit, no options),
+while a fresh upstream OPT record is kept as received.
 
 Fake IP terminal answers bypass the ordinary answer cache because their
 lifetime is governed by the Fake IP mapping itself.
@@ -292,6 +298,23 @@ Resolver errors are represented as DNS `SERVFAIL` answers where the inbound
 protocol has a valid DNS request to answer; malformed requests that cannot be
 reliably associated with a DNS transaction follow the listener's documented
 protocol validation behavior.
+
+Every listener answers through one shared EDNS(0) path (RFC 6891):
+
+- a query with more than one OPT record, or an OPT record that does not
+  parse, gets a local `FORMERR` without an OPT record;
+- a query with an EDNS version above 0 gets a local `BADVERS` (extended
+  RCODE 1) carrying the server's OPT record;
+- neither reaches the resolver; any other query is resolved, and its answer
+  carries exactly one OPT record — advertising the server's payload size,
+  version 0, and keeping an upstream OPT record's DO bit and options, or the
+  query's DO bit when it is fresh — if and only if the query had one.
+
+`ServerBuilder::edns_udp_payload_size` sets the server maximum (default
+1232 bytes, never below 512). A UDP answer is limited to 512 bytes for a
+non-EDNS client and to min(client payload size raised to 512, server
+maximum) for an EDNS client; a larger answer is sent with empty sections and
+`TC=1`, keeping its OPT record. Stream transports are never truncated.
 
 ## Concurrency and ownership
 

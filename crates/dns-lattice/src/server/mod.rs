@@ -39,7 +39,26 @@
 //! `id`/question to echo back in that case. A query that decodes but whose
 //! [`Resolver::resolve`](crate::engine::Resolver::resolve) call returns `Err(_)` is
 //! answered with a synthesized [`Rcode::ServFail`] response instead, so a
-//! client is never left silently unanswered or hanging.
+//! client is never left silently unanswered or hanging. A query whose EDNS(0)
+//! OPT record is malformed, or which carries more than one, is answered
+//! with `FORMERR`, and an OPT record with a version above 0 is answered with
+//! `BADVERS`; neither reaches the resolver (see "EDNS(0)" below).
+//!
+//! # EDNS(0)
+//!
+//! Every transport answers EDNS(0) queries (RFC 6891) the same way. A
+//! response to a query with an OPT record carries exactly one OPT record —
+//! including `SERVFAIL`, truncated, cache-hit and Fake IP responses — which
+//! advertises the server's own maximum UDP payload size
+//! ([`ServerBuilder::edns_udp_payload_size`], 1232 bytes by default) with
+//! version 0; a response to a query without one carries none.
+//!
+//! The UDP listener sends a response of up to the smaller of the client's
+//! advertised payload size (at least 512) and the server maximum to an EDNS
+//! client, and up to 512 bytes to any other client. A larger response is
+//! truncated: `TC=1`, empty answer and authority sections, and only the OPT
+//! record in the additional section. TCP, DoT, DoH and DoQ responses are
+//! never truncated.
 //!
 //! DoH cannot simply "drop" a request the way UDP/TCP/DoT/DoQ drop
 //! undecodable bytes — HTTP's request/response model requires *some*
@@ -65,7 +84,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dns_lattice_core::{Error, Result};
-use dns_lattice_model::{Message, Rcode};
+use dns_lattice_model::{Edns, Message, Rcode};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(test)]
 use tokio::net::TcpStream;
@@ -98,7 +117,9 @@ use hyper_util::server::conn::auto;
 use crate::engine::Resolver;
 #[cfg(feature = "doq")]
 use crate::upstream::QuicStream;
-use crate::upstream::{UDP_MAX_RESPONSE_LEN, read_framed, write_framed};
+use crate::upstream::{
+    DEFAULT_EDNS_UDP_PAYLOAD_SIZE, UDP_MAX_RESPONSE_LEN, read_framed, write_framed,
+};
 
 /// Bounds each TCP read/write performed by the server's per-connection
 /// loop. Not user-configurable in this stage — a slow/idle client simply
@@ -106,6 +127,15 @@ use crate::upstream::{UDP_MAX_RESPONSE_LEN, read_framed, write_framed};
 /// than being held open indefinitely; a future stage may expose this as
 /// builder configuration if a real deployment needs it tuned.
 const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The smallest EDNS(0) UDP payload size the server honours, from either a
+/// client OPT record or [`ServerBuilder::edns_udp_payload_size`]: RFC 6891
+/// §6.2.5 treats any smaller value as 512.
+const MIN_EDNS_UDP_PAYLOAD_SIZE: u16 = 512;
+
+/// The EDNS extended RCODE of BADVERS (16): the upper 8 bits of the 12-bit
+/// RCODE, carried in the response OPT record (RFC 6891 §6.1.3).
+const BADVERS_EXTENDED_RCODE: u8 = 1;
 
 /// Builds a [`Server`] from a shared [`Resolver`] and one or more listen
 /// addresses.
@@ -125,6 +155,7 @@ pub struct ServerBuilder {
     doh3_addrs: Vec<(SocketAddr, quinn::ServerConfig, DohListenerConfig)>,
     #[cfg(feature = "doq")]
     doq_addrs: Vec<(SocketAddr, quinn::ServerConfig)>,
+    edns_udp_payload_size: u16,
 }
 
 /// Configuration for a DoH (RFC 8484) listener beyond its TLS config,
@@ -172,7 +203,43 @@ impl ServerBuilder {
             doh3_addrs: Vec::new(),
             #[cfg(feature = "doq")]
             doq_addrs: Vec::new(),
+            edns_udp_payload_size: DEFAULT_EDNS_UDP_PAYLOAD_SIZE,
         }
+    }
+
+    /// Sets the largest UDP response this server sends to an EDNS(0)
+    /// client, and the UDP payload size every response OPT record
+    /// advertises (on every transport). Values below 512 are raised to 512.
+    /// The default is 1232 bytes.
+    ///
+    /// A UDP response to a query carrying an OPT record may be as large as
+    /// the smaller of this value and the client's advertised payload size
+    /// (itself raised to at least 512); a larger response is truncated with
+    /// `TC=1`. A query without an OPT record is always limited to 512 bytes.
+    /// TCP, DoT, DoH and DoQ responses are never truncated.
+    ///
+    /// The value also bounds how large a UDP response an EDNS query can
+    /// reflect towards a spoofed source address. An internet-facing listener
+    /// that must keep the 512-byte limit for every client can set
+    /// `edns_udp_payload_size(512)`; EDNS clients then still receive an OPT
+    /// record in every response, as RFC 6891 requires.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use dns_lattice::engine::Resolver;
+    /// use dns_lattice::model::SplitDnsPolicy;
+    /// use dns_lattice::server::ServerBuilder;
+    ///
+    /// let resolver = Arc::new(Resolver::builder(SplitDnsPolicy::builder().build()).build());
+    /// let builder = ServerBuilder::new(resolver)
+    ///     .udp_addr("127.0.0.1:0".parse().unwrap())
+    ///     .edns_udp_payload_size(512);
+    /// # drop(builder);
+    /// ```
+    pub fn edns_udp_payload_size(mut self, size: u16) -> Self {
+        self.edns_udp_payload_size = size.max(MIN_EDNS_UDP_PAYLOAD_SIZE);
+        self
     }
 
     /// Adds a UDP address to bind. May be called more than once to bind
@@ -341,6 +408,7 @@ impl ServerBuilder {
             doh3_endpoints,
             #[cfg(feature = "doq")]
             doq_endpoints,
+            edns_udp_payload_size: self.edns_udp_payload_size,
         })
     }
 }
@@ -360,6 +428,7 @@ pub struct Server {
     doh3_endpoints: Vec<(quinn::Endpoint, DohListenerConfig)>,
     #[cfg(feature = "doq")]
     doq_endpoints: Vec<quinn::Endpoint>,
+    edns_udp_payload_size: u16,
 }
 
 impl Server {
@@ -401,6 +470,7 @@ impl Server {
             doh3_endpoints,
             #[cfg(feature = "doq")]
             doq_endpoints,
+            edns_udp_payload_size: edns_max,
         } = self;
 
         let udp_sockets: Vec<Arc<UdpSocket>> = udp_sockets.into_iter().map(Arc::new).collect();
@@ -408,31 +478,33 @@ impl Server {
         let mut loops = tokio::task::JoinSet::new();
         for socket in udp_sockets {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_udp(socket, resolver).await });
+            loops.spawn(async move { serve_udp(socket, resolver, edns_max).await });
         }
         for listener in tcp_listeners {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_tcp(listener, resolver).await });
+            loops.spawn(async move { serve_tcp(listener, resolver, edns_max).await });
         }
         #[cfg(feature = "dot")]
         for (listener, acceptor) in dot_listeners {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_dot(listener, acceptor, resolver).await });
+            loops.spawn(async move { serve_dot(listener, acceptor, resolver, edns_max).await });
         }
         #[cfg(feature = "doh")]
         for (listener, acceptor, config) in doh_listeners {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_doh(listener, acceptor, config, resolver).await });
+            loops.spawn(
+                async move { serve_doh(listener, acceptor, config, resolver, edns_max).await },
+            );
         }
         #[cfg(feature = "doh")]
         for (endpoint, config) in doh3_endpoints {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_doh3(endpoint, config, resolver).await });
+            loops.spawn(async move { serve_doh3(endpoint, config, resolver, edns_max).await });
         }
         #[cfg(feature = "doq")]
         for endpoint in doq_endpoints {
             let resolver = resolver.clone();
-            loops.spawn(async move { serve_doq(endpoint, resolver).await });
+            loops.spawn(async move { serve_doq(endpoint, resolver, edns_max).await });
         }
 
         tokio::pin!(shutdown);
@@ -462,7 +534,7 @@ impl Server {
 /// resolution never stalls receiving the next datagram. Only returns (with
 /// `Err`) if `recv_from` itself fails, which is treated as unrecoverable
 /// for this socket.
-async fn serve_udp(socket: Arc<UdpSocket>, resolver: Arc<Resolver>) -> Result<()> {
+async fn serve_udp(socket: Arc<UdpSocket>, resolver: Arc<Resolver>, edns_max: u16) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (len, from) = socket
@@ -473,29 +545,32 @@ async fn serve_udp(socket: Arc<UdpSocket>, resolver: Arc<Resolver>) -> Result<()
         let socket = socket.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            handle_udp_datagram(&socket, &resolver, &payload, from).await;
+            handle_udp_datagram(&socket, &resolver, &payload, from, edns_max).await;
         });
     }
 }
 
-/// Decodes, resolves, and answers one inbound UDP datagram. Undecodable
-/// bytes are dropped (logged nowhere in this stage — no logging facade
-/// exists yet; see module docs) rather than answered, since there is no
-/// reliable `id`/question to echo back for a message that failed to parse.
+/// Decodes, answers (through [`answer`]) and sends the response to one
+/// inbound UDP datagram. Undecodable bytes are dropped (logged nowhere in
+/// this stage — no logging facade exists yet; see module docs) rather than
+/// answered, since there is no reliable `id`/question to echo back for a
+/// message that failed to parse.
+///
+/// The response is limited to [`udp_response_limit`] bytes. A larger one is
+/// truncated: its answer and authority sections are cleared, only its OPT
+/// record (if any) is kept in the additional section, and `TC=1` is set.
 async fn handle_udp_datagram(
     socket: &UdpSocket,
     resolver: &Resolver,
     payload: &[u8],
     from: SocketAddr,
+    edns_max: u16,
 ) {
     let Ok(query) = Message::decode(payload) else {
         return;
     };
 
-    let mut response = match resolver.resolve(&query).await {
-        Ok(answer) => answer,
-        Err(_) => servfail_response(&query),
-    };
+    let mut response = answer(&query, resolver, edns_max).await;
 
     let Ok(mut encoded) = response.encode() else {
         // Encoding a synthesized/passthrough response should not normally
@@ -506,18 +581,49 @@ async fn handle_udp_datagram(
         return;
     };
 
-    if encoded.len() > UDP_MAX_RESPONSE_LEN {
+    let limit = udp_response_limit(&query, edns_max);
+    if encoded.len() > limit {
+        let edns = response.edns().ok().flatten();
         response.answers.clear();
         response.authorities.clear();
         response.additionals.clear();
         response.header.truncated = true;
+        response.set_edns(edns);
         encoded = match response.encode() {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
+        if encoded.len() > limit {
+            // The OPT options may still push the response over the limit
+            // (a header, one question and a bare OPT always fit in 512
+            // bytes), so drop them too.
+            if let Ok(Some(mut edns)) = response.edns() {
+                edns.clear_options();
+                response.set_edns(Some(edns));
+            }
+            encoded = match response.encode() {
+                Ok(bytes) => bytes,
+                Err(_) => return,
+            };
+        }
     }
 
     let _ = socket.send_to(&encoded, from).await;
+}
+
+/// The largest UDP response for `query`: with a well-formed OPT record, the
+/// client's advertised payload size raised to at least 512 and capped at
+/// the server maximum `edns_max`; otherwise 512 bytes (RFC 1035 §4.2.1,
+/// RFC 6891 §6.2.5).
+fn udp_response_limit(query: &Message, edns_max: u16) -> usize {
+    match query.edns() {
+        Ok(Some(edns)) => usize::from(
+            edns.udp_payload_size()
+                .max(MIN_EDNS_UDP_PAYLOAD_SIZE)
+                .min(edns_max),
+        ),
+        Ok(None) | Err(_) => UDP_MAX_RESPONSE_LEN,
+    }
 }
 
 /// Runs `listener`'s TCP accept loop forever: one `tokio::task` per
@@ -525,7 +631,7 @@ async fn handle_udp_datagram(
 /// as many length-prefixed queries as the client sends on that connection.
 /// Only returns (with `Err`) if `accept` itself fails, which is treated as
 /// unrecoverable for this listener.
-async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) -> Result<()> {
+async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>, edns_max: u16) -> Result<()> {
     loop {
         let (stream, _peer) = listener
             .accept()
@@ -533,7 +639,7 @@ async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) -> Result<()>
             .map_err(|err| Error::Transport(err.to_string()))?;
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            handle_tcp_connection(stream, &resolver).await;
+            handle_tcp_connection(stream, &resolver, edns_max).await;
         });
     }
 }
@@ -551,6 +657,7 @@ async fn serve_dot(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     resolver: Arc<Resolver>,
+    edns_max: u16,
 ) -> Result<()> {
     loop {
         let (stream, _peer) = listener
@@ -563,7 +670,7 @@ async fn serve_dot(
             let Ok(tls_stream) = acceptor.accept(stream).await else {
                 return;
             };
-            handle_tcp_connection(tls_stream, &resolver).await;
+            handle_tcp_connection(tls_stream, &resolver, edns_max).await;
         });
     }
 }
@@ -582,6 +689,7 @@ async fn serve_doh(
     acceptor: TlsAcceptor,
     config: DohListenerConfig,
     resolver: Arc<Resolver>,
+    edns_max: u16,
 ) -> Result<()> {
     let config = Arc::new(config);
     loop {
@@ -602,7 +710,7 @@ async fn serve_doh(
                 let config = config.clone();
                 async move {
                     Ok::<_, std::convert::Infallible>(
-                        handle_doh_request(req, config, resolver).await,
+                        handle_doh_request(req, config, resolver, edns_max).await,
                     )
                 }
             });
@@ -630,6 +738,7 @@ async fn handle_doh_request(
     req: Request<Incoming>,
     config: Arc<DohListenerConfig>,
     resolver: Arc<Resolver>,
+    edns_max: u16,
 ) -> Response<Full<Bytes>> {
     if req.uri().path() != config.path {
         return http_status_response(StatusCode::NOT_FOUND);
@@ -644,10 +753,7 @@ async fn handle_doh_request(
         return http_status_response(StatusCode::BAD_REQUEST);
     };
 
-    let response = match resolver.resolve(&query).await {
-        Ok(answer) => answer,
-        Err(_) => servfail_response(&query),
-    };
+    let response = answer(&query, &resolver, edns_max).await;
 
     let Ok(encoded) = response.encode() else {
         return http_status_response(StatusCode::INTERNAL_SERVER_ERROR);
@@ -703,6 +809,7 @@ async fn serve_doh3(
     endpoint: quinn::Endpoint,
     config: DohListenerConfig,
     resolver: Arc<Resolver>,
+    edns_max: u16,
 ) -> Result<()> {
     loop {
         let Some(incoming) = endpoint.accept().await else {
@@ -743,11 +850,8 @@ async fn serve_doh3(
                     let (status, payload) =
                         match query_bytes.and_then(|bytes| Message::decode(&bytes).ok()) {
                             Some(query) if request.uri().path() == config.path => {
-                                let answer = resolver
-                                    .resolve(&query)
-                                    .await
-                                    .unwrap_or_else(|_| servfail_response(&query));
-                                match answer.encode() {
+                                let response = answer(&query, &resolver, edns_max).await;
+                                match response.encode() {
                                     Ok(bytes) => (StatusCode::OK, bytes),
                                     Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Vec::new()),
                                 }
@@ -799,7 +903,11 @@ fn extract_doh3_query_bytes(request: &http::Request<()>, body: Vec<u8>) -> Optio
 /// endpoint was closed), or `Err` if the endpoint itself becomes
 /// unrecoverable.
 #[cfg(feature = "doq")]
-async fn serve_doq(endpoint: quinn::Endpoint, resolver: Arc<Resolver>) -> Result<()> {
+async fn serve_doq(
+    endpoint: quinn::Endpoint,
+    resolver: Arc<Resolver>,
+    edns_max: u16,
+) -> Result<()> {
     loop {
         let Some(incoming) = endpoint.accept().await else {
             return Ok(());
@@ -821,7 +929,7 @@ async fn serve_doq(endpoint: quinn::Endpoint, resolver: Arc<Resolver>) -> Result
                 };
                 let resolver = resolver.clone();
                 tokio::spawn(async move {
-                    handle_doq_stream(send, recv, &resolver).await;
+                    handle_doq_stream(send, recv, &resolver, edns_max).await;
                 });
             }
         });
@@ -838,7 +946,12 @@ async fn serve_doq(endpoint: quinn::Endpoint, resolver: Arc<Resolver>) -> Result
 /// stream without a response, same undecodable-message policy as UDP/TCP/
 /// DoT.
 #[cfg(feature = "doq")]
-async fn handle_doq_stream(send: quinn::SendStream, recv: quinn::RecvStream, resolver: &Resolver) {
+async fn handle_doq_stream(
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    resolver: &Resolver,
+    edns_max: u16,
+) {
     let mut stream = QuicStream { send, recv };
 
     let query = match read_framed(&mut stream, TCP_IO_TIMEOUT).await {
@@ -846,10 +959,7 @@ async fn handle_doq_stream(send: quinn::SendStream, recv: quinn::RecvStream, res
         Err(_) => return,
     };
 
-    let response = match resolver.resolve(&query).await {
-        Ok(answer) => answer,
-        Err(_) => servfail_response(&query),
-    };
+    let response = answer(&query, resolver, edns_max).await;
 
     if write_framed(&mut stream, TCP_IO_TIMEOUT, &response)
         .await
@@ -876,6 +986,7 @@ async fn handle_doq_stream(send: quinn::SendStream, recv: quinn::RecvStream, res
 async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     resolver: &Resolver,
+    edns_max: u16,
 ) {
     loop {
         let query = match read_framed(&mut stream, TCP_IO_TIMEOUT).await {
@@ -887,10 +998,7 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Err(_) => return,
         };
 
-        let response = match resolver.resolve(&query).await {
-            Ok(answer) => answer,
-            Err(_) => servfail_response(&query),
-        };
+        let response = answer(&query, resolver, edns_max).await;
 
         if write_framed(&mut stream, TCP_IO_TIMEOUT, &response)
             .await
@@ -901,14 +1009,68 @@ async fn handle_tcp_connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Synthesizes an [`Rcode::ServFail`] response echoing `query`'s `id` and
-/// question section, used whenever
-/// [`Resolver::resolve`](crate::engine::Resolver::resolve) returns `Err(_)` for a
-/// query that *did* decode successfully.
-fn servfail_response(query: &Message) -> Message {
+/// Answers one decoded query; every transport (UDP, TCP, DoT, DoH over
+/// HTTP/1.1, HTTP/2 and HTTP/3, DoQ) goes through this helper, so EDNS(0)
+/// handling is identical everywhere. `edns_max` is the server's maximum
+/// EDNS UDP payload size.
+///
+/// 1. A query whose OPT record is malformed (for example more than one OPT
+///    record) gets `FORMERR` without an OPT record (RFC 6891 §6.1.1).
+/// 2. A well-formed OPT record with a version above 0 gets `BADVERS`
+///    (RFC 6891 §6.1.3): header RCODE 0 and an OPT record with extended
+///    RCODE 1, version 0, payload size `edns_max`, the query's DO bit and no
+///    options.
+///
+/// Neither of these calls the resolver. Otherwise the resolver answers;
+/// its `Err` becomes `SERVFAIL`. Finally the response carries exactly one
+/// OPT record when the query had one — the resolver's own (keeping its DO
+/// bit, extended RCODE and options) or a fresh one — always advertising
+/// `edns_max` with version 0, and none otherwise.
+async fn answer(query: &Message, resolver: &Resolver, edns_max: u16) -> Message {
+    let query_edns = match query.edns() {
+        Ok(edns) => edns,
+        Err(_) => return local_response(query, Rcode::FormErr),
+    };
+    if let Some(query_edns) = &query_edns
+        && query_edns.version() > 0
+    {
+        let mut response = local_response(query, Rcode::NoError);
+        let mut edns = Edns::new(edns_max);
+        edns.set_extended_rcode(BADVERS_EXTENDED_RCODE)
+            .set_dnssec_ok(query_edns.dnssec_ok());
+        response.set_edns(Some(edns));
+        return response;
+    }
+
+    let mut response = match resolver.resolve(query).await {
+        Ok(answer) => answer,
+        Err(_) => local_response(query, Rcode::ServFail),
+    };
+    let response_edns = query_edns.map(|query_edns| {
+        let mut edns = match response.edns() {
+            Ok(Some(edns)) => edns,
+            Ok(None) | Err(_) => {
+                let mut edns = Edns::new(edns_max);
+                edns.set_dnssec_ok(query_edns.dnssec_ok());
+                edns
+            }
+        };
+        edns.set_udp_payload_size(edns_max).set_version(0);
+        edns
+    });
+    response.set_edns(response_edns);
+    response
+}
+
+/// Synthesizes a response with `rcode` echoing `query`'s header (with `QR`
+/// set) and question section, and no records: used for [`Rcode::ServFail`]
+/// whenever [`Resolver::resolve`](crate::engine::Resolver::resolve) returns
+/// `Err(_)` for a query that *did* decode successfully, and for the
+/// `FORMERR` and `BADVERS` answers [`answer`] gives without the resolver.
+fn local_response(query: &Message, rcode: Rcode) -> Message {
     let mut header = query.header;
     header.qr = true;
-    header.rcode = Rcode::ServFail;
+    header.rcode = rcode;
     Message {
         header,
         questions: query.questions.clone(),
@@ -1808,6 +1970,335 @@ mod tests {
         assert!(result.unwrap().is_ok());
     }
 
+    // --- EDNS(0): shared answer helper, FORMERR/BADVERS, UDP size limit ----
+
+    use dns_lattice_model::{Edns, EdnsOption};
+
+    /// The upstream OPT [`SizedBackend`] attaches to answers for EDNS
+    /// queries: a 4096-byte payload and a 16-byte COOKIE option (code 10).
+    fn sized_backend_edns() -> Edns {
+        let mut edns = Edns::new(4096);
+        edns.push_option(EdnsOption::new(10, vec![0xA5; 16]).unwrap());
+        edns
+    }
+
+    /// A fake backend answering a question whose first label is `r<count>`
+    /// with `count` A records, so one resolver can produce answers of
+    /// several sizes. An answer to a query carrying an OPT record carries
+    /// [`sized_backend_edns`], like a real EDNS upstream. Counts its calls.
+    ///
+    /// Wire sizes for a two-digit `rNN.example` question (names are encoded
+    /// uncompressed): header and question 29 bytes, each A record 27 bytes,
+    /// the upstream OPT 31 bytes and a bare OPT 11 bytes.
+    struct SizedBackend {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpstreamBackend for SizedBackend {
+        async fn resolve(&self, query: &Message) -> Result<Message> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let name = &query.questions[0].name;
+            let label = name.labels().next().expect("a non-root name");
+            let count: u8 = std::str::from_utf8(&label[1..]).unwrap().parse().unwrap();
+            let mut answer = query.clone();
+            answer.header.qr = true;
+            answer.additionals.clear();
+            for octet in 0..count {
+                answer.answers.push(ResourceRecord {
+                    name: name.clone(),
+                    rtype: RecordType::A,
+                    class: Class::In,
+                    ttl: 300,
+                    rdata: RData::A(std::net::Ipv4Addr::new(203, 0, 113, octet)),
+                });
+            }
+            if query.edns().unwrap().is_some() {
+                answer.set_edns(Some(sized_backend_edns()));
+            }
+            Ok(answer)
+        }
+    }
+
+    fn sized_resolver() -> (Arc<Resolver>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = resolver_with(SizedBackend {
+            calls: calls.clone(),
+        });
+        (resolver, calls)
+    }
+
+    /// A query for `name` carrying an OPT record advertising `payload`.
+    fn edns_query(name: &str, id: u16, payload: u16, dnssec_ok: bool) -> Message {
+        let mut query = query_for(name, id);
+        let mut edns = Edns::new(payload);
+        edns.set_dnssec_ok(dnssec_ok);
+        query.set_edns(Some(edns));
+        query
+    }
+
+    /// A running server on loopback UDP and TCP, stopped by
+    /// [`TestServer::stop`].
+    struct TestServer {
+        udp: SocketAddr,
+        tcp: SocketAddr,
+        shutdown: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl TestServer {
+        async fn start(builder: ServerBuilder) -> TestServer {
+            let server = builder
+                .udp_addr("127.0.0.1:0".parse().unwrap())
+                .tcp_addr("127.0.0.1:0".parse().unwrap())
+                .bind()
+                .await
+                .expect("binds udp and tcp");
+            let udp = server.udp_sockets[0].local_addr().unwrap();
+            let tcp = server.tcp_listeners[0].local_addr().unwrap();
+            let (shutdown, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            TestServer {
+                udp,
+                tcp,
+                shutdown,
+                task,
+            }
+        }
+
+        /// Sends `query` over UDP and returns the datagram length and the
+        /// decoded response.
+        async fn udp(&self, query: &Message) -> (usize, Message) {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client
+                .send_to(&query.encode().unwrap(), self.udp)
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 65535];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .expect("response arrives in time")
+                .unwrap();
+            (len, Message::decode(&buf[..len]).unwrap())
+        }
+
+        async fn stop(self) {
+            self.shutdown.send(()).unwrap();
+            self.task.await.unwrap().unwrap();
+        }
+    }
+
+    /// The number of OPT records in `message`'s additional section.
+    fn opt_count(message: &Message) -> usize {
+        message
+            .additionals
+            .iter()
+            .filter(|record| record.rtype == RecordType::Other(41))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn udp_edns_client_gets_a_full_answer_above_512_bytes_with_the_server_opt() {
+        let (resolver, _calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        // 29 + 40 × 27 + 31 = 1140 bytes.
+        let (len, response) = server.udp(&edns_query("r40.example", 1, 1232, false)).await;
+        assert!(len > 512 && len <= 1232, "{len} bytes");
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 40);
+        assert_eq!(opt_count(&response), 1);
+        let edns = response.edns().unwrap().unwrap();
+        assert_eq!(edns.udp_payload_size(), 1232, "the server's own maximum");
+        assert_eq!(edns.version(), 0);
+        assert_eq!(
+            edns.options(),
+            sized_backend_edns().options(),
+            "a fresh upstream OPT keeps its options"
+        );
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn udp_large_edns_payload_is_capped_at_the_server_maximum_and_tc_keeps_the_opt() {
+        let (resolver, _calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        let (len, response) = server.udp(&edns_query("r100.example", 2, 4096, true)).await;
+        assert!(len <= 1232, "{len} bytes");
+        assert!(response.header.truncated);
+        assert_eq!(response.header.id, 2);
+        assert!(response.answers.is_empty());
+        assert!(response.authorities.is_empty());
+        assert_eq!(response.additionals.len(), 1, "only the OPT is kept");
+        let edns = response.edns().unwrap().unwrap();
+        assert_eq!(edns.udp_payload_size(), 1232);
+        assert_eq!(
+            edns.options(),
+            sized_backend_edns().options(),
+            "the upstream OPT, with the server's payload size, is kept"
+        );
+
+        // The same answer over TCP is not truncated and carries the OPT.
+        let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+        let response = tcp_round_trip(&mut stream, &edns_query("r100.example", 3, 512, true)).await;
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 100);
+        assert_eq!(opt_count(&response), 1);
+        assert_eq!(response.edns().unwrap().unwrap().udp_payload_size(), 1232);
+        drop(stream);
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn udp_client_payload_is_the_limit_and_is_raised_to_512() {
+        let (resolver, _calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        // Client 600: a 573-byte answer (r19) fits, an 870-byte one (r30)
+        // does not.
+        let (len, response) = server.udp(&edns_query("r19.example", 1, 600, false)).await;
+        assert!(len > 512 && len <= 600, "{len} bytes");
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 19);
+        let (len, response) = server.udp(&edns_query("r30.example", 2, 600, false)).await;
+        assert!(len <= 600, "{len} bytes");
+        assert!(response.header.truncated);
+        assert_eq!(opt_count(&response), 1);
+
+        // Client 100 is treated as 512: a 465-byte answer (r15) fits, r19
+        // (553 bytes as a cache hit with a bare OPT) does not.
+        let (len, response) = server.udp(&edns_query("r15.example", 3, 100, false)).await;
+        assert!(len <= 512, "{len} bytes");
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 15);
+        let (len, response) = server.udp(&edns_query("r19.example", 4, 100, false)).await;
+        assert!(len <= 512, "{len} bytes");
+        assert!(response.header.truncated);
+        assert_eq!(opt_count(&response), 1);
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn udp_non_edns_client_stays_at_512_bytes_without_an_opt() {
+        let (resolver, _calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        // r15: 434 bytes; r19: 542 bytes.
+        let (_, response) = server.udp(&query_for("r15.example", 1)).await;
+        assert!(!response.header.truncated);
+        assert_eq!(response.answers.len(), 15);
+        assert_eq!(opt_count(&response), 0);
+        let (len, response) = server.udp(&query_for("r19.example", 2)).await;
+        assert!(len <= 512, "{len} bytes");
+        assert!(response.header.truncated);
+        assert!(response.answers.is_empty());
+        assert!(response.additionals.is_empty());
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn edns_udp_payload_size_sets_the_maximum_and_is_raised_to_512() {
+        let (resolver, _calls) = sized_resolver();
+        let server =
+            TestServer::start(ServerBuilder::new(resolver).edns_udp_payload_size(512)).await;
+        // r19: 573 bytes; r15: 465 bytes.
+        let (len, response) = server.udp(&edns_query("r19.example", 1, 4096, false)).await;
+        assert!(len <= 512, "{len} bytes");
+        assert!(response.header.truncated, "the 1.1 limit is restored");
+        assert_eq!(response.edns().unwrap().unwrap().udp_payload_size(), 512);
+        server.stop().await;
+
+        let (resolver, _calls) = sized_resolver();
+        let server =
+            TestServer::start(ServerBuilder::new(resolver).edns_udp_payload_size(100)).await;
+        let (_, response) = server.udp(&edns_query("r15.example", 2, 4096, false)).await;
+        assert!(!response.header.truncated, "100 is raised to 512");
+        assert_eq!(response.answers.len(), 15);
+        assert_eq!(response.edns().unwrap().unwrap().udp_payload_size(), 512);
+        let (len, response) = server.udp(&edns_query("r19.example", 3, 4096, false)).await;
+        assert!(len <= 512, "{len} bytes");
+        assert!(response.header.truncated);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn badvers_and_formerr_are_answered_without_calling_the_resolver() {
+        let (resolver, calls) = sized_resolver();
+        let server = TestServer::start(ServerBuilder::new(resolver)).await;
+
+        // Version 1: BADVERS = header RCODE 0 plus extended RCODE 1.
+        let mut query = query_for("r1.example", 1);
+        let mut edns = Edns::new(4096);
+        edns.set_version(1).set_dnssec_ok(true);
+        query.set_edns(Some(edns));
+        let (_, response) = server.udp(&query).await;
+        assert!(response.header.qr);
+        assert_eq!(response.header.id, 1);
+        assert_eq!(response.header.rcode, Rcode::NoError);
+        assert_eq!(response.questions, query.questions);
+        assert!(response.answers.is_empty());
+        let mut expected = Edns::new(1232);
+        expected.set_extended_rcode(1).set_dnssec_ok(true);
+        assert_eq!(response.edns().unwrap(), Some(expected));
+
+        // Two OPT records: FORMERR without an OPT, on UDP and TCP.
+        let mut query = edns_query("r1.example", 2, 1232, false);
+        let opt = query.additionals[0].clone();
+        query.additionals.push(opt);
+        let (_, response) = server.udp(&query).await;
+        assert_eq!(response.header.rcode, Rcode::FormErr);
+        assert_eq!(response.header.id, 2);
+        assert_eq!(response.questions, query.questions);
+        assert!(response.additionals.is_empty());
+        let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+        let response = tcp_round_trip(&mut stream, &query).await;
+        assert_eq!(response.header.rcode, Rcode::FormErr);
+        assert!(response.additionals.is_empty());
+        drop(stream);
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the resolver is never called"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn servfail_carries_an_opt_exactly_when_the_query_had_one() {
+        let server = TestServer::start(ServerBuilder::new(resolver_with(FailingBackend))).await;
+
+        let (_, response) = server.udp(&query_for("nope.example", 1)).await;
+        assert_eq!(response.header.rcode, Rcode::ServFail);
+        assert_eq!(opt_count(&response), 0);
+
+        let (_, response) = server.udp(&edns_query("nope.example", 2, 4096, true)).await;
+        assert_eq!(response.header.rcode, Rcode::ServFail);
+        let mut expected = Edns::new(1232);
+        expected.set_dnssec_ok(true);
+        assert_eq!(response.edns().unwrap(), Some(expected));
+
+        let mut stream = TcpStream::connect(server.tcp).await.unwrap();
+        let response =
+            tcp_round_trip(&mut stream, &edns_query("nope.example", 3, 1232, false)).await;
+        assert_eq!(response.header.rcode, Rcode::ServFail);
+        assert_eq!(opt_count(&response), 1);
+        drop(stream);
+
+        server.stop().await;
+    }
+
     #[cfg(feature = "dot")]
     mod dot_tests {
         use super::*;
@@ -2226,6 +2717,65 @@ mod tests {
             assert_eq!(response.header.id, 41);
             assert_eq!(response.header.rcode, Rcode::NoError);
             assert_eq!(response.answers.len(), 1);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doh_edns_query_gets_one_server_opt_and_a_plain_query_none() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 32),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doh_addr(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Arc::new(server_config),
+                    DohListenerConfig::default(),
+                )
+                .bind()
+                .await
+                .expect("binds doh");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doh_listeners[0].0.local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let mut edns = Edns::new(4096);
+            edns.set_dnssec_ok(true);
+            for (id, query_edns) in [(43u16, Some(edns)), (44u16, None)] {
+                let mut query = query_for("example.com", id);
+                query.set_edns(query_edns.clone());
+                let (status, body) = send_http_request(
+                    &connector,
+                    server_name.clone(),
+                    addr,
+                    "POST /dns-query HTTP/1.1",
+                    &[("content-type", "application/dns-message".to_string())],
+                    &query.encode().unwrap(),
+                )
+                .await;
+                assert_eq!(status, 200);
+                let response = Message::decode(&body).unwrap();
+                assert_eq!(response.header.id, id);
+                assert_eq!(response.answers.len(), 1);
+                let expected = query_edns.map(|_| {
+                    let mut expected = Edns::new(1232);
+                    expected.set_dnssec_ok(true);
+                    expected
+                });
+                assert_eq!(response.edns().unwrap(), expected);
+            }
 
             shutdown_tx.send(()).unwrap();
             serve_task.await.unwrap().unwrap();
@@ -2840,6 +3390,64 @@ mod tests {
             assert_eq!(response.header.id, 21);
             assert_eq!(response.header.rcode, Rcode::NoError);
             assert_eq!(response.answers.len(), 1);
+
+            shutdown_tx.send(()).unwrap();
+            serve_task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn doq_edns_query_gets_one_server_opt_and_badvers_is_local() {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let resolver = resolver_with(FixedBackend(answer_with_a(
+                "example.com",
+                0,
+                std::net::Ipv4Addr::new(203, 0, 113, 22),
+            )));
+            let server = ServerBuilder::new(resolver)
+                .doq_addr("127.0.0.1:0".parse().unwrap(), server_config)
+                .edns_udp_payload_size(4000)
+                .bind()
+                .await
+                .expect("binds doq");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let addr = server.doq_endpoints[0].local_addr().unwrap();
+            let serve_task = tokio::spawn(async move {
+                server
+                    .serve_until(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let client_endpoint = client_endpoint();
+            let mut query = query_for("example.com", 23);
+            query.set_edns(Some(Edns::new(1232)));
+            let response = doq_query(
+                &client_endpoint,
+                client_config.clone(),
+                server_name.clone(),
+                addr,
+                &query,
+            )
+            .await;
+            assert_eq!(response.answers.len(), 1);
+            assert_eq!(
+                response.edns().unwrap(),
+                Some(Edns::new(4000)),
+                "the configured server maximum is advertised"
+            );
+
+            let mut edns = Edns::new(1232);
+            edns.set_version(2);
+            query.set_edns(Some(edns));
+            let response =
+                doq_query(&client_endpoint, client_config, server_name, addr, &query).await;
+            assert_eq!(response.header.rcode, Rcode::NoError);
+            assert!(response.answers.is_empty());
+            let mut expected = Edns::new(4000);
+            expected.set_extended_rcode(1);
+            assert_eq!(response.edns().unwrap(), Some(expected));
 
             shutdown_tx.send(()).unwrap();
             serve_task.await.unwrap().unwrap();

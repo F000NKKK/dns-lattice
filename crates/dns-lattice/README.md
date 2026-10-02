@@ -122,7 +122,9 @@ upstreams when its policy selects the query.
 
 **Cache.** Answers are cached in memory by DNS TTL, with negative caching. Ordinary cache
 identity includes the effective upstream group, so equal questions routed to different groups never
-share an answer.
+share an answer, and the query's RD and EDNS DO bits. Answers are stored without their OPT
+record; an answer to an EDNS(0) query always carries one, and an answer to a plain query never
+does.
 
 **Route hook.** `ResolverBuilder::route_hook` takes one `RouteHook`, which receives the first
 question and the tentative static group and returns `RouteDecision::Use(group)` (a
@@ -170,7 +172,11 @@ caller's id).
 
 Names are given as backend type / `ServerBuilder` listener method. Every upstream query
 currently opens a fresh socket or connection. The host provides TLS/QUIC server configuration
-and certificate material for the listeners. Contract details:
+and certificate material for the listeners. The inbound UDP listener answers an EDNS(0) client
+with up to min(its advertised payload size, 1232 bytes) — `ServerBuilder::edns_udp_payload_size`
+changes the maximum, never below 512 — and a plain client with up to 512 bytes; larger answers
+are truncated (`TC=1`) for a TCP retry. Malformed OPT records get a local `FORMERR` and EDNS
+versions above 0 a local `BADVERS`. Contract details:
 [upstream](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#upstream-transport-contract)
 and [server](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#inbound-server-contract).
 

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{
-    Class, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy,
+    Class, Edns, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy,
     UpstreamGroupId,
 };
 
@@ -33,7 +33,7 @@ use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
     HookObserveDecision, ObservabilitySink, ObserveEvent, ObserveFailure, UpstreamObserveOutcome,
 };
-use crate::upstream::UpstreamBackend;
+use crate::upstream::{DEFAULT_EDNS_UDP_PAYLOAD_SIZE, UpstreamBackend};
 
 /// Fixed negative-cache TTL, in seconds, used when a negative response
 /// carries no SOA record in its authority section to derive one from. It is
@@ -123,8 +123,9 @@ impl Clock for FakeClock {
 /// Cache key: the fields that identify a question's matching intent,
 /// equivalent to a [`dns_lattice_model::Question`]'s name/type/class but
 /// independent of that struct's exact field set, plus the effective upstream
-/// group and the query's RD bit (an upstream may answer RD=0 and RD=1
-/// queries differently).
+/// group, the query's RD bit (an upstream may answer RD=0 and RD=1 queries
+/// differently), and the query's EDNS DO bit (a DO=0 client must not receive
+/// DNSSEC records cached for a DO=1 client, RFC 3225 §3).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     name: Name,
@@ -132,14 +133,16 @@ struct CacheKey {
     class: Class,
     group: UpstreamGroupId,
     recursion_desired: bool,
+    dnssec_ok: bool,
 }
 
 /// A normalised cached answer, shared through an [`Arc`] so a hit clones
 /// only the pointer while the cache lock is held.
 struct CachedAnswer {
-    /// The upstream answer with every non-OPT record TTL clamped into the
-    /// entry class's bounds (and, for a negative answer with an SOA, the
-    /// SOA TTL rewritten to the negative TTL).
+    /// The upstream answer with its EDNS OPT record removed (OPT is
+    /// per-transaction and never cached, RFC 6891 §6.1.1) and every record
+    /// TTL clamped into the entry class's bounds (and, for a negative answer
+    /// with an SOA, the SOA TTL rewritten to the negative TTL).
     message: Message,
     /// The instant captured before the upstream call; TTLs count down from
     /// here.
@@ -224,16 +227,18 @@ impl Resolver {
     /// opcode `QUERY`; any other query goes straight to the upstream group
     /// (reported as a cache miss) and its answer is not stored. The cache
     /// identity is the question's name (case-insensitively), type and class,
-    /// the effective upstream group, and the query's RD bit.
+    /// the effective upstream group, the query's RD bit, and the DO bit of
+    /// the query's EDNS OPT record (false without a well-formed OPT).
     ///
     /// An answer is stored only when its opcode is `QUERY`, `TC` is clear,
     /// it carries either no EDNS OPT record or a well-formed one whose
     /// extended RCODE is 0, and it is either positive (`NOERROR` with at least one answer record)
     /// or negative (`NXDOMAIN`, or `NOERROR` with an empty answer section).
     /// `SERVFAIL`, `REFUSED` and every other response code are returned but
-    /// never stored. Before storing, every record TTL except the EDNS OPT
-    /// pseudo-record's is clamped to at most 86 400 s for a positive answer
-    /// or 3 600 s for a negative one. The entry then lives for:
+    /// never stored. The stored copy never keeps the EDNS OPT record. Before
+    /// storing, every other record TTL is clamped to at most 86 400 s for a
+    /// positive answer or 3 600 s for a negative one. The entry then lives
+    /// for:
     ///
     /// - positive: the minimum record TTL over the answer, authority and
     ///   additional sections;
@@ -247,11 +252,28 @@ impl Resolver {
     /// upstream call.
     ///
     /// A hit returns the stored answer in its original record order with
-    /// every TTL except the OPT record's reduced by the whole seconds
-    /// elapsed since it was stored (never below 1 while it is fresh), the
-    /// current query's message id, question section and RD bit, and AA
-    /// cleared. The entry is a miss from the instant its lifetime ends and
-    /// is removed when such a lookup finds it.
+    /// every TTL reduced by the whole seconds elapsed since it was stored
+    /// (never below 1 while it is fresh), the current query's message id,
+    /// question section and RD bit, and AA cleared. The entry is a miss from
+    /// the instant its lifetime ends and is removed when such a lookup finds
+    /// it.
+    ///
+    /// # EDNS(0)
+    ///
+    /// Every `Ok` answer — Fake IP, cache hit, or fresh upstream — is aligned
+    /// with the query's EDNS OPT record (RFC 6891):
+    ///
+    /// - a query without an OPT record gets an answer without one, even when
+    ///   the upstream answer carried one;
+    /// - a query with a well-formed OPT record gets an answer with exactly one:
+    ///   a fresh upstream answer's own well-formed OPT is kept as is;
+    ///   otherwise (a cache hit, a Fake IP answer, or an upstream answer
+    ///   without a usable OPT) a fresh OPT advertising 1232 bytes, version 0,
+    ///   the query's DO bit and no options is attached;
+    /// - a query whose OPT record is malformed gets the answer unchanged.
+    ///
+    /// A cache hit therefore never replays an earlier transaction's OPT
+    /// record or its options.
     ///
     /// # Errors
     ///
@@ -288,7 +310,8 @@ impl Resolver {
         };
         if let Some(fake_ip) = &self.fake_ip {
             match fake_ip_answer(query, fake_ip) {
-                Ok(Some(answer)) => {
+                Ok(Some(mut answer)) => {
+                    align_edns(query, &mut answer);
                     self.emit(ObserveEvent::FakeIpTerminal { correlation_id });
                     self.emit(ObserveEvent::Completed {
                         correlation_id,
@@ -323,11 +346,13 @@ impl Resolver {
             class: question.qclass,
             group: group.clone(),
             recursion_desired: query.header.recursion_desired,
+            dnssec_ok: query_dnssec_ok(query),
         });
 
         let now = self.clock.now();
         if let Some(cached) = key.as_ref().and_then(|key| self.cache_lookup(key, now)) {
-            let answer = cache_hit_response(query, &cached, now);
+            let mut answer = cache_hit_response(query, &cached, now);
+            align_edns(query, &mut answer);
             self.emit(ObserveEvent::CacheHit {
                 correlation_id,
                 group: group.clone(),
@@ -351,7 +376,7 @@ impl Resolver {
                 backend_index,
             });
             match backend.resolve(query).await {
-                Ok(answer) => {
+                Ok(mut answer) => {
                     self.emit(ObserveEvent::UpstreamOutcome {
                         correlation_id,
                         group: group.clone(),
@@ -367,6 +392,7 @@ impl Resolver {
                             .expect("cache mutex poisoned")
                             .insert(key, entry);
                     }
+                    align_edns(query, &mut answer);
                     self.emit(ObserveEvent::Completed {
                         correlation_id,
                         rcode: answer.header.rcode,
@@ -484,6 +510,35 @@ impl Resolver {
 /// one question and opcode `QUERY`.
 fn query_uses_cache(query: &Message) -> bool {
     query.questions.len() == 1 && query.header.opcode == Opcode::Query
+}
+
+/// The query's EDNS DO bit for the cache identity: false when the query has
+/// no OPT record or a malformed one.
+fn query_dnssec_ok(query: &Message) -> bool {
+    matches!(query.edns(), Ok(Some(edns)) if edns.dnssec_ok())
+}
+
+/// Aligns `answer`'s EDNS(0) OPT record with `query`'s, so an answer never
+/// carries another transaction's OPT and an EDNS client always gets one:
+///
+/// - `query` has no OPT: every OPT is removed from `answer`;
+/// - `query` has a valid OPT and `answer` has none or a malformed one: a
+///   fresh OPT is attached advertising [`DEFAULT_EDNS_UDP_PAYLOAD_SIZE`],
+///   with version 0, the query's DO bit and no options;
+/// - both have a valid OPT (a fresh upstream answer): `answer` is kept;
+/// - `query`'s OPT is malformed: `answer` is left untouched.
+fn align_edns(query: &Message, answer: &mut Message) {
+    match query.edns() {
+        Ok(None) => answer.set_edns(None),
+        Ok(Some(query_edns)) => {
+            if !matches!(answer.edns(), Ok(Some(_))) {
+                let mut edns = Edns::new(DEFAULT_EDNS_UDP_PAYLOAD_SIZE);
+                edns.set_dnssec_ok(query_edns.dnssec_ok());
+                answer.set_edns(Some(edns));
+            }
+        }
+        Err(_) => {}
+    }
 }
 
 /// Whether `record` is an EDNS(0) OPT pseudo-record, whose `TTL` field is
@@ -715,7 +770,7 @@ fn observe_failure(error: &Error) -> ObserveFailure {
 /// stored), and either positive (`NoError` with at least one answer record)
 /// or negative (`NxDomain`, or `NoError` with an empty answer section).
 ///
-/// Every non-OPT record TTL is clamped into [`POSITIVE_TTL`] or
+/// The stored copy has its OPT record removed. Every remaining record TTL is clamped into [`POSITIVE_TTL`] or
 /// [`NEGATIVE_TTL`]. The entry TTL is the minimum non-OPT record TTL over
 /// all sections. For a negative answer it is further limited to the
 /// negative TTL: min(SOA TTL, SOA `MINIMUM`) (RFC 2308 §5) clamped into
@@ -740,6 +795,9 @@ fn cacheable_answer(answer: &Message, inserted: Instant) -> Option<CachedAnswer>
     let bounds = if negative { NEGATIVE_TTL } else { POSITIVE_TTL };
 
     let mut message = answer.clone();
+    // OPT is per-transaction (payload size, DO, options such as COOKIE) and
+    // must never be cached (RFC 6891 §6.1.1); a hit gets a fresh one.
+    message.set_edns(None);
     for record in ttl_records_mut(&mut message) {
         record.ttl = bounds.clamp(record.ttl);
     }
@@ -2696,34 +2754,49 @@ mod tests {
         assert_eq!(refreshed.answers[0].ttl, 300);
     }
 
+    /// Whether no cache entry keeps an OPT record.
+    fn cache_holds_no_opt(resolver: &Resolver) -> bool {
+        resolver
+            .cache
+            .lock()
+            .unwrap()
+            .values()
+            .all(|entry| entry.message.edns() == Ok(None))
+    }
+
     #[tokio::test]
-    async fn opt_record_is_never_clamped_counted_down_or_used_as_a_lifetime() {
+    async fn opt_record_is_never_stored_counted_down_or_used_as_a_lifetime() {
         // OPT TTL field 0: counting it would make the entry TTL 0.
         let mut plain = a_answer("example.com", 300);
-        plain.set_edns(Some(Edns::new(1232)));
+        plain.set_edns(Some(Edns::new(4096)));
         let (resolver, calls, clock) = cache_resolver(plain);
-        resolver.resolve(&query_for("example.com")).await.unwrap();
+        let query = edns_query_for("example.com", 4096, false);
+        let first = resolver.resolve(&query).await.unwrap();
+        assert_eq!(
+            first.edns().unwrap(),
+            Some(Edns::new(4096)),
+            "a fresh answer keeps its own OPT"
+        );
+        assert!(cache_holds_no_opt(&resolver), "the stored copy has no OPT");
         clock.advance(Duration::from_secs(100));
-        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        let hit = resolver.resolve(&query).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "OPT TTL 0 does not block");
         assert_eq!(hit.answers[0].ttl, 200);
-        assert_eq!(hit.additionals[0].ttl, 0);
-        assert_eq!(hit.edns().unwrap(), Some(Edns::new(1232)));
+        assert_eq!(hit.edns().unwrap(), Some(Edns::new(1232)), "a fresh OPT");
 
         // OPT TTL field 98 304 (version 1, DO): above the positive clamp and
-        // above the answer TTL, so clamping or counting would both show.
+        // above the answer TTL, so using it as a lifetime would show.
         let mut edns = Edns::new(1232);
         edns.set_version(1).set_dnssec_ok(true);
         let mut flagged = a_answer("example.com", 300);
-        flagged.set_edns(Some(edns.clone()));
-        let opt_ttl = flagged.additionals[0].ttl;
-        assert!(opt_ttl > POSITIVE_TTL.max);
+        flagged.set_edns(Some(edns));
+        assert!(flagged.additionals[0].ttl > POSITIVE_TTL.max);
         let (resolver, calls, clock) = cache_resolver(flagged);
         resolver.resolve(&query_for("example.com")).await.unwrap();
         clock.advance(Duration::from_secs(299));
         let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
-        assert_eq!(hit.additionals[0].ttl, opt_ttl);
-        assert_eq!(hit.edns().unwrap(), Some(edns));
+        assert_eq!(hit.answers[0].ttl, 1);
+        assert_eq!(hit.edns().unwrap(), None);
         clock.advance(Duration::from_secs(1));
         resolver.resolve(&query_for("example.com")).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "lifetime is the A TTL");
@@ -2921,7 +2994,10 @@ mod tests {
         for (label, answer) in cases {
             let (resolver, calls, _clock) = cache_resolver(answer.clone());
             let first = resolver.resolve(&query_for("example.com")).await.unwrap();
-            assert_eq!(first, answer, "{label}: the answer is returned as-is");
+            // The query carries no OPT, so the returned answer carries none.
+            let mut expected = answer.clone();
+            expected.set_edns(None);
+            assert_eq!(first, expected, "{label}: the answer is returned as-is");
             resolver.resolve(&query_for("example.com")).await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 2, "{label}: not cached");
             assert!(resolver.cache.lock().unwrap().is_empty(), "{label}");
@@ -3055,10 +3131,18 @@ mod tests {
 
     /// Resolves `answer`'s question twice, 7 s apart, and checks that the
     /// hit equals the upstream answer field for field and byte for byte
-    /// except for the id and the counted-down TTLs.
+    /// except for the id and the counted-down TTLs. When `answer` carries an
+    /// OPT record it must be `Edns::new(1232)` with any DO bit; the query
+    /// then carries an OPT with the same DO bit, so the fresh OPT attached
+    /// to the hit equals it.
     async fn assert_cache_hit_is_golden(answer: Message) -> Message {
         let mut query = query_for("unused.example");
         query.questions = answer.questions.clone();
+        if let Some(answer_edns) = answer.edns().unwrap() {
+            let mut edns = Edns::new(4096);
+            edns.set_dnssec_ok(answer_edns.dnssec_ok());
+            query.set_edns(Some(edns));
+        }
         let (resolver, calls, clock) = cache_resolver(answer.clone());
         let first = resolver.resolve(&query).await.unwrap();
         assert_eq!(first, answer);
@@ -3213,6 +3297,188 @@ mod tests {
             .map(|octet| a_record("example.com", 120, octet))
             .collect();
         assert_cache_hit_is_golden(a_rrset).await;
+    }
+
+    // --- EDNS(0): DO in the cache key, OPT never cached, alignment on every
+    // `Ok` path ---------------------------------------------------------------
+
+    use dns_lattice_model::EdnsOption;
+
+    /// An A query for `name` carrying an OPT record advertising `payload`
+    /// bytes with the given DO bit.
+    fn edns_query_for(name: &str, payload: u16, dnssec_ok: bool) -> Message {
+        let mut query = query_for(name);
+        let mut edns = Edns::new(payload);
+        edns.set_dnssec_ok(dnssec_ok);
+        query.set_edns(Some(edns));
+        query
+    }
+
+    /// An upstream OPT with a 4096-byte payload, the given DO bit and a
+    /// per-transaction COOKIE option (code 10).
+    fn upstream_edns(dnssec_ok: bool) -> Edns {
+        let mut edns = Edns::new(4096);
+        edns.set_dnssec_ok(dnssec_ok)
+            .push_option(EdnsOption::new(10, vec![0xA5; 16]).unwrap());
+        edns
+    }
+
+    #[tokio::test]
+    async fn cache_hit_for_an_edns_query_gets_a_fresh_opt_with_the_do_bit_echoed() {
+        let mut answer = a_answer("example.com", 300);
+        answer.set_edns(Some(upstream_edns(true)));
+        let (resolver, calls, clock) = cache_resolver(answer);
+        let query = edns_query_for("example.com", 4096, true);
+
+        let first = resolver.resolve(&query).await.unwrap();
+        assert_eq!(
+            first.edns().unwrap(),
+            Some(upstream_edns(true)),
+            "the fresh answer keeps the upstream OPT"
+        );
+        assert!(cache_holds_no_opt(&resolver));
+
+        clock.advance(Duration::from_secs(5));
+        let hit = resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "served from the cache");
+        let mut expected = Edns::new(1232);
+        expected.set_dnssec_ok(true);
+        assert_eq!(hit.edns().unwrap(), Some(expected), "no upstream cookie");
+        assert_eq!(
+            hit.additionals
+                .iter()
+                .filter(|record| is_opt(record))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn non_edns_hit_on_an_entry_stored_from_an_edns_query_has_no_opt() {
+        let mut answer = a_answer("example.com", 300);
+        answer.set_edns(Some(upstream_edns(false)));
+        let (resolver, calls, _clock) = cache_resolver(answer);
+
+        resolver
+            .resolve(&edns_query_for("example.com", 1232, false))
+            .await
+            .unwrap();
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "DO=0 shares the entry");
+        assert_eq!(hit.edns().unwrap(), None);
+        assert!(hit.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_bit_splits_the_cache() {
+        let (resolver, calls, _clock) = cache_resolver(a_answer("example.com", 300));
+        let do_clear = edns_query_for("example.com", 1232, false);
+        let do_set = edns_query_for("example.com", 1232, true);
+
+        resolver.resolve(&do_clear).await.unwrap();
+        resolver.resolve(&do_set).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "DO=0 and DO=1 are apart");
+        let hit_clear = resolver.resolve(&do_clear).await.unwrap();
+        let hit_set = resolver.resolve(&do_set).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both are cached");
+        assert!(!hit_clear.edns().unwrap().unwrap().dnssec_ok());
+        assert!(hit_set.edns().unwrap().unwrap().dnssec_ok());
+        assert_eq!(resolver.cache.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn extended_rcode_answer_to_an_edns_query_keeps_its_opt_and_is_not_cached() {
+        let mut edns = Edns::new(4096);
+        edns.set_extended_rcode(1);
+        let mut answer = query_for_response("example.com");
+        answer.set_edns(Some(edns.clone()));
+        let (resolver, calls, _clock) = cache_resolver(answer);
+        let query = edns_query_for("example.com", 1232, false);
+
+        let first = resolver.resolve(&query).await.unwrap();
+        assert_eq!(first.edns().unwrap(), Some(edns));
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(resolver.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_answer_opt_is_removed_for_a_non_edns_query_and_replaced_when_malformed() {
+        let mut answer = a_answer("example.com", 300);
+        answer.set_edns(Some(upstream_edns(true)));
+        let (resolver, _calls, _clock) = cache_resolver(answer);
+        let fresh = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(fresh.edns().unwrap(), None, "a stray OPT is removed");
+        assert!(fresh.additionals.is_empty());
+
+        // A malformed upstream OPT (two OPT records) is replaced by a fresh
+        // one for an EDNS query.
+        let mut answer = a_answer("example.com", 300);
+        answer.set_edns(Some(upstream_edns(false)));
+        let opt = answer.additionals[0].clone();
+        answer.additionals.push(opt);
+        assert!(answer.edns().is_err());
+        let (resolver, _calls, _clock) = cache_resolver(answer);
+        let fresh = resolver
+            .resolve(&edns_query_for("example.com", 1232, true))
+            .await
+            .unwrap();
+        let mut expected = Edns::new(1232);
+        expected.set_dnssec_ok(true);
+        assert_eq!(fresh.edns().unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn malformed_query_opt_leaves_the_answer_untouched() {
+        let mut answer = a_answer("example.com", 300);
+        answer.set_edns(Some(upstream_edns(true)));
+        let (resolver, _calls, _clock) = cache_resolver(answer.clone());
+        let mut query = edns_query_for("example.com", 1232, true);
+        let opt = query.additionals[0].clone();
+        query.additionals.push(opt);
+        assert!(query.edns().is_err());
+
+        let fresh = resolver.resolve(&query).await.unwrap();
+        assert_eq!(fresh, answer, "passed through as in 1.1");
+    }
+
+    #[tokio::test]
+    async fn fake_ip_answer_has_an_opt_exactly_when_the_query_has_one() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .backend(
+            UpstreamGroupId::new("g"),
+            CountingBackend {
+                answer: a_answer("example.test", 300),
+                calls: calls.clone(),
+            },
+        )
+        .fake_ip(
+            fake_ip_pool(PoolClock::new()),
+            fake_ip_policy("example.test"),
+        )
+        .build();
+
+        let plain = resolver
+            .resolve(&query_for("www.example.test"))
+            .await
+            .unwrap();
+        assert_eq!(plain.answers.len(), 1);
+        assert_eq!(plain.edns().unwrap(), None);
+
+        let with_opt = resolver
+            .resolve(&edns_query_for("www.example.test", 4096, true))
+            .await
+            .unwrap();
+        assert_eq!(with_opt.answers.len(), 1);
+        let mut expected = Edns::new(1232);
+        expected.set_dnssec_ok(true);
+        assert_eq!(with_opt.edns().unwrap(), Some(expected));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "answered locally");
     }
 
     #[test]

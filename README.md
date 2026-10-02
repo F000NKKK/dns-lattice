@@ -148,6 +148,10 @@ Current limits, stated plainly:
   unchanged, so a query without one gets UDP answers of at most 512 bytes
   (larger ones fall back to TCP), while a query that carries one can get
   answers up to the size it advertises;
+- the inbound server answers UDP EDNS(0) clients with at most
+  min(client payload size, 1232 bytes) (`ServerBuilder::edns_udp_payload_size`
+  changes the 1232) and non-EDNS clients with at most 512 bytes; larger
+  answers are sent empty with `TC=1`, so clients retry over TCP;
 - the answer cache has no size limit and no background sweep: an expired
   entry stays in memory until the same question is answered again.
 
@@ -476,7 +480,7 @@ The resolver has an in-memory TTL-respecting answer cache, including negative
 caching. Ordinary cache identity includes the **effective upstream group**.
 That matters when a route hook sends equal DNS questions to different routes:
 an answer obtained from one group cannot be reused for another group. The
-query's RD bit is part of the identity too.
+query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
 
 - **What is cached**: `NOERROR` answers with records, `NXDOMAIN`, and
   `NODATA`, only with opcode QUERY, `TC=0`, and an EDNS extended RCODE of 0.
@@ -488,9 +492,12 @@ query's RD bit is part of the identity too.
   sections; a negative one for min(SOA TTL, SOA `MINIMUM`) (RFC 2308), or
   60 s without an SOA.
 - **Hits**: TTLs count down by the whole seconds since the answer was
-  stored; the EDNS OPT record is never touched. A hit carries the current
-  query's id, question, and RD bit, sets AA=0, and keeps every record in its
-  original order.
+  stored. A hit carries the current query's id, question, and RD bit, sets
+  AA=0, and keeps every record in its original order.
+- **EDNS(0)**: the OPT record is removed before an answer is stored, so a
+  hit never replays another client's OPT record. A hit for a query with an
+  OPT record gets a fresh one (1232 bytes, version 0, the query's DO bit,
+  no options); a hit for a query without one gets none.
 
 Fake IP terminal answers bypass the ordinary answer cache; their lifetime is
 owned by the Fake IP mapping.
@@ -656,7 +663,7 @@ docs.rs page (version 0.26.3).
 | **DNSSEC validation** | ❌ | ✅ `dnssec-*` features |
 | **System resolver config** (`/etc/resolv.conf`, Windows) | ❌ By design; the host configures everything | ✅ `system-config` (default) |
 | **Upstream connection reuse** | ❌ New connection per query | ✅ Name-server pool |
-| **EDNS0 on UDP** | ➖ The client's OPT record is forwarded; none is added, and the inbound listener answers with at most 512 bytes | Not compared |
+| **EDNS0 on UDP** | ➖ The inbound server answers EDNS clients with up to 1232 bytes (configurable), with `FORMERR`/`BADVERS` handled locally; `UdpBackend` forwards the client's OPT record and adds none | Not compared |
 | **Throughput and latency** | Not yet benchmarked | Not yet benchmarked |
 
 ## 🛠️ API Overview
@@ -733,10 +740,13 @@ the port.
 <details>
 <summary><b>Large answers are empty with the <code>TC</code> bit set</b></summary>
 
-The inbound UDP listener does not read EDNS0 yet, so it answers with at most
-512 bytes. For a larger answer it sends an empty, truncated response and the
-client is expected to retry over TCP; also listen on TCP (`tcp_addr`) at the
-same address. `UdpBackend` performs that TCP retry itself.
+The inbound UDP listener answers a client without an EDNS0 OPT record with at
+most 512 bytes, and an EDNS0 client with at most the smaller of its advertised
+payload size and the server maximum (1232 bytes by default,
+`ServerBuilder::edns_udp_payload_size`). For a larger answer it sends an empty,
+truncated response (keeping the OPT record for an EDNS0 client) and the client
+is expected to retry over TCP; also listen on TCP (`tcp_addr`) at the same
+address. `UdpBackend` performs that TCP retry itself.
 </details>
 
 <details>

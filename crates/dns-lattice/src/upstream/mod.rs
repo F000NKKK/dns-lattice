@@ -98,14 +98,25 @@ pub(crate) use doq::QuicStream;
 pub use doq::{DoqBackend, DoqBackendConfig};
 
 /// RFC 1035 §4.2.1's 512-byte standard UDP message size: the largest
-/// response `crate::server`'s UDP listener sends before it truncates the
-/// answer and sets `TC=1`, since it negotiates no larger EDNS0 payload size.
+/// response `crate::server`'s UDP listener sends to a client whose query
+/// carries no EDNS(0) OPT record before it truncates the answer and sets
+/// `TC=1`. It is also the floor of the UDP limit for EDNS clients: RFC 6891
+/// §6.2.5 treats an advertised payload size below 512 as 512.
 ///
 /// This is not the [`UdpBackend`] receive limit. The backend forwards a
 /// query unchanged, including any EDNS0 OPT record the original client
 /// added, so the upstream may legitimately answer with more than 512 bytes;
 /// see [`UDP_RECV_BUFFER_LEN`].
 pub(crate) const UDP_MAX_RESPONSE_LEN: usize = 512;
+
+/// The default EDNS(0) UDP payload size, 1232 bytes (the DNS Flag Day 2020
+/// value, which avoids IP fragmentation on IPv6 paths with a 1280-byte MTU).
+///
+/// `crate::server` uses it as the default largest UDP response to an EDNS
+/// client and as the payload size its response OPT records advertise;
+/// `crate::engine` uses it for the OPT record it attaches when it answers an
+/// EDNS query without one (a cache hit or a Fake IP answer).
+pub(crate) const DEFAULT_EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
 
 /// Size of the [`UdpBackend`] receive buffer: the largest DNS message a UDP
 /// datagram can carry (the 16-bit UDP length bounds the payload, and a DNS
