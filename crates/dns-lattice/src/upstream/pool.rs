@@ -2335,6 +2335,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn orphan_if_leaves_a_slot_that_the_caller_does_not_own() {
+        let mut t = table(8, 10);
+        let now = Instant::now();
+        let id = t.register("current", now).unwrap();
+        // A guard from an earlier query that had the same id.
+        assert_eq!(t.orphan_if(id, now, |v| *v == "earlier"), None);
+        assert_eq!(t.pending_len(), 1, "the current query stays pending");
+        assert_eq!(t.orphan_if(id, now, |v| *v == "current"), Some("current"));
+        assert_eq!(t.pending_len(), 0);
+        assert_eq!(t.take(id), Taken::Orphaned);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn take_distinguishes_pending_orphaned_and_unknown() {
         let mut t = table(8, 10);
         let now = Instant::now();

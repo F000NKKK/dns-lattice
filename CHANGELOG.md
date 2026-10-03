@@ -138,8 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Error::Transport`. A connection that receives more than 16 unsolicited
     frames in a row, not counting frames answering queries that were
     cancelled or timed out, is closed;
-  - a reply that cannot be decoded closes the connection and fails the
-    queries pending on it;
+  - a reply that cannot be decoded closes the connection: the query it
+    answered fails with the decode error, and the other queries pending on
+    the connection fail with a transport error (and are retried like any
+    query on a closed connection);
   - the time budget of one call is not longer than before: connect timeout
     plus two read timeouts for TCP, plus three for DoT.
   `UdpBackend` is unchanged, and its fallback to TCP after a truncated answer

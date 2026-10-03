@@ -326,11 +326,9 @@ impl StreamConn {
 /// Tells one frame what to do. Returns `false` when the connection ended.
 fn dispatch(shared: &ConnShared, hooks: &PoolHooks, frame: &[u8]) -> bool {
     let Some(id_bytes) = frame.first_chunk::<2>() else {
-        // Too short to carry an id: not a DNS message at all.
-        let err = Message::decode(frame)
-            .err()
-            .unwrap_or(Error::Truncated { len: frame.len() });
-        shared.fail(&Failure::terminal(err));
+        // Too short to carry an id: not a DNS message at all, and no query
+        // is the offender.
+        shared.fail(&Failure::closed("upstream sent an undecodable response"));
         return false;
     };
     let id = u16::from_be_bytes(*id_bytes);
@@ -362,10 +360,13 @@ fn dispatch(shared: &ConnShared, hooks: &PoolHooks, frame: &[u8]) -> bool {
                 true
             }
             Err(err) => {
-                // The peer sends garbage: do not trust the rest of the stream.
-                let failure = Failure::terminal(err);
-                let _ = waiter.tx.send(Err(failure.clone()));
-                shared.fail(&failure);
+                // The peer sends garbage: do not trust the rest of the
+                // stream. Only the query this frame answered receives the
+                // decode error; the other queries on the connection were
+                // healthy and see a lost connection, which the retry rule
+                // and failover treat as retryable.
+                let _ = waiter.tx.send(Err(Failure::terminal(err)));
+                shared.fail(&Failure::closed("upstream sent an undecodable response"));
                 false
             }
         },
@@ -1141,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_undecodable_answer_fails_the_waiters_with_the_decode_error_and_closes() {
+    async fn an_undecodable_answer_fails_only_its_query_with_the_decode_error_and_closes() {
         // The server echoes the wire id it received, with a body too short
         // to be a DNS message (a 5-byte frame).
         let garbage = script(|_, mut s| async move {
@@ -1161,7 +1162,138 @@ mod tests {
         assert_eq!(h.stats().connections_open(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_bystander_of_an_undecodable_answer_is_retried_on_a_new_connection() {
+        // Connection 0 answers one query, then reads two more and answers the
+        // first of them with garbage. Later connections answer normally.
+        let garbage = script(|_, mut s| async move {
+            if let Some(q) = read_query(&mut s).await {
+                write_message(&mut s, &answer_to(&q)).await;
+            }
+            let (Some(x), Some(_y)) = (read_query(&mut s).await, read_query(&mut s).await) else {
+                return;
+            };
+            let id = x.header.id.to_be_bytes();
+            let _ = s.write_all(&[0, 5, id[0], id[1], 0, 0, 0]).await;
+            while read_query(&mut s).await.is_some() {}
+        });
+        let good = echo();
+        let h = harness(
+            PoolConfig::new().max_connections(1),
+            script(move |i, s| if i == 0 { garbage(i, s) } else { good(i, s) }),
+        );
+        h.ask("warm.example").await.unwrap();
+        let x = tokio::spawn({
+            let pool = Arc::clone(&h.pool);
+            async move { pool.query(&query_for("x.example")).await }
+        });
+        // Let the first spawned query register before the second.
+        settle().await;
+        let y = tokio::spawn({
+            let pool = Arc::clone(&h.pool);
+            async move { pool.query(&query_for("y.example")).await }
+        });
+        let x = x.await.unwrap().unwrap_err();
+        assert!(
+            matches!(x, Error::Truncated { .. } | Error::CountMismatch),
+            "the offender gets the decode error: {x:?}"
+        );
+        let y = y
+            .await
+            .unwrap()
+            .expect("the bystander is retried and answered");
+        assert_eq!(y.questions, query_for("y.example").questions);
+        let stats = h.stats();
+        assert_eq!(stats.retries(), 1, "only the bystander is retried");
+        assert_eq!(stats.connections_opened(), 2);
+        assert_eq!(stats.closed_error(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_too_short_for_an_id_gives_every_query_a_connection_error() {
+        let tiny = script(|_, mut s| async move {
+            let _ = read_query(&mut s).await;
+            let _ = s.write_all(&[0, 1, 7]).await;
+            while read_query(&mut s).await.is_some() {}
+        });
+        let h = harness(PoolConfig::new(), tiny);
+        let err = h.ask("a.example").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        assert_eq!(h.stats().connections_open(), 0);
+    }
+
     // ---- unsolicited frames -----------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn orphaned_queries_buy_credit_for_late_answers_that_were_evicted() {
+        // 20 queries are cancelled, their tombstones expire, and only then
+        // does the server answer all of them: 20 unknown frames, more than
+        // the base allowance of 16, with no answer to a pending query in
+        // between. Each orphaning added one credit, so the connection lives.
+        let late = script(|_, mut s| async move {
+            let mut queries = Vec::new();
+            for _ in 0..20 {
+                match read_query(&mut s).await {
+                    Some(q) => queries.push(q),
+                    None => return,
+                }
+            }
+            sleep(Duration::from_secs(4)).await;
+            for q in &queries {
+                write_message(&mut s, &answer_to(q)).await;
+            }
+            while let Some(q) = read_query(&mut s).await {
+                write_message(&mut s, &answer_to(&q)).await;
+            }
+        });
+        let h = harness(PoolConfig::new().max_connections(1), late);
+        let cancelled: Vec<_> = (0..20)
+            .map(|i| {
+                let pool = Arc::clone(&h.pool);
+                tokio::spawn(tokio::time::timeout(
+                    Duration::from_millis(100),
+                    async move { pool.query(&query_for(&format!("o{i}.example"))).await },
+                ))
+            })
+            .collect();
+        for handle in cancelled {
+            assert!(handle.await.unwrap().is_err(), "dropped mid-flight");
+        }
+        advance(Duration::from_secs(3)).await; // past the tombstone lifetime
+        let live = h
+            .ask("live.example")
+            .await
+            .expect("the connection survives");
+        assert_eq!(live.questions, query_for("live.example").questions);
+        let stats = h.stats();
+        assert_eq!(stats.unsolicited(), 20);
+        assert_eq!(stats.connections_opened(), 1);
+        assert_eq!(stats.closed_error(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_never_lands_on_another_stale_connection() {
+        // Every connection answers one query and hangs up on the second.
+        // Connection 2 and later answer normally.
+        let once = close_on_query(1);
+        let good = echo();
+        let h = harness(
+            PoolConfig::new().max_connections(2).max_in_flight(1),
+            script(move |i, s| if i < 2 { once(i, s) } else { good(i, s) }),
+        );
+        // Two concurrent queries open two connections, each answers once.
+        let (a, b) = tokio::join!(h.ask("a.example"), h.ask("b.example"));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(h.stats().connections_opened(), 2);
+        // The next query hits a connection that closes; the retry must go to
+        // a new connection rather than the other (equally stale) one.
+        let answer = h.ask("c.example").await.expect("the retry succeeds");
+        assert_eq!(answer.questions, query_for("c.example").questions);
+        let stats = h.stats();
+        assert_eq!(stats.retries(), 1);
+        assert_eq!(stats.connections_opened(), 3);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn more_than_sixteen_unsolicited_frames_in_a_row_close_the_connection() {
