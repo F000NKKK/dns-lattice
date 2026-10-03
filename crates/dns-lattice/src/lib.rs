@@ -142,7 +142,8 @@
 //! # Facade design
 //!
 //! The canonical imports are domain-scoped: [`model`] for message, matcher,
-//! and policy types; [`engine`] for query orchestration; [`upstream`] for
+//! and policy types; [`engine`] for query orchestration; [`cache`] for the
+//! bounded answer-cache configuration; [`upstream`] for
 //! outbound transports; [`server`] for inbound listeners; and [`fakeip`] for
 //! synthetic-address pools, policies, and snapshots. `Error` and `Result` are
 //! shared across those domains. [`engine::ResolverBuilder::fake_ip`] explicitly
@@ -284,6 +285,7 @@
 
 #![warn(missing_docs)]
 
+pub mod cache;
 pub mod engine;
 pub mod fakeip;
 /// Shared error and result types.
@@ -318,10 +320,14 @@ pub mod upstream;
 
 #[cfg(test)]
 mod facade_path_tests {
-    use super::{core, engine, fakeip, hooks, model, server, upstream};
+    use super::{cache, core, engine, fakeip, hooks, model, server, upstream};
 
     #[test]
     fn canonical_module_paths_expose_the_public_surface() {
+        let _: fn() -> cache::CacheConfig = cache::CacheConfig::new;
+        let _: fn() -> cache::CacheConfig = cache::CacheConfig::disabled;
+        let _: fn(engine::ResolverBuilder, cache::CacheConfig) -> engine::ResolverBuilder =
+            engine::ResolverBuilder::cache;
         let _: model::Name = model::Name::root();
         let _: Option<model::DomainMatcher<()>> = Some(model::DomainMatcher::new());
         let _: fn(model::Name) -> model::DomainPattern = model::DomainPattern::suffix;

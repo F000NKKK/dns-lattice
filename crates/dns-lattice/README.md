@@ -26,8 +26,8 @@
 ## 📖 Overview
 
 The application-facing crate of [DNS Lattice](https://github.com/F000NKKK/dns-lattice): an
-embeddable DNS resolver and server engine with split DNS, a TTL-aware cache scoped by upstream
-group, Fake IP, dynamic route selection, structured observability, and UDP/TCP/DoT/DoH/DoQ
+embeddable DNS resolver and server engine with split DNS, a TTL-aware, byte-bounded cache scoped by
+upstream group, Fake IP, dynamic route selection, structured observability, and UDP/TCP/DoT/DoH/DoQ
 transports in both directions. It is for Rust applications that need custom DNS behavior: the
 host application owns the process and configuration, while this crate owns DNS protocol
 handling, resolution, serving, routing, cache behavior, and transport execution. It is a
@@ -39,6 +39,8 @@ modules; flat root aliases are intentionally not exposed:
 - `core`: shared `Error` / `Result`;
 - `model`: DNS messages, records, names, domain matcher, split-DNS policy, upstream-group IDs;
 - `engine`: `Resolver` / `ResolverBuilder` (routing, cache, ordered failover);
+- `cache`: `CacheConfig` for the answer cache (memory bound, shard count, TTL limits), passed
+  to `ResolverBuilder::cache`;
 - `upstream`: the `UpstreamBackend` trait (implement it for your own transport) and the
   built-in UDP, TCP, DoT, DoH, DoH3, and DoQ backends;
 - `server`: `Server` / `ServerBuilder`, inbound listeners on the same transports over a shared
@@ -124,7 +126,12 @@ upstreams when its policy selects the query.
 identity includes the effective upstream group and the query's RD and EDNS DO bits, so equal
 questions routed to different groups never share an answer. Answers are stored without their OPT
 record; an answer to an EDNS(0) query always carries one, and an answer to a plain query never
-does.
+does. The cache is sharded and bounded to about 16 MiB by default (an estimate of heap use),
+enforced on every insert by evicting expired entries first and then entries that were never
+reused, so a flood of one-off names cannot grow it or push out the popular names. Use
+`ResolverBuilder::cache(CacheConfig::new().max_bytes(..))` to change the bound, the shard count,
+or the TTL limits (positive 0 s to 86 400 s, negative 0 s to 3 600 s by default), or
+`CacheConfig::disabled()` to keep nothing.
 
 **Route hook.** `ResolverBuilder::route_hook` takes one `RouteHook`, which receives the first
 question and the tentative static group and returns `RouteDecision::Use(group)` (a

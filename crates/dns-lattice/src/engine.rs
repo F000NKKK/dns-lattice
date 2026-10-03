@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
@@ -28,6 +28,9 @@ use dns_lattice_model::{
     UpstreamGroupId,
 };
 
+use crate::cache::CacheConfig;
+use crate::cache::TtlPolicy;
+use crate::cache::store::{CachedAnswer, KeyBuf, Store};
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
@@ -35,39 +38,10 @@ use crate::observability::{
 };
 use crate::upstream::{DEFAULT_EDNS_UDP_PAYLOAD_SIZE, UpstreamBackend};
 
-/// Fixed negative-cache TTL, in seconds, used when a negative response
-/// carries no SOA record in its authority section to derive one from. It is
-/// capped by [`NEGATIVE_TTL`]'s maximum and is not user-configurable.
-const NEGATIVE_TTL_WITHOUT_SOA: u32 = 60;
-
 /// The `TYPE` value of the EDNS(0) OPT pseudo-record (RFC 6891). Its `TTL`
 /// field holds the extended RCODE, version and flags, so it is never
 /// clamped, counted down, or used to compute a cache lifetime.
 const OPT_RTYPE: u16 = 41;
-
-/// Inclusive bounds, in seconds, that every stored record TTL of one cache
-/// entry class (positive or negative) is clamped into.
-#[derive(Clone, Copy)]
-struct TtlBounds {
-    min: u32,
-    max: u32,
-}
-
-impl TtlBounds {
-    fn clamp(self, ttl: u32) -> u32 {
-        ttl.clamp(self.min, self.max)
-    }
-}
-
-/// Record TTL bounds for positive answers: at most one day.
-const POSITIVE_TTL: TtlBounds = TtlBounds {
-    min: 0,
-    max: 86_400,
-};
-
-/// Record TTL bounds for negative answers (NXDOMAIN and NODATA): at most one
-/// hour, following RFC 2308 §5's guidance.
-const NEGATIVE_TTL: TtlBounds = TtlBounds { min: 0, max: 3_600 };
 
 /// A source of the current time, abstracted so tests can advance it
 /// deterministically instead of relying on real `sleep`.
@@ -120,37 +94,6 @@ impl Clock for FakeClock {
     }
 }
 
-/// Cache key: the fields that identify a question's matching intent,
-/// equivalent to a [`dns_lattice_model::Question`]'s name/type/class but
-/// independent of that struct's exact field set, plus the effective upstream
-/// group, the query's RD bit (an upstream may answer RD=0 and RD=1 queries
-/// differently), and the query's EDNS DO bit (a DO=0 client must not receive
-/// DNSSEC records cached for a DO=1 client, RFC 3225 §3).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct CacheKey {
-    name: Name,
-    rtype: RecordType,
-    class: Class,
-    group: UpstreamGroupId,
-    recursion_desired: bool,
-    dnssec_ok: bool,
-}
-
-/// A normalised cached answer, shared through an [`Arc`] so a hit clones
-/// only the pointer while the cache lock is held.
-struct CachedAnswer {
-    /// The upstream answer with its EDNS OPT record removed (OPT is
-    /// per-transaction and never cached, RFC 6891 §6.1.1) and every record
-    /// TTL clamped into the entry class's bounds (and, for a negative answer
-    /// with an SOA, the SOA TTL rewritten to the negative TTL).
-    message: Message,
-    /// The instant captured before the upstream call; TTLs count down from
-    /// here.
-    inserted: Instant,
-    /// `inserted` plus the entry TTL; the entry is a miss from this instant.
-    expires: Instant,
-}
-
 /// An in-process DNS query orchestrator.
 ///
 /// Construct it from a split-DNS policy and one or more upstream backends
@@ -171,8 +114,13 @@ struct CachedAnswer {
 pub struct Resolver {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
+    /// A dense index per registered group, fixed at build time; part of the
+    /// cache key so it holds no string.
+    group_index: HashMap<UpstreamGroupId, u32>,
     clock: Box<dyn Clock + Send + Sync>,
-    cache: Mutex<HashMap<CacheKey, Arc<CachedAnswer>>>,
+    /// The bounded answer store; `None` when the cache is disabled.
+    cache: Option<Store>,
+    ttl_policy: TtlPolicy,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
     observability_sink: Option<Arc<dyn ObservabilitySink>>,
@@ -196,6 +144,7 @@ impl Resolver {
             policy,
             backends: HashMap::new(),
             clock: Box::new(SystemClock),
+            cache: CacheConfig::new(),
             fake_ip: None,
             route_hook: None,
             observability_sink: None,
@@ -230,22 +179,34 @@ impl Resolver {
     /// the effective upstream group, the query's RD bit, and the DO bit of
     /// the query's EDNS OPT record (false without a well-formed OPT).
     ///
+    /// The cache is a sharded store bounded by [`CacheConfig::max_bytes`]
+    /// (16 MiB, estimated, by default). Every insert evicts as much as it
+    /// needs to stay within the bound — expired entries first, then entries
+    /// that were never reused — so memory use stays bounded however many
+    /// distinct names are queried; an answer too large for its shard is
+    /// returned but not stored. [`CacheConfig::disabled`] keeps nothing. The
+    /// TTL limits below are the defaults of [`CacheConfig`] and can be
+    /// changed through [`ResolverBuilder::cache`].
+    ///
     /// An answer is stored only when its opcode is `QUERY`, `TC` is clear,
     /// it carries either no EDNS OPT record or a well-formed one whose
-    /// extended RCODE is 0, and it is either positive (`NOERROR` with at least one answer record)
-    /// or negative (`NXDOMAIN`, or `NOERROR` with an empty answer section).
-    /// `SERVFAIL`, `REFUSED` and every other response code are returned but
-    /// never stored. The stored copy never keeps the EDNS OPT record. Before
-    /// storing, every other record TTL is clamped to at most 86 400 s for a
-    /// positive answer or 3 600 s for a negative one. The entry then lives
-    /// for:
+    /// extended RCODE is 0, and it is either positive (`NOERROR` with at
+    /// least one answer record) or negative (`NXDOMAIN`, or `NOERROR` with an
+    /// empty answer section). `SERVFAIL`, `REFUSED` and every other response
+    /// code are returned but never stored. The stored copy never keeps the
+    /// EDNS OPT record. Before storing, every other record TTL is clamped
+    /// into [`CacheConfig::positive_ttl`] (by default at most 86 400 s) for a
+    /// positive answer or [`CacheConfig::negative_ttl`] (by default at most
+    /// 3 600 s) for a negative one. The entry then lives for:
     ///
     /// - positive: the minimum record TTL over the answer, authority and
     ///   additional sections;
     /// - negative with an SOA in the authority section: min(SOA TTL, SOA
     ///   `MINIMUM`) (RFC 2308 §5), to which the stored SOA's TTL is
     ///   rewritten, or less if another record's TTL is lower;
-    /// - negative without an SOA: 60 s, or less if a record's TTL is lower.
+    /// - negative without an SOA: [`CacheConfig::negative_ttl_without_soa`]
+    ///   (60 s by default; such an answer is not stored when it is `None`),
+    ///   or less if a record's TTL is lower.
     ///
     /// An answer whose lifetime works out to 0 s is not stored. The lifetime
     /// is measured from the moment the query was received, before the
@@ -330,27 +291,41 @@ impl Resolver {
             }
         }
 
-        let (group, backends) = match self.select_backends(question, correlation_id).await {
-            Ok(selected) => selected,
-            Err(error) => {
-                self.emit(ObserveEvent::Failed {
-                    correlation_id,
-                    failure: observe_failure(&error),
-                });
-                return Err(error);
-            }
-        };
-        let mut key = query_uses_cache(query).then(|| CacheKey {
-            name: question.name.clone(),
-            rtype: question.qtype,
-            class: question.qclass,
-            group: group.clone(),
-            recursion_desired: query.header.recursion_desired,
-            dnssec_ok: query_dnssec_ok(query),
-        });
+        let (group, group_index, backends) =
+            match self.select_backends(question, correlation_id).await {
+                Ok(selected) => selected,
+                Err(error) => {
+                    self.emit(ObserveEvent::Failed {
+                        correlation_id,
+                        failure: observe_failure(&error),
+                    });
+                    return Err(error);
+                }
+            };
+        // The canonical key is built once, on the stack, and hashed once; the
+        // same hash selects the shard on lookup and on insert.
+        let key = self
+            .cache
+            .as_ref()
+            .filter(|_| query_uses_cache(query))
+            .and_then(|store| {
+                let key = KeyBuf::new(
+                    group_index,
+                    question.qtype,
+                    question.qclass,
+                    query.header.recursion_desired,
+                    query_dnssec_ok(query),
+                    &question.name,
+                )?;
+                let hash = store.hash(key.as_bytes());
+                Some((store, key, hash))
+            });
 
         let now = self.clock.now();
-        if let Some(cached) = key.as_ref().and_then(|key| self.cache_lookup(key, now)) {
+        if let Some(cached) = key
+            .as_ref()
+            .and_then(|(store, key, hash)| store.get(*hash, key.as_bytes(), now))
+        {
             let mut answer = cache_hit_response(query, &cached, now);
             align_edns(query, &mut answer);
             self.emit(ObserveEvent::CacheHit {
@@ -383,14 +358,12 @@ impl Resolver {
                         backend_index,
                         outcome: UpstreamObserveOutcome::Success,
                     });
-                    if let Some(key) = key.take()
-                        && let Some(entry) = cacheable_answer(&answer, now)
+                    if let Some((store, key, hash)) = &key
+                        && let Some(entry) = cacheable_answer(&answer, now, &self.ttl_policy)
                     {
-                        let entry = Arc::new(entry);
-                        self.cache
-                            .lock()
-                            .expect("cache mutex poisoned")
-                            .insert(key, entry);
+                        // An entry too large for its shard is simply not
+                        // stored; the answer is still returned.
+                        store.insert(*hash, key.as_bytes(), Arc::new(entry), now);
                     }
                     align_edns(query, &mut answer);
                     self.emit(ObserveEvent::Completed {
@@ -438,23 +411,10 @@ impl Resolver {
         }
     }
 
-    /// Returns the fresh entry for `key`, cloning only its [`Arc`] under the
-    /// cache lock. An entry found expired at `now` is removed.
-    fn cache_lookup(&self, key: &CacheKey, now: Instant) -> Option<Arc<CachedAnswer>> {
-        let mut cache = self.cache.lock().expect("cache mutex poisoned");
-        match cache.get(key) {
-            Some(entry) if entry.expires > now => Some(Arc::clone(entry)),
-            Some(_) => {
-                cache.remove(key);
-                None
-            }
-            None => None,
-        }
-    }
-
     /// Selects and validates the effective upstream group for one ordinary
-    /// query. This deliberately happens before the cache lookup because a
-    /// hook may choose different groups for equal DNS questions.
+    /// query, returning it with its cache-key index. This deliberately
+    /// happens before the cache lookup because a hook may choose different
+    /// groups for equal DNS questions.
     ///
     /// No resolver mutex is held while invoking the hook. Dropping the
     /// enclosing [`Resolver::resolve`] future drops this in-flight hook call;
@@ -464,7 +424,7 @@ impl Resolver {
         &self,
         question: &dns_lattice_model::Question,
         correlation_id: u64,
-    ) -> Result<(UpstreamGroupId, &Vec<Box<dyn UpstreamBackend>>)> {
+    ) -> Result<(UpstreamGroupId, u32, &Vec<Box<dyn UpstreamBackend>>)> {
         let static_group = self.policy.resolve_group(&question.name);
         self.emit(ObserveEvent::StaticRoute {
             correlation_id,
@@ -502,7 +462,8 @@ impl Resolver {
         if backends.is_empty() {
             return Err(Error::NoRoute);
         }
-        Ok((group, backends))
+        let index = *self.group_index.get(&group).ok_or(Error::NoRoute)?;
+        Ok((group, index, backends))
     }
 }
 
@@ -770,15 +731,20 @@ fn observe_failure(error: &Error) -> ObserveFailure {
 /// stored), and either positive (`NoError` with at least one answer record)
 /// or negative (`NxDomain`, or `NoError` with an empty answer section).
 ///
-/// The stored copy has its OPT record removed. Every remaining record TTL is clamped into [`POSITIVE_TTL`] or
-/// [`NEGATIVE_TTL`]. The entry TTL is the minimum non-OPT record TTL over
-/// all sections. For a negative answer it is further limited to the
-/// negative TTL: min(SOA TTL, SOA `MINIMUM`) (RFC 2308 §5) clamped into
-/// [`NEGATIVE_TTL`], written back to the first authority SOA's TTL so it
-/// counts down on hits (RFC 2308 §6), or [`NEGATIVE_TTL_WITHOUT_SOA`]
-/// (clamped likewise) when the authority section has no SOA. An entry TTL
-/// of 0 is not stored. `inserted` anchors the countdown and expiry.
-fn cacheable_answer(answer: &Message, inserted: Instant) -> Option<CachedAnswer> {
+/// The stored copy has its OPT record removed. Every remaining record TTL is
+/// clamped into `policy`'s positive or negative bounds. The entry TTL is the
+/// minimum non-OPT record TTL over all sections. For a negative answer it is
+/// further limited to the negative TTL: min(SOA TTL, SOA `MINIMUM`) (RFC 2308
+/// §5) clamped into the negative bounds, written back to the first authority
+/// SOA's TTL so it counts down on hits (RFC 2308 §6); with no SOA in the
+/// authority section it is `policy.negative_without_soa` (clamped likewise),
+/// and a policy of `None` stores no such answer. An entry TTL of 0 is not
+/// stored. `inserted` anchors the countdown and expiry.
+fn cacheable_answer(
+    answer: &Message,
+    inserted: Instant,
+    policy: &TtlPolicy,
+) -> Option<CachedAnswer> {
     if answer.header.opcode != Opcode::Query || answer.header.truncated {
         return None;
     }
@@ -792,7 +758,11 @@ fn cacheable_answer(answer: &Message, inserted: Instant) -> Option<CachedAnswer>
         Rcode::NxDomain => true,
         _ => return None,
     };
-    let bounds = if negative { NEGATIVE_TTL } else { POSITIVE_TTL };
+    let bounds = if negative {
+        policy.negative
+    } else {
+        policy.positive
+    };
 
     let mut message = answer.clone();
     // OPT is per-transaction (payload size, DO, options such as COOKIE) and
@@ -814,7 +784,7 @@ fn cacheable_answer(answer: &Message, inserted: Instant) -> Option<CachedAnswer>
                 record.ttl = bounds.clamp(record.ttl.min(minimum));
                 record.ttl
             }
-            None => bounds.clamp(NEGATIVE_TTL_WITHOUT_SOA),
+            None => bounds.clamp(policy.negative_without_soa?),
         })
     } else {
         None
@@ -841,6 +811,7 @@ pub struct ResolverBuilder {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     clock: Box<dyn Clock + Send + Sync>,
+    cache: CacheConfig,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
     observability_sink: Option<Arc<dyn ObservabilitySink>>,
@@ -911,6 +882,18 @@ impl ResolverBuilder {
         self
     }
 
+    /// Configures the answer cache: its memory bound, shard count and TTL
+    /// clamps. Without this call the resolver uses [`CacheConfig::new`], a
+    /// store bounded to 16 MiB (estimated). Pass [`CacheConfig::disabled`] to
+    /// keep nothing; every query then goes to its upstream group.
+    ///
+    /// The configuration is read once, by [`ResolverBuilder::build`]; a later
+    /// call replaces an earlier one.
+    pub fn cache(mut self, config: CacheConfig) -> Self {
+        self.cache = config;
+        self
+    }
+
     /// Substitutes the clock used to compute and check cache expiry.
     /// Crate-private: no public API for clock injection.
     #[cfg(test)]
@@ -921,11 +904,24 @@ impl ResolverBuilder {
 
     /// Builds the resolver.
     pub fn build(self) -> Resolver {
+        let mut groups: Vec<&UpstreamGroupId> = self.backends.keys().collect();
+        groups.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let group_index = groups
+            .into_iter()
+            .zip(0_u32..)
+            .map(|(group, index)| (group.clone(), index))
+            .collect();
+        let cache = self
+            .cache
+            .store_enabled()
+            .then(|| Store::new(self.cache.max_bytes_value(), self.cache.shards_value()));
         Resolver {
             policy: self.policy,
             backends: self.backends,
+            group_index,
             clock: self.clock,
-            cache: Mutex::new(HashMap::new()),
+            cache,
+            ttl_policy: self.cache.ttl_policy(),
             fake_ip: self.fake_ip,
             route_hook: self.route_hook,
             observability_sink: self.observability_sink,
@@ -1255,8 +1251,8 @@ mod tests {
     // the routing and cache slice -----------------------------------------
 
     use std::net::Ipv4Addr;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use dns_lattice_model::{RData, ResourceRecord};
     use tokio::sync::Notify;
@@ -1504,6 +1500,7 @@ mod tests {
             policy: base.policy,
             backends: base.backends,
             clock: base.clock,
+            cache: CacheConfig::new(),
             fake_ip: base.fake_ip,
             route_hook: base.route_hook,
             observability_sink: Some(sink.clone()),
@@ -2145,7 +2142,7 @@ mod tests {
         }
         assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
         assert_eq!(backend_calls.load(Ordering::SeqCst), 0);
-        assert!(resolver.cache.lock().unwrap().is_empty());
+        assert_eq!(cache_len(&resolver), 0);
     }
 
     #[tokio::test]
@@ -2226,8 +2223,8 @@ mod tests {
 
         entered_wait.await;
         assert!(
-            resolver.cache.try_lock().is_ok(),
-            "the resolver cache mutex is not held across hook await"
+            resolver.cache.as_ref().is_none_or(Store::all_unlocked),
+            "no cache shard lock is held across the hook await"
         );
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -2758,10 +2755,13 @@ mod tests {
     fn cache_holds_no_opt(resolver: &Resolver) -> bool {
         resolver
             .cache
-            .lock()
-            .unwrap()
-            .values()
-            .all(|entry| entry.message.edns() == Ok(None))
+            .as_ref()
+            .is_none_or(|store| store.all_entries(|entry| entry.message.edns() == Ok(None)))
+    }
+
+    /// The number of entries in the resolver's answer store.
+    fn cache_len(resolver: &Resolver) -> usize {
+        resolver.cache.as_ref().map_or(0, Store::len)
     }
 
     #[tokio::test]
@@ -2790,7 +2790,7 @@ mod tests {
         edns.set_version(1).set_dnssec_ok(true);
         let mut flagged = a_answer("example.com", 300);
         flagged.set_edns(Some(edns));
-        assert!(flagged.additionals[0].ttl > POSITIVE_TTL.max);
+        assert!(flagged.additionals[0].ttl > 86_400);
         let (resolver, calls, clock) = cache_resolver(flagged);
         resolver.resolve(&query_for("example.com")).await.unwrap();
         clock.advance(Duration::from_secs(299));
@@ -3000,7 +3000,7 @@ mod tests {
             assert_eq!(first, expected, "{label}: the answer is returned as-is");
             resolver.resolve(&query_for("example.com")).await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 2, "{label}: not cached");
-            assert!(resolver.cache.lock().unwrap().is_empty(), "{label}");
+            assert_eq!(cache_len(&resolver), 0, "{label}");
         }
     }
 
@@ -3036,7 +3036,7 @@ mod tests {
             resolver.resolve(query).await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 4);
-        assert!(resolver.cache.lock().unwrap().is_empty());
+        assert_eq!(cache_len(&resolver), 0);
         let misses = sink
             .0
             .lock()
@@ -3107,13 +3107,14 @@ mod tests {
         .build();
 
         resolver.resolve(&query_for("example.com")).await.unwrap();
-        assert_eq!(resolver.cache.lock().unwrap().len(), 1);
+        assert_eq!(cache_len(&resolver), 1);
         clock.advance(Duration::from_secs(10));
         let refreshed = resolver.resolve(&query_for("example.com")).await.unwrap();
         assert_eq!(refreshed.header.rcode, Rcode::ServFail);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(
-            resolver.cache.lock().unwrap().is_empty(),
+        assert_eq!(
+            cache_len(&resolver),
+            0,
             "the expired entry is gone and SERVFAIL was not stored"
         );
     }
@@ -3383,7 +3384,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2, "both are cached");
         assert!(!hit_clear.edns().unwrap().unwrap().dnssec_ok());
         assert!(hit_set.edns().unwrap().unwrap().dnssec_ok());
-        assert_eq!(resolver.cache.lock().unwrap().len(), 2);
+        assert_eq!(cache_len(&resolver), 2);
     }
 
     #[tokio::test]
@@ -3399,7 +3400,7 @@ mod tests {
         assert_eq!(first.edns().unwrap(), Some(edns));
         resolver.resolve(&query).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(resolver.cache.lock().unwrap().is_empty());
+        assert_eq!(cache_len(&resolver), 0);
     }
 
     #[tokio::test]
@@ -3479,6 +3480,214 @@ mod tests {
         expected.set_dnssec_ok(true);
         assert_eq!(with_opt.edns().unwrap(), Some(expected));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "answered locally");
+    }
+
+    // --- Bounded store: CacheConfig, byte bound, clamps, concurrency. -------
+
+    /// A resolver with one default group backed by a counting fake that
+    /// always returns `answer`, on a fake clock, with `config` as its cache.
+    fn configured_resolver(
+        config: CacheConfig,
+        answer: Message,
+    ) -> (Resolver, Arc<AtomicUsize>, FakeClock) {
+        let clock = FakeClock::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .clock(clock.clone())
+        .cache(config)
+        .backend(
+            UpstreamGroupId::new("g"),
+            CountingBackend {
+                answer,
+                calls: calls.clone(),
+            },
+        )
+        .build();
+        (resolver, calls, clock)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_cache_keeps_nothing_and_every_query_goes_upstream() {
+        for config in [CacheConfig::disabled(), CacheConfig::new().max_bytes(0)] {
+            let (resolver, calls, _clock) =
+                configured_resolver(config, a_answer("example.com", 300));
+            for _ in 0..3 {
+                let answer = resolver.resolve(&query_for("example.com")).await.unwrap();
+                assert_eq!(answer.answers.len(), 1);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert!(resolver.cache.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_cache_is_enabled() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::default(), a_answer("example.com", 300));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_len(&resolver), 1);
+    }
+
+    #[tokio::test]
+    async fn the_store_stays_within_its_byte_bound_while_names_flood_in() {
+        let bound = 64 * 1024;
+        let (resolver, calls, _clock) = configured_resolver(
+            CacheConfig::new().max_bytes(bound).shards(1),
+            a_answer("example.com", 300),
+        );
+        let store = resolver.cache.as_ref().expect("enabled");
+        let total = 500;
+        for i in 0..total {
+            resolver
+                .resolve(&query_for(&format!("host{i}.example.com")))
+                .await
+                .unwrap();
+            assert!(store.bytes() <= bound, "after {i}: {}", store.bytes());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), total);
+        assert!(store.len() < total, "older entries were evicted");
+        assert!(store.len() > 10, "the budget is actually used");
+    }
+
+    #[tokio::test]
+    async fn an_answer_too_large_for_its_shard_is_returned_but_not_stored() {
+        let mut answer = a_answer("example.com", 300);
+        answer.answers[0].rtype = RecordType::Txt;
+        answer.answers[0].rdata = RData::Txt(vec![vec![b'x'; 255]; 80]);
+        let (resolver, calls, _clock) = configured_resolver(
+            CacheConfig::new().max_bytes(64 * 1024).shards(1),
+            answer.clone(),
+        );
+        let first = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(first.answers, answer.answers);
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "never cached");
+        assert_eq!(cache_len(&resolver), 0);
+    }
+
+    #[tokio::test]
+    async fn the_positive_ttl_bounds_are_configurable() {
+        let config =
+            CacheConfig::new().positive_ttl(Duration::from_secs(10), Duration::from_secs(60));
+        // The maximum clamp.
+        let (resolver, calls, clock) =
+            configured_resolver(config.clone(), a_answer("example.com", 300));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        clock.advance(Duration::from_secs(59));
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(ttls(&hit), vec![1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "gone at the clamped TTL");
+
+        // The minimum clamp raises a short TTL.
+        let (resolver, calls, clock) = configured_resolver(config, a_answer("example.com", 1));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        clock.advance(Duration::from_secs(9));
+        let hit = resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(ttls(&hit), vec![1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_negative_ttl_bounds_are_configurable() {
+        let config = CacheConfig::new().negative_ttl(Duration::ZERO, Duration::from_secs(30));
+        let (resolver, calls, clock) =
+            configured_resolver(config, nxdomain_answer("missing.example.com", Some(1_000)));
+        let query = query_for("missing.example.com");
+        resolver.resolve(&query).await.unwrap();
+        clock.advance(Duration::from_secs(29));
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "clamped to 30 s");
+    }
+
+    #[tokio::test]
+    async fn the_lifetime_of_a_negative_answer_without_soa_is_configurable() {
+        let answer = nxdomain_answer("missing.example.com", None);
+        let query = query_for("missing.example.com");
+
+        let (resolver, calls, clock) = configured_resolver(
+            CacheConfig::new().negative_ttl_without_soa(Some(Duration::from_secs(5))),
+            answer.clone(),
+        );
+        resolver.resolve(&query).await.unwrap();
+        clock.advance(Duration::from_secs(4));
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        clock.advance(Duration::from_secs(1));
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // `None` is strict RFC 2308: such an answer is not stored.
+        let (resolver, calls, _clock) = configured_resolver(
+            CacheConfig::new().negative_ttl_without_soa(None),
+            answer.clone(),
+        );
+        resolver.resolve(&query).await.unwrap();
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cache_len(&resolver), 0);
+
+        // A negative answer that has an SOA is unaffected by the setting.
+        let (resolver, calls, _clock) = configured_resolver(
+            CacheConfig::new().negative_ttl_without_soa(None),
+            nxdomain_answer("missing.example.com", Some(300)),
+        );
+        resolver.resolve(&query).await.unwrap();
+        resolver.resolve(&query).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hits_are_served_from_one_upstream_call() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::new().shards(4), a_answer("example.com", 300));
+        let resolver = Arc::new(resolver);
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+
+        let tasks: Vec<_> = (0..8_u16)
+            .map(|task| {
+                let resolver = Arc::clone(&resolver);
+                tokio::spawn(async move {
+                    for round in 0..100_u16 {
+                        let mut query = query_for("example.com");
+                        query.header.id = task * 1_000 + round;
+                        let answer = resolver.resolve(&query).await.unwrap();
+                        assert_eq!(answer.header.id, query.header.id);
+                        assert_eq!(answer.answers.len(), 1);
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(resolver.cache.as_ref().unwrap().all_unlocked());
+    }
+
+    #[tokio::test]
+    async fn names_that_differ_only_in_case_share_one_entry() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::default(), a_answer("example.com", 300));
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        resolver.resolve(&query_for("EXAMPLE.com")).await.unwrap();
+        resolver.resolve(&query_for("Example.COM.")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_len(&resolver), 1);
     }
 
     #[test]

@@ -13,8 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inbound server sends to an EDNS(0) client and advertises in its OPT
   record. The default is 1232 bytes; smaller values are raised to 512, and
   setting 512 restores the 1.1 UDP answer size.
+- `dns_lattice::cache::CacheConfig` and `ResolverBuilder::cache` configure
+  the resolver's answer cache: `max_bytes` (the memory bound; `0` disables
+  the store), `shards`, `positive_ttl`, `negative_ttl` (inclusive TTL clamps,
+  in whole seconds), and `negative_ttl_without_soa` (`None` stores no
+  negative answer that lacks an SOA, the strict reading of RFC 2308).
+  `CacheConfig::disabled()` keeps no answers. The defaults reproduce the
+  behaviour listed under Changed.
 
 ### Changed
+
+- Resolver cache memory, default behaviour (no public API change beyond the
+  Added entry above):
+  - the cache is bounded to about 16 MiB (an estimate of the heap its
+    entries occupy, not an allocator-exact figure). It used to be unbounded,
+    and expired entries stayed in memory until the same question was asked
+    again. The limit is enforced on every insert by evicting entries one at
+    a time, expired ones first and then entries that were never reused
+    (S3-FIFO); the cache is never flushed as a whole;
+  - an answer larger than an eighth of one shard's share of the bound is
+    returned but no longer stored;
+  - the cache is split into shards with one lock each, replacing the single
+    lock around one map; the shard count defaults to four per available
+    core (at most 64), reduced so a shard keeps at least 256 KiB;
+  - the cache key is hashed with a per-resolver random key and compared in
+    full on every hit.
 
 - Inbound server EDNS(0), default behaviour:
   - a UDP answer to a client that sends an OPT record may now be up to

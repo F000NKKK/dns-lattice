@@ -79,6 +79,9 @@ composable.
   domain patterns to upstream groups, with an optional default group
 - ✅ **TTL and negative cache**: in-memory answers expire with their DNS TTL;
   NXDOMAIN and empty answers are cached too
+- ✅ **Bounded, sharded cache**: memory is capped (16 MiB by default, an
+  estimate) and enforced on every insert; `CacheConfig` sets the cap, the
+  shard count, and the TTL limits
 - ✅ **Ordered failover**: backends in one group are tried in registration
   order; timeout, transport, and TLS failures move on to the next one
 - ✅ **Fake IP synthesis**: matching A/AAAA and in-range PTR questions are
@@ -128,14 +131,20 @@ public resolvers.
 
 ### 🏆 Design Highlights
 
-- **Cache hits never touch the network**: a hit takes one mutex lock on an
-  in-memory map and returns; the hook still runs first, upstreams do not.
+- **Cache hits never touch the network**: a hit takes one short lock on one
+  shard of an in-memory store, clones a reference, and returns; concurrent
+  hits on other shards do not wait for each other. The hook still runs
+  first, upstreams do not.
+- **A cache that cannot grow without bound**: the store holds a fixed
+  number of bytes (16 MiB by default) and evicts on every insert, expired
+  entries first, so a flood of one-off names cannot push out the names that
+  are asked for again and again.
 - **One task per request, no shared worker**: the server spawns a Tokio task
   per UDP datagram, per TCP/DoT/DoH connection, and per DoQ stream, all
   sharing one `Arc<Resolver>`.
 - **No background threads or queues**: the resolver owns no threads or
-  tasks, and observability callbacks run synchronously after the cache lock
-  is released.
+  tasks, and observability callbacks run synchronously after the cache
+  shard lock is released.
 - **Pay only for the transports you use**: without `dot`, `doh`, or `doq`
   the build has no TLS, HTTP, or QUIC dependency.
 
@@ -153,8 +162,11 @@ Current limits, stated plainly:
   (`ServerBuilder::edns_udp_payload_size`
   changes the 1232) and non-EDNS clients with at most 512 bytes; larger
   answers are sent empty with `TC=1`, so clients retry over TCP;
-- the answer cache has no size limit and no background sweep: an expired
-  entry stays in memory until the same question is answered again.
+- the answer cache holds at most about 16 MiB by default
+  (`CacheConfig::max_bytes`; an estimate of heap use, not an exact
+  allocator figure) and has no background sweep: an expired entry is
+  removed when its question is asked again or when an insert needs room.
+  Concurrent identical queries are not merged yet; each one goes upstream.
 
 ### 📊 Benchmarks
 
@@ -488,10 +500,21 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   `SERVFAIL`, `REFUSED`, other error codes, truncated answers, and answers
   with a TTL of 0 are returned but never stored. Queries with more or fewer
   than one question, or another opcode, bypass the cache.
-- **Lifetimes**: stored TTLs are capped at 86 400 s (positive) and 3 600 s
-  (negative). A positive entry lives for its lowest record TTL across all
-  sections; a negative one for min(SOA TTL, SOA `MINIMUM`) (RFC 2308), or
-  60 s without an SOA.
+- **Lifetimes**: by default stored TTLs are capped at 86 400 s (positive)
+  and 3 600 s (negative); `CacheConfig::positive_ttl` and
+  `CacheConfig::negative_ttl` set other bounds. A positive entry lives for
+  its lowest record TTL across all sections; a negative one for min(SOA TTL,
+  SOA `MINIMUM`) (RFC 2308), or 60 s without an SOA
+  (`CacheConfig::negative_ttl_without_soa` changes it; `None` stores no
+  such answer).
+- **Memory bound**: the store is split into shards, each with its own lock
+  and an equal share of `CacheConfig::max_bytes` (16 MiB by default). Every
+  insert evicts until its shard is back within its share: expired entries
+  first, then entries that were never reused (S3-FIFO), so a flood of
+  unique names, such as random-subdomain NXDOMAIN queries, leaves the
+  popular names in place. The cache is never flushed as a whole to make
+  room. An answer larger than an eighth of a shard's share is returned but
+  not stored. `CacheConfig::disabled()` (or `max_bytes(0)`) keeps nothing.
 - **Hits**: TTLs count down by the whole seconds since the answer was
   stored. A hit carries the current query's id, question, and RD bit, sets
   AA=0, and keeps every record in its original order.
@@ -630,6 +653,7 @@ the release automation. Those checks do not publish crates.
 | Exact/suffix/wildcard domain matcher | ✅ |
 | Static split-DNS policy | ✅ |
 | Resolver + TTL/negative cache | ✅ |
+| Byte-bounded sharded cache, configurable TTL limits | ✅ |
 | Route-scoped cache identity | ✅ |
 | UDP/TCP upstreams | ✅ |
 | DoT/DoH/DoQ upstreams | ✅ |
@@ -678,6 +702,7 @@ Canonical public paths are:
 | `dns_lattice::core` | Shared typed errors/results |
 | `dns_lattice::model` | DNS messages, records, names, matchers, policies |
 | `dns_lattice::engine` | `Resolver` / `ResolverBuilder` |
+| `dns_lattice::cache` | `CacheConfig`: cache memory bound, shards, TTL limits |
 | `dns_lattice::upstream` | Outbound backend trait and transports |
 | `dns_lattice::server` | Inbound listener configuration/lifecycle |
 | `dns_lattice::fakeip` | Fake IP pool, policy, TTL, snapshots |

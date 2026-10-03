@@ -175,12 +175,38 @@ that the hook routes to another group. The query's RD bit and EDNS DO bit
 
 Only clean answers are stored (opcode QUERY, `TC=0`, a well-formed OPT record
 with EDNS extended RCODE 0 if any, and `NOERROR` with records, `NXDOMAIN`, or
-`NODATA`), with the OPT record removed, record TTLs capped at one day
-(positive) or one hour (negative) and a negative lifetime of min(SOA TTL, SOA
-`MINIMUM`). A hit counts every TTL down by whole elapsed seconds, echoes the
-current query's id, question, and RD bit, clears AA, and preserves record
-order. The cache lock covers only the lookup and a reference-count increment;
-the response is built after it is released.
+`NODATA`), with the OPT record removed, record TTLs capped by default at one
+day (positive) or one hour (negative) and a negative lifetime of min(SOA TTL,
+SOA `MINIMUM`), or 60 s without an SOA. `CacheConfig` changes the TTL bounds
+and the no-SOA lifetime. A hit counts every TTL down by whole elapsed
+seconds, echoes the current query's id, question, and RD bit, clears AA, and
+preserves record order.
+
+The store is private to the facade crate and bounded in memory. It is split
+into a power-of-two number of shards, each behind its own lock, so concurrent
+queries contend only when they hit the same shard. The key is one canonical
+byte string — effective group index, type, class, the RD and DO bits, and the
+lowercased wire form of the name — built in a stack buffer and hashed once
+with a per-resolver keyed hash (resistant to hash flooding); the hash's high
+bits select the shard and every hit compares the full key bytes, so a hash
+collision replaces the older key and never serves a mismatched answer. A
+shard lock covers only the lookup and a reference-count increment; the
+response is built after it is released, and observability callbacks never run
+under it.
+
+Every shard owns an equal share of `CacheConfig::max_bytes` (16 MiB by
+default). The cost of an entry is a deterministic structural estimate of its
+heap use, computed once on insert. The bound is enforced synchronously on
+every insert, which evicts one entry at a time until the shard is within its
+share (a background cleaner could be outrun by an attacker); an entry costing
+more than an eighth of the share is not stored, and the cache is never
+flushed as a whole. Eviction takes an expired entry first, earliest expiry
+first. Otherwise it follows S3-FIFO: new keys enter a small queue (10 % of
+the share) and leave it for a main queue only if they were hit, so one-hit
+names, such as random-subdomain NXDOMAIN floods, are dropped while the
+reused set stays; a ghost ring remembers only the hashes of dropped keys so a
+returning key enters the main queue directly. An expired entry is never
+promoted. `CacheConfig::disabled()` configures no store at all.
 
 Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
 answer — is aligned with the query's EDNS(0) state: without a query OPT
