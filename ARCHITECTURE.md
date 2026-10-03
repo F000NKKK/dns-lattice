@@ -243,8 +243,27 @@ matching only tests suffixes that begin at a label boundary. A flush resets
 the shard but keeps its counters. `Resolver::cache_stats` sums per-shard
 counters kept under the shard locks (inserts, evictions, expirations,
 oversized rejections, entries, bytes) with three relaxed atomics for lookup
-outcomes (hits, misses, coalesced); it takes no lock longer than one shard
-and does not stop queries.
+outcomes (hits, misses, coalesced) and a refresh counter; it takes no lock
+longer than one shard and does not stop queries. A query that missed, led,
+and found an answer stored in the meantime reports `CacheMiss` and counts as
+a miss, so `hits` can slightly undercount the answers the store served.
+
+Prefetch (`CacheConfig::prefetch`, off by default) is the only feature that
+spawns. The resolver is a thin handle over a shared inner state (`Arc`) plus a
+`JoinSet` of refresh tasks; the tasks hold the inner state, never the handle,
+so dropping the `Resolver` drops the set and aborts every refresh. Each entry
+counts its fresh hits and carries a one-shot `refreshing` flag. A fresh hit
+that has reached the hit threshold, is within the configured share of the
+entry's lifetime from its expiry, finds fewer than 256 running refreshes and
+a Tokio runtime handle, and wins the flag, registers a flight for the key as
+leader (backing off if another query already leads one) and spawns a task
+that runs the same failover loop and insert as a miss, against the hit's
+group without running the hook again, and publishes to any follower that
+joined. It emits only `CacheEvent::RefreshStarted` and
+`CacheEvent::RefreshCompleted` with a fresh correlation id, never an
+`ObserveEvent`, and honours the purge epoch like any leader. Without a
+runtime nothing happens and nothing panics. The task-set lock is held only
+to reap finished tasks and spawn; no sink callback runs under it.
 
 Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
 answer — is aligned with the query's EDNS(0) state: without a query OPT

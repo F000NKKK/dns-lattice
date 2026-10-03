@@ -47,7 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Resolver::cache_stats` returns a `dns_lattice::cache::CacheStats`
   snapshot: `entries`, `bytes` (an estimate), `capacity_bytes`, `hits`,
   `misses`, `coalesced`, `inserts`, `evictions`, `expirations` and
-  `oversized_rejected`. The counters are monotonic and survive a flush.
+  `oversized_rejected` (and `refreshes`, see below). The counters are
+  monotonic and survive a flush. `hits` counts queries answered from the
+  store at their first lookup; a leader that missed and then found an
+  answer another query had just stored counts as a miss, so under
+  concurrency `hits` can be slightly below the number of queries the store
+  served.
+- Opt-in cache prefetch: `dns_lattice::cache::Prefetch` (`new`,
+  `threshold_percent`, `min_hits`), `CacheConfig::prefetch`,
+  `CacheStats::refreshes` and the events `CacheEvent::RefreshStarted` and
+  `CacheEvent::RefreshCompleted` (added to the `#[non_exhaustive]`
+  `CacheEvent`). A fresh hit on an entry with at least `min_hits` (default
+  2) hits and at most `threshold_percent` (default 10, clamped to 1 to 50)
+  of its lifetime left starts one background refresh on the current Tokio
+  runtime. The refresh queries the hit's own upstream group without running
+  the route hook again, joins the in-flight registry like a miss (so it never
+  duplicates an upstream call and a query arriving meanwhile shares its
+  result), replaces the entry when the answer is cacheable, and emits cache
+  events but no `ObserveEvent`. Each stored entry is refreshed at most once,
+  at most 256 refreshes run at a time, a hit outside a Tokio runtime starts
+  none, and dropping the `Resolver` aborts the running refreshes. It is off
+  by default: without it the resolver still spawns no tasks.
 
 ### Changed
 

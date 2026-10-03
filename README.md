@@ -142,8 +142,9 @@ public resolvers.
 - **One task per request, no shared worker**: the server spawns a Tokio task
   per UDP datagram, per TCP/DoT/DoH connection, and per DoQ stream, all
   sharing one `Arc<Resolver>`.
-- **No background threads or queues**: the resolver owns no threads or
-  tasks, and observability callbacks run synchronously after the cache
+- **No background threads or queues**: the resolver owns no threads, and no
+  tasks unless you opt into cache prefetch (then dropping the resolver
+  aborts them); observability callbacks run synchronously after the cache
   shard lock is released.
 - **Pay only for the transports you use**: without `dot`, `doh`, or `doq`
   the build has no TLS, HTTP, or QUIC dependency.
@@ -514,6 +515,21 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   `CacheEvent::Coalesced` through `ObservabilitySink::record_cache`. If the
   leading `resolve` future is dropped, a waiting query takes over; nothing
   is spawned, so this works on any executor.
+- **Prefetch (opt-in)**: `CacheConfig::prefetch(Some(Prefetch::new()))`
+  refreshes popular entries just before they expire. A fresh hit starts a
+  background refresh when the entry has at most 10 % of its lifetime left
+  (`Prefetch::threshold_percent`, 1 to 50) and has served at least 2 hits
+  (`Prefetch::min_hits`). The hit is answered from the cache as usual; the
+  refresh queries the same upstream group (the route hook is not run again),
+  joins the in-flight registry like an ordinary miss, so it never duplicates
+  an upstream call and a query that arrives meanwhile shares its result, and
+  replaces the entry when the answer is cacheable. Each stored entry is
+  refreshed at most once, at most 256 refreshes run at a time, and a hit
+  outside a Tokio runtime starts none. Refreshes run on that runtime and are
+  aborted when the `Resolver` is dropped. They emit
+  `CacheEvent::RefreshStarted` and `CacheEvent::RefreshCompleted` (with
+  `refreshed`) but no `ObserveEvent`. Off by default: without it the
+  resolver spawns nothing.
 - **Lifetimes**: by default stored TTLs are capped at 86 400 s (positive)
   and 3 600 s (negative); `CacheConfig::positive_ttl` and
   `CacheConfig::negative_ttl` set other bounds. A positive entry lives for
@@ -542,8 +558,12 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   answered. Use it after a network or VPN change.
 - **Statistics**: `Resolver::cache_stats()` returns a `CacheStats` snapshot
   with `entries`, `bytes` (an estimate), `capacity_bytes`, `hits`, `misses`,
-  `coalesced`, `inserts`, `evictions`, `expirations` and `oversized_rejected`.
-  The counters are monotonic and survive a flush.
+  `coalesced`, `inserts`, `evictions`, `expirations`, `oversized_rejected`
+  and `refreshes`. The counters are monotonic and survive a flush. `hits`
+  counts queries answered from the store at their first lookup: a leader
+  that missed and then found an answer another query had just stored counts
+  as a miss, so under concurrency `hits` can be slightly below the number of
+  queries the store served.
 - **EDNS(0)**: the OPT record is removed before an answer is stored, so a
   hit never replays another client's OPT record. A hit for a query with an
   OPT record gets a fresh one (1232 bytes, version 0, the query's DO bit,

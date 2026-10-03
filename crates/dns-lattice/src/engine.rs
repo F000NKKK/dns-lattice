@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
@@ -27,11 +27,13 @@ use dns_lattice_model::{
     Class, Edns, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy,
     UpstreamGroupId,
 };
+use tokio::runtime::Handle;
+use tokio::task::JoinSet;
 
 use crate::cache::TtlPolicy;
-use crate::cache::flight::{Flights, Join, Outcome, Wait};
+use crate::cache::flight::{Flights, Join, LeaderGuard, Outcome, Wait};
 use crate::cache::store::{CachedAnswer, KeyBuf, Store};
-use crate::cache::{CacheConfig, CacheStats};
+use crate::cache::{CacheConfig, CacheStats, Prefetch};
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
@@ -108,12 +110,22 @@ impl Clock for FakeClock {
 /// # Lifecycle
 ///
 /// Construct via [`Resolver::builder`], call [`Resolver::resolve`] as many
-/// times as needed, then drop. This stage holds no background threads, so
-/// there is no explicit `shutdown` method — Rust's ordinary drop semantics
-/// fully release any resources the resolver owns (including any sockets a
-/// registered [`crate::upstream::UdpBackend`]/[`crate::upstream::TcpBackend`]
-/// opens per call).
+/// times as needed, then drop. The resolver spawns no threads and no tasks
+/// unless [`CacheConfig::prefetch`] is configured; with it, a cache hit may
+/// start a background refresh on the Tokio runtime it runs in. There is no
+/// explicit `shutdown` method — dropping the resolver aborts every refresh
+/// still running, and Rust's ordinary drop semantics release everything else
+/// it owns (including any sockets a registered
+/// [`crate::upstream::UdpBackend`]/[`crate::upstream::TcpBackend`] opens per
+/// call).
 pub struct Resolver {
+    inner: Arc<ResolverInner>,
+    /// Background refresh tasks; dropping the set aborts them.
+    background: Mutex<JoinSet<()>>,
+}
+
+/// The resolver state shared with background refresh tasks.
+struct ResolverInner {
     policy: SplitDnsPolicy,
     backends: HashMap<UpstreamGroupId, Vec<Box<dyn UpstreamBackend>>>,
     /// A dense index per registered group, fixed at build time; part of the
@@ -128,6 +140,8 @@ pub struct Resolver {
     /// Bumped whenever cached content is invalidated; a leader stores its
     /// answer only if the epoch is unchanged since its upstream call began.
     cache_epoch: AtomicU64,
+    /// Opt-in prefetch policy.
+    prefetch: Option<Prefetch>,
     /// Lookup outcome counters behind [`Resolver::cache_stats`].
     counters: QueryCounters,
     fake_ip: Option<FakeIpResolverConfig>,
@@ -143,6 +157,15 @@ struct QueryCounters {
     hits: AtomicU64,
     misses: AtomicU64,
     coalesced: AtomicU64,
+    refreshes: AtomicU64,
+}
+
+/// The most background refreshes running at once; a hit that would start
+/// another is served without one.
+const MAX_REFRESH_TASKS: usize = 256;
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Explicit Fake IP answer synthesis owned by a [`Resolver`].
@@ -256,6 +279,15 @@ impl Resolver {
     /// future is dropped, one follower takes over as the new leader; nothing
     /// is spawned, so this works on any executor.
     ///
+    /// # Prefetch
+    ///
+    /// Only when [`CacheConfig::prefetch`] is configured, a fresh cache hit on
+    /// a popular entry close to its expiry also starts a background refresh
+    /// of that entry on the current Tokio runtime (a hit outside a runtime
+    /// starts none). The hit itself is answered from the cache exactly as
+    /// above; the refresh is aborted if the resolver is dropped. See
+    /// [`crate::cache::Prefetch`].
+    ///
     /// # EDNS(0)
     ///
     /// Every `Ok` answer — Fake IP, cache hit, or fresh upstream — is aligned
@@ -291,6 +323,65 @@ impl Resolver {
     /// [`crate::upstream::TcpBackend`]) — see `crate::upstream`'s
     /// module-level docs.
     pub async fn resolve(&self, query: &Message) -> Result<Message> {
+        self.inner.resolve(query, &self.background).await
+    }
+
+    /// Removes every cached answer and returns how many were removed.
+    ///
+    /// Use it when the upstream data is known to have changed wholesale (a
+    /// network switch, a VPN toggle, a policy reload). Queries already waiting
+    /// on an upstream call still receive that call's result, but the result
+    /// is not stored: an answer fetched before the flush never outlives it.
+    /// The lifetime counters of [`Resolver::cache_stats`] are not reset.
+    ///
+    /// Takes one shard lock at a time, never across an await, and runs no
+    /// callback. With the store disabled it returns 0.
+    pub fn clear_cache(&self) -> usize {
+        self.inner.clear_cache()
+    }
+
+    /// Removes the cached answers for exactly `name` and returns how many
+    /// were removed.
+    ///
+    /// Every upstream group, class and query shape (RD and DO bits) is
+    /// covered, and so is every answer kind (positive and negative). With
+    /// `rtype` set only that record type is removed; with `None` every type
+    /// is. The name is compared case-insensitively. Answers for names below
+    /// `name` are kept; see [`Resolver::purge_subtree`].
+    ///
+    /// Like [`Resolver::clear_cache`], it also stops in-flight queries from
+    /// storing the answer they were fetching (for any name: a purge
+    /// invalidates every upstream call that began before it).
+    pub fn purge(&self, name: &Name, rtype: Option<RecordType>) -> usize {
+        self.inner.purge(name, rtype)
+    }
+
+    /// Removes the cached answers for `zone` and every name below it, and
+    /// returns how many were removed.
+    ///
+    /// Matching respects label boundaries: purging `ample.com` removes
+    /// `ample.com` and `www.ample.com` but not `example.com`. Purging the
+    /// root name removes everything, like [`Resolver::clear_cache`] (except
+    /// that remembered eviction hashes are kept). The group, class, type and
+    /// query shape of an answer do not matter. In-flight queries are handled
+    /// as in [`Resolver::purge`].
+    pub fn purge_subtree(&self, zone: &Name) -> usize {
+        self.inner.purge_subtree(zone)
+    }
+
+    /// A snapshot of the cache counters and size. See [`CacheStats`].
+    pub fn cache_stats(&self) -> CacheStats {
+        self.inner.cache_stats()
+    }
+}
+
+impl ResolverInner {
+    /// The body of [`Resolver::resolve`].
+    async fn resolve(
+        self: &Arc<Self>,
+        query: &Message,
+        background: &Mutex<JoinSet<()>>,
+    ) -> Result<Message> {
         let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let question = query.questions.first();
         self.emit(ObserveEvent::QueryReceived {
@@ -375,6 +466,11 @@ impl Resolver {
                 correlation_id,
                 rcode: answer.header.rcode,
             });
+            if let (Some(prefetch), Some((_, key, hash))) = (&self.prefetch, &stored) {
+                self.maybe_prefetch(
+                    prefetch, background, query, &group, key, *hash, &cached, now,
+                );
+            }
             return Ok(answer);
         }
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
@@ -438,17 +534,21 @@ impl Resolver {
         let now = if announced { self.clock.now() } else { now };
         let epoch = self.cache_epoch.load(Ordering::Acquire);
         let result = self
-            .query_upstream(query, &group, backends, correlation_id, stored, now, epoch)
+            .query_upstream(
+                query,
+                &group,
+                backends,
+                Some(correlation_id),
+                stored,
+                now,
+                epoch,
+            )
             .await;
         if let Some(guard) = guard {
-            guard.finish(|| match &result {
-                Ok((_, Some(entry))) => Outcome::Cached(Arc::clone(entry)),
-                Ok((answer, None)) => Outcome::Raw(Arc::new(answer.clone())),
-                Err(error) => Outcome::Failed(error.clone()),
-            });
+            guard.finish(|| outcome_of(&result));
         }
         match result {
-            Ok((mut answer, _)) => {
+            Ok((mut answer, _, _)) => {
                 align_edns(query, &mut answer);
                 self.emit(ObserveEvent::Completed {
                     correlation_id,
@@ -466,17 +566,8 @@ impl Resolver {
         }
     }
 
-    /// Removes every cached answer and returns how many were removed.
-    ///
-    /// Use it when the upstream data is known to have changed wholesale (a
-    /// network switch, a VPN toggle, a policy reload). Queries already waiting
-    /// on an upstream call still receive that call's result, but the result
-    /// is not stored: an answer fetched before the flush never outlives it.
-    /// The lifetime counters of [`Resolver::cache_stats`] are not reset.
-    ///
-    /// Takes one shard lock at a time, never across an await, and runs no
-    /// callback. With the store disabled it returns 0.
-    pub fn clear_cache(&self) -> usize {
+    /// The body of [`Resolver::clear_cache`].
+    fn clear_cache(&self) -> usize {
         // Bump first, then lock: an insert that already passed its epoch
         // check holds a shard lock, so the flush below waits for it and
         // removes the entry; any later insert sees the new epoch.
@@ -484,43 +575,24 @@ impl Resolver {
         self.cache.as_ref().map_or(0, Store::clear)
     }
 
-    /// Removes the cached answers for exactly `name` and returns how many
-    /// were removed.
-    ///
-    /// Every upstream group, class and query shape (RD and DO bits) is
-    /// covered, and so is every answer kind (positive and negative). With
-    /// `rtype` set only that record type is removed; with `None` every type
-    /// is. The name is compared case-insensitively. Answers for names below
-    /// `name` are kept; see [`Resolver::purge_subtree`].
-    ///
-    /// Like [`Resolver::clear_cache`], it also stops in-flight queries from
-    /// storing the answer they were fetching (for any name: a purge
-    /// invalidates every upstream call that began before it).
-    pub fn purge(&self, name: &Name, rtype: Option<RecordType>) -> usize {
+    /// The body of [`Resolver::purge`].
+    fn purge(&self, name: &Name, rtype: Option<RecordType>) -> usize {
         self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         self.cache
             .as_ref()
             .map_or(0, |store| store.purge(name, rtype))
     }
 
-    /// Removes the cached answers for `zone` and every name below it, and
-    /// returns how many were removed.
-    ///
-    /// Matching respects label boundaries: purging `ample.com` removes
-    /// `ample.com` and `www.ample.com` but not `example.com`. Purging the
-    /// root name removes everything, like [`Resolver::clear_cache`] (except
-    /// that remembered eviction hashes are kept). The group, class, type and
-    /// query shape of an answer do not matter. In-flight queries are handled
-    /// as in [`Resolver::purge`].
-    pub fn purge_subtree(&self, zone: &Name) -> usize {
+    /// The body of [`Resolver::purge_subtree`].
+    fn purge_subtree(&self, zone: &Name) -> usize {
         self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         self.cache
             .as_ref()
             .map_or(0, |store| store.purge_subtree(zone))
     }
 
-    /// A snapshot of the cache counters and size. See [`CacheStats`].
-    pub fn cache_stats(&self) -> CacheStats {
+    /// The body of [`Resolver::cache_stats`].
+    fn cache_stats(&self) -> CacheStats {
         let store = self.cache.as_ref().map(Store::stats).unwrap_or_default();
         CacheStats {
             entries: store.entries,
@@ -533,6 +605,7 @@ impl Resolver {
             evictions: store.evictions,
             expirations: store.expirations,
             oversized_rejected: store.oversized_rejected,
+            refreshes: self.counters.refreshes.load(Ordering::Relaxed),
         }
     }
 
@@ -578,47 +651,58 @@ impl Resolver {
     ///
     /// A cacheable answer is stored here, before the caller publishes it to
     /// any coalesced follower, unless a purge has bumped `epoch` since the
-    /// upstream call began. Emits the per-backend upstream events; the
-    /// terminal event is the caller's.
+    /// upstream call began. Emits the per-backend upstream events under
+    /// `correlation_id` (none for a background refresh, which passes `None`);
+    /// the terminal event is the caller's.
+    ///
+    /// Returns the answer, its normalised entry when it is cacheable, and
+    /// whether that entry was actually stored.
     #[allow(clippy::too_many_arguments)]
     async fn query_upstream(
         &self,
         query: &Message,
         group: &UpstreamGroupId,
         backends: &[Box<dyn UpstreamBackend>],
-        correlation_id: u64,
+        correlation_id: Option<u64>,
         stored: Option<(&Store, &KeyBuf, u64)>,
         now: Instant,
         epoch: u64,
-    ) -> Result<(Message, Option<Arc<CachedAnswer>>)> {
+    ) -> Result<UpstreamAnswer> {
+        let observe = |event: &dyn Fn(u64) -> ObserveEvent| {
+            if let Some(correlation_id) = correlation_id {
+                self.emit(event(correlation_id));
+            }
+        };
         let mut last_err = None;
         for (backend_index, backend) in backends.iter().enumerate() {
-            self.emit(ObserveEvent::UpstreamAttempt {
+            observe(&|correlation_id| ObserveEvent::UpstreamAttempt {
                 correlation_id,
                 group: group.clone(),
                 backend_index,
             });
             match backend.resolve(query).await {
                 Ok(answer) => {
-                    self.emit(ObserveEvent::UpstreamOutcome {
+                    observe(&|correlation_id| ObserveEvent::UpstreamOutcome {
                         correlation_id,
                         group: group.clone(),
                         backend_index,
                         outcome: UpstreamObserveOutcome::Success,
                     });
+                    let mut was_stored = false;
                     let entry = stored.and_then(|(store, key, hash)| {
                         let entry = Arc::new(cacheable_answer(&answer, now, &self.ttl_policy)?);
                         // An entry too large for its shard is simply not
                         // stored; the answer is still returned.
-                        store.insert_if(hash, key.as_bytes(), Arc::clone(&entry), now, || {
-                            self.cache_epoch.load(Ordering::Acquire) == epoch
-                        });
+                        was_stored =
+                            store.insert_if(hash, key.as_bytes(), Arc::clone(&entry), now, || {
+                                self.cache_epoch.load(Ordering::Acquire) == epoch
+                            });
                         Some(entry)
                     });
-                    return Ok((answer, entry));
+                    return Ok((answer, entry, was_stored));
                 }
                 Err(e) if is_retryable(&e) => {
-                    self.emit(ObserveEvent::UpstreamOutcome {
+                    observe(&|correlation_id| ObserveEvent::UpstreamOutcome {
                         correlation_id,
                         group: group.clone(),
                         backend_index,
@@ -627,7 +711,7 @@ impl Resolver {
                     last_err = Some(e);
                 }
                 Err(e) => {
-                    self.emit(ObserveEvent::UpstreamOutcome {
+                    observe(&|correlation_id| ObserveEvent::UpstreamOutcome {
                         correlation_id,
                         group: group.clone(),
                         backend_index,
@@ -638,6 +722,109 @@ impl Resolver {
             }
         }
         Err(last_err.expect("at least one backend was tried since backends is non-empty"))
+    }
+
+    /// Starts a background refresh of `cached` when prefetch is due; see
+    /// [`Prefetch`] for the conditions. Never fails and never blocks: when any
+    /// condition is not met, or no Tokio runtime is available, nothing
+    /// happens. No sink callback runs here, so holding the task-set lock is
+    /// safe.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_prefetch(
+        self: &Arc<Self>,
+        prefetch: &Prefetch,
+        background: &Mutex<JoinSet<()>>,
+        query: &Message,
+        group: &UpstreamGroupId,
+        key: &KeyBuf,
+        hash: u64,
+        cached: &Arc<CachedAnswer>,
+        now: Instant,
+    ) {
+        let hits = cached
+            .hits
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if hits < prefetch.min_hits_value() {
+            return;
+        }
+        let lifetime = cached.expires.saturating_duration_since(cached.inserted);
+        let remaining = cached.expires.saturating_duration_since(now);
+        if remaining.as_nanos() * 100
+            > lifetime.as_nanos() * u128::from(prefetch.threshold_percent_value())
+        {
+            return;
+        }
+        // Without a runtime there is nowhere to run the refresh.
+        let Ok(handle) = Handle::try_current() else {
+            return;
+        };
+        let mut tasks = lock(background);
+        while tasks.try_join_next().is_some() {}
+        if tasks.len() >= MAX_REFRESH_TASKS {
+            return;
+        }
+        if cached.refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // A refresh is a coalescing leader: if another query is already
+        // fetching this key, there is nothing to add.
+        let guard = match &self.flights {
+            Some(flights) => {
+                match flights.join_or_lead(flights.hash(key.as_bytes()), key.as_bytes()) {
+                    Join::Lead(guard) => Some(guard),
+                    Join::Follow(_) => return,
+                }
+            }
+            None => None,
+        };
+        let task = Arc::clone(self).refresh(query.clone(), group.clone(), key.clone(), hash, guard);
+        tasks.spawn_on(task, &handle);
+    }
+
+    /// Fetches a fresh answer for a popular entry in the background and
+    /// stores it, as a coalescing leader. Emits only cache events.
+    async fn refresh(
+        self: Arc<Self>,
+        query: Message,
+        group: UpstreamGroupId,
+        key: KeyBuf,
+        hash: u64,
+        guard: Option<LeaderGuard>,
+    ) {
+        let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        self.counters.refreshes.fetch_add(1, Ordering::Relaxed);
+        self.emit_cache(CacheEvent::RefreshStarted {
+            correlation_id,
+            group: group.clone(),
+        });
+        let refreshed = match (&self.cache, self.backends.get(&group)) {
+            (Some(store), Some(backends)) => {
+                let now = self.clock.now();
+                let epoch = self.cache_epoch.load(Ordering::Acquire);
+                let result = self
+                    .query_upstream(
+                        &query,
+                        &group,
+                        backends,
+                        None,
+                        Some((store, &key, hash)),
+                        now,
+                        epoch,
+                    )
+                    .await;
+                if let Some(guard) = guard {
+                    guard.finish(|| outcome_of(&result));
+                }
+                matches!(result, Ok((_, _, true)))
+            }
+            _ => false,
+        };
+        self.emit_cache(CacheEvent::RefreshCompleted {
+            correlation_id,
+            group,
+            refreshed,
+        });
     }
 
     fn emit(&self, event: ObserveEvent) {
@@ -958,6 +1145,19 @@ fn parse_reverse_name(name: &Name) -> Option<std::net::IpAddr> {
     None
 }
 
+/// What one upstream resolution produced: the answer, its normalised cache
+/// entry when it is cacheable, and whether that entry was stored.
+type UpstreamAnswer = (Message, Option<Arc<CachedAnswer>>, bool);
+
+/// The outcome a coalescing leader publishes for `result`.
+fn outcome_of(result: &Result<UpstreamAnswer>) -> Outcome {
+    match result {
+        Ok((_, Some(entry), _)) => Outcome::Cached(Arc::clone(entry)),
+        Ok((answer, None, _)) => Outcome::Raw(Arc::new(answer.clone())),
+        Err(error) => Outcome::Failed(error.clone()),
+    }
+}
+
 /// Returns whether `err` should cause the failover loop to try the next
 /// backend in the group rather than propagate immediately: all three
 /// backend-level failure variants —
@@ -1055,11 +1255,11 @@ fn cacheable_answer(
     if ttl == 0 {
         return None;
     }
-    Some(CachedAnswer {
+    Some(CachedAnswer::new(
         message,
         inserted,
-        expires: inserted + Duration::from_secs(u64::from(ttl)),
-    })
+        inserted + Duration::from_secs(u64::from(ttl)),
+    ))
 }
 
 /// Builds a [`Resolver`] from a split-DNS policy and one or more upstream
@@ -1173,22 +1373,26 @@ impl ResolverBuilder {
             .store_enabled()
             .then(|| Store::new(self.cache.max_bytes_value(), self.cache.shards_value()));
         Resolver {
-            policy: self.policy,
-            backends: self.backends,
-            group_index,
-            clock: self.clock,
-            cache,
-            ttl_policy: self.cache.ttl_policy(),
-            flights: self
-                .cache
-                .coalesce_enabled()
-                .then(|| Arc::new(Flights::new())),
-            cache_epoch: AtomicU64::new(0),
-            counters: QueryCounters::default(),
-            fake_ip: self.fake_ip,
-            route_hook: self.route_hook,
-            observability_sink: self.observability_sink,
-            next_correlation_id: AtomicU64::new(1),
+            inner: Arc::new(ResolverInner {
+                policy: self.policy,
+                backends: self.backends,
+                group_index,
+                clock: self.clock,
+                cache,
+                ttl_policy: self.cache.ttl_policy(),
+                flights: self
+                    .cache
+                    .coalesce_enabled()
+                    .then(|| Arc::new(Flights::new())),
+                cache_epoch: AtomicU64::new(0),
+                prefetch: self.cache.prefetch_policy().cloned(),
+                counters: QueryCounters::default(),
+                fake_ip: self.fake_ip,
+                route_hook: self.route_hook,
+                observability_sink: self.observability_sink,
+                next_correlation_id: AtomicU64::new(1),
+            }),
+            background: Mutex::new(JoinSet::new()),
         }
     }
 }
@@ -1759,6 +1963,9 @@ mod tests {
             a_answer("example.com", 300),
             FakeClock::new(),
         );
+        let base = Arc::try_unwrap(base.inner)
+            .ok()
+            .expect("the resolver is not shared");
         let resolver = ResolverBuilder {
             policy: base.policy,
             backends: base.backends,
@@ -2358,7 +2565,8 @@ mod tests {
                 })
                 .build();
             if group == "empty" {
-                resolver
+                Arc::get_mut(&mut resolver.inner)
+                    .expect("the resolver is not shared")
                     .backends
                     .insert(UpstreamGroupId::new("empty"), Vec::new());
             }
@@ -2486,7 +2694,11 @@ mod tests {
 
         entered_wait.await;
         assert!(
-            resolver.cache.as_ref().is_none_or(Store::all_unlocked),
+            resolver
+                .inner
+                .cache
+                .as_ref()
+                .is_none_or(Store::all_unlocked),
             "no cache shard lock is held across the hook await"
         );
         task.abort();
@@ -3017,6 +3229,7 @@ mod tests {
     /// Whether no cache entry keeps an OPT record.
     fn cache_holds_no_opt(resolver: &Resolver) -> bool {
         resolver
+            .inner
             .cache
             .as_ref()
             .is_none_or(|store| store.all_entries(|entry| entry.message.edns() == Ok(None)))
@@ -3024,7 +3237,7 @@ mod tests {
 
     /// The number of entries in the resolver's answer store.
     fn cache_len(resolver: &Resolver) -> usize {
-        resolver.cache.as_ref().map_or(0, Store::len)
+        resolver.inner.cache.as_ref().map_or(0, Store::len)
     }
 
     #[tokio::test]
@@ -3783,7 +3996,7 @@ mod tests {
                 assert_eq!(answer.answers.len(), 1);
             }
             assert_eq!(calls.load(Ordering::SeqCst), 3);
-            assert!(resolver.cache.is_none());
+            assert!(resolver.inner.cache.is_none());
         }
     }
 
@@ -3804,7 +4017,7 @@ mod tests {
             CacheConfig::new().max_bytes(bound).shards(1),
             a_answer("example.com", 300),
         );
-        let store = resolver.cache.as_ref().expect("enabled");
+        let store = resolver.inner.cache.as_ref().expect("enabled");
         let total = 500;
         for i in 0..total {
             resolver
@@ -3939,7 +4152,7 @@ mod tests {
             task.await.unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(resolver.cache.as_ref().unwrap().all_unlocked());
+        assert!(resolver.inner.cache.as_ref().unwrap().all_unlocked());
     }
 
     #[tokio::test]
@@ -4107,7 +4320,7 @@ mod tests {
             assert!(!answer.header.authoritative);
         }
         assert_eq!(cache_len(&gated.resolver), 1, "the answer was stored");
-        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        assert_eq!(gated.resolver.inner.flights.as_ref().unwrap().len(), 0);
         // A later arrival hits the cache: the leader stored before unregistering.
         gated
             .resolver
@@ -4177,7 +4390,7 @@ mod tests {
             assert!(matches!(result, Err(Error::Transport(text)) if text == "boom"));
         }
         assert_eq!(cache_len(&gated.resolver), 0);
-        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        assert_eq!(gated.resolver.inner.flights.as_ref().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -4218,16 +4431,16 @@ mod tests {
             () = tokio::task::yield_now() => {}
         }
         assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 1);
+        assert_eq!(gated.resolver.inner.flights.as_ref().unwrap().len(), 1);
 
         drop(leader);
-        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        assert_eq!(gated.resolver.inner.flights.as_ref().unwrap().len(), 0);
         let answer = waiter.await.unwrap();
         assert_eq!(answer.header.id, 2);
         assert_eq!(answer.answers.len(), 1);
         assert_eq!(gated.calls.load(Ordering::SeqCst), 2, "the waiter led");
         assert_eq!(cache_len(&gated.resolver), 1);
-        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        assert_eq!(gated.resolver.inner.flights.as_ref().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -4237,7 +4450,7 @@ mod tests {
         let query = query_for("example.com");
         // Hold the flight as if a first leader were working on it.
         let key = KeyBuf::new(0, RecordType::A, Class::In, true, false, &n("example.com")).unwrap();
-        let flights = resolver.flights.as_ref().unwrap();
+        let flights = resolver.inner.flights.as_ref().unwrap();
         let hash = flights.hash(key.as_bytes());
         let Join::Lead(first_leader) = flights.join_or_lead(hash, key.as_bytes()) else {
             panic!("the flight is free");
@@ -4251,10 +4464,14 @@ mod tests {
         }
         // The first leader's answer lands in the store, then the leader is
         // cancelled without publishing.
-        let store = resolver.cache.as_ref().unwrap();
+        let store = resolver.inner.cache.as_ref().unwrap();
         let now = clock.now();
-        let entry = cacheable_answer(&a_answer("example.com", 300), now, &resolver.ttl_policy)
-            .expect("cacheable");
+        let entry = cacheable_answer(
+            &a_answer("example.com", 300),
+            now,
+            &resolver.inner.ttl_policy,
+        )
+        .expect("cacheable");
         assert!(store.insert(
             store.hash(key.as_bytes()),
             key.as_bytes(),
@@ -4292,7 +4509,11 @@ mod tests {
             }
         }
         // A purge lands while the upstream query is in flight.
-        gated.resolver.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        gated
+            .resolver
+            .inner
+            .cache_epoch
+            .fetch_add(1, Ordering::SeqCst);
         gated.gate.add_permits(1);
         for future in futures {
             assert_eq!(
@@ -4420,7 +4641,9 @@ mod tests {
             0,
         );
         let mut resolver = gated.resolver;
-        resolver.observability_sink = Some(Arc::new(PanicsOnCache));
+        Arc::get_mut(&mut resolver.inner)
+            .expect("the resolver is not shared")
+            .observability_sink = Some(Arc::new(PanicsOnCache));
         let gated = Gated { resolver, ..gated };
         let queries = [
             query_with_id("example.com", 1),
@@ -4553,7 +4776,7 @@ mod tests {
         warm(&resolver, &["a.example.com"]).await;
         assert_eq!(calls.load(Ordering::SeqCst), 4, "refetched after the flush");
         assert_eq!(cache_len(&resolver), 1);
-        assert!(resolver.cache.as_ref().unwrap().all_unlocked());
+        assert!(resolver.inner.cache.as_ref().unwrap().all_unlocked());
     }
 
     #[tokio::test]
@@ -4837,5 +5060,461 @@ mod tests {
         let stats = resolver.cache_stats();
         assert_eq!((stats.hits(), stats.misses(), stats.entries()), (0, 2, 0));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Prefetch. -----------------------------------------------------------
+
+    use std::collections::VecDeque;
+
+    /// Counts a backend call that has not finished (or been dropped) yet.
+    struct InFlightGuard(Arc<AtomicUsize>);
+
+    impl InFlightGuard {
+        fn enter(counter: &Arc<AtomicUsize>) -> Self {
+            counter.fetch_add(1, Ordering::SeqCst);
+            InFlightGuard(Arc::clone(counter))
+        }
+    }
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A fake backend that plays a script of results (then 100 s answers for
+    /// example.com), holds every call until the test releases a permit, and
+    /// counts calls and calls still running.
+    struct ScriptedBackend {
+        script: Mutex<VecDeque<Result<Message>>>,
+        calls: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+        in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpstreamBackend for ScriptedBackend {
+        async fn resolve(&self, query: &Message) -> Result<Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _running = InFlightGuard::enter(&self.in_flight);
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            let next = self.script.lock().expect("poisoned").pop_front();
+            next.unwrap_or_else(|| Ok(a_answer("example.com", 100)))
+                .map(|mut answer| {
+                    answer.header.id = query.header.id;
+                    answer
+                })
+        }
+    }
+
+    struct Prefetching {
+        resolver: Resolver,
+        calls: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+        in_flight: Arc<AtomicUsize>,
+        clock: FakeClock,
+        log: Arc<EventLog>,
+    }
+
+    /// A resolver on a fake clock whose single backend plays `script`; the
+    /// gate starts with one permit, for the first query.
+    fn prefetching(config: CacheConfig, script: Vec<Result<Message>>) -> Prefetching {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(1));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let clock = FakeClock::new();
+        let log = Arc::new(EventLog::default());
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .clock(clock.clone())
+        .cache(config)
+        .observability_sink(log.clone())
+        .backend(
+            UpstreamGroupId::new("g"),
+            ScriptedBackend {
+                script: Mutex::new(script.into()),
+                calls: calls.clone(),
+                gate: gate.clone(),
+                in_flight: in_flight.clone(),
+            },
+        )
+        .build();
+        Prefetching {
+            resolver,
+            calls,
+            gate,
+            in_flight,
+            clock,
+            log,
+        }
+    }
+
+    /// Lets every spawned task run until it parks again (single thread, no
+    /// timers, so a fixed number of yields is deterministic).
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn secs(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    fn cache_events(p: &Prefetching) -> Vec<CacheEvent> {
+        p.log.cache.lock().expect("poisoned").clone()
+    }
+
+    fn upstream_attempts(p: &Prefetching) -> usize {
+        p.log
+            .observed
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .filter(|event| matches!(event, ObserveEvent::UpstreamAttempt { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_popular_entry_is_refreshed_once_before_it_expires() {
+        let p = prefetching(CacheConfig::new().prefetch(Some(Prefetch::new())), vec![]);
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap(); // stored at t=0, ttl 100
+        p.clock.advance(secs(50));
+        p.resolver.resolve(&query).await.unwrap(); // hit 1, outside the window
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 0);
+
+        p.clock.advance(secs(41)); // t=91: 9 s of 100 s remain
+        p.gate.add_permits(1);
+        let answer = p.resolver.resolve(&query).await.unwrap(); // hit 2
+        assert_eq!(answer.answers[0].ttl, 9, "the hit is served from the cache");
+        settle().await;
+
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "one refresh");
+        let stats = p.resolver.cache_stats();
+        assert_eq!(stats.refreshes(), 1);
+        assert_eq!((stats.hits(), stats.misses(), stats.inserts()), (2, 1, 2));
+        let events = cache_events(&p);
+        let [
+            CacheEvent::RefreshStarted {
+                correlation_id: started,
+                group,
+            },
+            CacheEvent::RefreshCompleted {
+                correlation_id: completed,
+                refreshed: true,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("unexpected cache events: {events:?}");
+        };
+        assert_eq!(started, completed);
+        assert_eq!(group, &UpstreamGroupId::new("g"));
+        assert_eq!(upstream_attempts(&p), 1, "a refresh emits no ObserveEvent");
+
+        // The old entry would be gone at t=100; the refreshed one lives on.
+        p.clock.advance(secs(9));
+        let answer = p.resolver.resolve(&query).await.unwrap();
+        assert_eq!(answer.answers[0].ttl, 91);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefetch_is_off_by_default() {
+        let p = prefetching(CacheConfig::new(), vec![]);
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        for _ in 0..4 {
+            p.resolver.resolve(&query).await.unwrap();
+        }
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 0);
+        assert!(cache_events(&p).is_empty());
+    }
+
+    #[tokio::test]
+    async fn min_hits_gates_the_refresh() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(5))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(91));
+        for _ in 0..4 {
+            p.resolver.resolve(&query).await.unwrap(); // hits 1..=4
+        }
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1, "too few hits");
+
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query).await.unwrap(); // hit 5
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 1);
+    }
+
+    #[tokio::test]
+    async fn threshold_percent_sets_the_window() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().threshold_percent(50).min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(49)); // 51 s remain: more than half
+        p.resolver.resolve(&query).await.unwrap();
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+
+        p.clock.advance(secs(1)); // exactly half remains
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query).await.unwrap();
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_hits_start_a_single_refresh() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        // The refresh blocks in the backend: no permit yet.
+        for id in 0..6 {
+            p.resolver
+                .resolve(&query_with_id("example.com", id))
+                .await
+                .unwrap();
+        }
+        settle().await;
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            2,
+            "initial query + one refresh"
+        );
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 1);
+        assert_eq!(cache_events(&p).len(), 1, "started, not completed");
+
+        p.gate.add_permits(1);
+        settle().await;
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(cache_events(&p).len(), 2);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_query_arriving_during_a_refresh_joins_it() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        p.resolver.resolve(&query).await.unwrap(); // starts the refresh
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+
+        // The old entry has expired; the refresh is still running.
+        p.clock.advance(secs(5));
+        let joined = query_with_id("example.com", 77);
+        let mut future = Box::pin(p.resolver.resolve(&joined));
+        tokio::select! {
+            biased;
+            _ = future.as_mut() => panic!("must wait for the refresh"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "no second upstream call");
+        assert_eq!(p.resolver.cache_stats().coalesced(), 1);
+
+        p.gate.add_permits(1);
+        let answer = future.await.unwrap();
+        assert_eq!(answer.header.id, 77);
+        assert_eq!(answer.answers[0].ttl, 95, "stored when the refresh began");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cache_events(&p)
+                .iter()
+                .any(|event| matches!(event, CacheEvent::Coalesced { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_resolver_aborts_a_running_refresh() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        p.resolver.resolve(&query).await.unwrap();
+        settle().await;
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 1, "refresh is running");
+
+        let Prefetching {
+            resolver,
+            in_flight,
+            gate,
+            log,
+            ..
+        } = p;
+        drop(resolver);
+        settle().await;
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "the refresh was aborted"
+        );
+        gate.add_permits(1);
+        settle().await;
+        let events = log.cache.lock().expect("poisoned").clone();
+        assert_eq!(events.len(), 1, "an aborted refresh never completes");
+    }
+
+    /// Polls `future` once with a no-op waker and no Tokio runtime.
+    fn poll_ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the fake backend answers immediately"),
+        }
+    }
+
+    #[test]
+    fn without_a_runtime_a_due_hit_neither_panics_nor_refreshes() {
+        assert!(Handle::try_current().is_err(), "no runtime on this thread");
+        let (resolver, calls, clock) = configured_resolver(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            a_answer("example.com", 100),
+        );
+        let query = query_for("example.com");
+        poll_ready(resolver.resolve(&query)).unwrap();
+        clock.advance(secs(95));
+        for _ in 0..3 {
+            let answer = poll_ready(resolver.resolve(&query)).unwrap();
+            assert_eq!(answer.answers[0].ttl, 5);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.cache_stats().refreshes(), 0);
+        assert!(lock(&resolver.background).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_leaves_the_entry_and_is_not_retried() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![Ok(a_answer("example.com", 100)), Err(Error::Timeout)],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query).await.unwrap(); // starts the failing refresh
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            cache_events(&p).last(),
+            Some(CacheEvent::RefreshCompleted {
+                refreshed: false,
+                ..
+            })
+        ));
+
+        // The old entry still answers and no further refresh is attempted.
+        p.clock.advance(secs(2));
+        for _ in 0..3 {
+            let answer = p.resolver.resolve(&query).await.unwrap();
+            assert_eq!(answer.answers[0].ttl, 3);
+        }
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_flush_during_a_refresh_stops_it_from_storing() {
+        let p = prefetching(
+            CacheConfig::new().prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        p.resolver.resolve(&query).await.unwrap();
+        settle().await;
+        assert_eq!(p.resolver.clear_cache(), 1);
+
+        p.gate.add_permits(1);
+        settle().await;
+        assert_eq!(
+            cache_len(&p.resolver),
+            0,
+            "the refreshed answer was not stored"
+        );
+        assert!(matches!(
+            cache_events(&p).last(),
+            Some(CacheEvent::RefreshCompleted {
+                refreshed: false,
+                ..
+            })
+        ));
+        assert_eq!(p.resolver.inner.flights.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_needs_the_store() {
+        let p = prefetching(
+            CacheConfig::disabled().prefetch(Some(Prefetch::new().min_hits(0))),
+            vec![],
+        );
+        p.gate.add_permits(2);
+        for _ in 0..3 {
+            p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        }
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(p.resolver.cache_stats().refreshes(), 0);
+        assert!(cache_events(&p).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_without_coalescing_still_replaces_the_entry() {
+        let p = prefetching(
+            CacheConfig::new()
+                .coalesce(false)
+                .prefetch(Some(Prefetch::new().min_hits(1))),
+            vec![],
+        );
+        let query = query_for("example.com");
+        p.resolver.resolve(&query).await.unwrap();
+        p.clock.advance(secs(95));
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query).await.unwrap();
+        settle().await;
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        p.clock.advance(secs(5));
+        let answer = p.resolver.resolve(&query).await.unwrap();
+        assert_eq!(answer.answers[0].ttl, 95);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
     }
 }

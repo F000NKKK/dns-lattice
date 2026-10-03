@@ -167,8 +167,15 @@ that coalescing.
 flush cached answers (for example after a network or VPN change) and return the number of
 entries removed; a flush also stops in-flight queries from storing the answer they were
 fetching. `Resolver::cache_stats()` returns a `CacheStats` snapshot (entries, estimated
-bytes, hits, misses, coalesced queries, inserts, evictions, expirations and oversized
-rejections).
+bytes, hits, misses, coalesced queries, inserts, evictions, expirations, oversized
+rejections and background refreshes).
+
+**Prefetch.** Opt-in via `CacheConfig::prefetch(Some(Prefetch::new()))`: a fresh hit on an
+entry that has served at least two hits and has at most 10% of its lifetime left starts one
+background refresh of that entry on the current Tokio runtime (none outside a runtime). The
+refresh shares the in-flight registry with ordinary misses, never duplicates an upstream
+call, emits `CacheEvent::RefreshStarted`/`RefreshCompleted` rather than `ObserveEvent`s, and
+is aborted when the `Resolver` is dropped. Without prefetch the resolver spawns no tasks.
 
 Details: [ARCHITECTURE.md](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#resolver-data-flow)
 and [docs.rs](https://docs.rs/dns-lattice).

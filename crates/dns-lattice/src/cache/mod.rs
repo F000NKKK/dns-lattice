@@ -9,7 +9,9 @@
 //! as a whole to make room.
 //!
 //! Concurrent misses for the same question share one upstream query; see
-//! [`CacheConfig::coalesce`].
+//! [`CacheConfig::coalesce`]. Popular entries can be refreshed shortly before
+//! they expire with the opt-in [`Prefetch`]; it is the only part of the cache
+//! that spawns tasks.
 //!
 //! The cache can be flushed with [`crate::engine::Resolver::clear_cache`],
 //! [`crate::engine::Resolver::purge`] and
@@ -129,6 +131,104 @@ pub struct CacheConfig {
     negative: TtlBounds,
     negative_without_soa: Option<u32>,
     coalesce: bool,
+    prefetch: Option<Prefetch>,
+}
+
+/// Smallest accepted prefetch threshold, in percent of an entry's lifetime.
+const MIN_PREFETCH_PERCENT: u8 = 1;
+
+/// Largest accepted prefetch threshold, in percent of an entry's lifetime.
+const MAX_PREFETCH_PERCENT: u8 = 50;
+
+/// Default prefetch threshold: the last tenth of an entry's lifetime.
+const DEFAULT_PREFETCH_PERCENT: u8 = 10;
+
+/// Default number of hits an entry needs before it is prefetched.
+const DEFAULT_PREFETCH_MIN_HITS: u32 = 2;
+
+/// Opt-in refresh of popular cache entries shortly before they expire; pass
+/// it to [`CacheConfig::prefetch`].
+///
+/// A *fresh* cache hit starts a background refresh when all of these hold:
+///
+/// - the entry's remaining lifetime is at most
+///   [`threshold_percent`](Prefetch::threshold_percent) of its whole lifetime
+///   (10 % by default);
+/// - the entry has served at least [`min_hits`](Prefetch::min_hits) hits (2 by
+///   default), counted from the moment it was stored, so a name asked for
+///   once is left to expire;
+/// - no refresh of this entry has been started yet (each stored entry is
+///   refreshed at most once, so an unreachable upstream is tried once per
+///   entry rather than on every hit), the number of refreshes running at the
+///   same time is below 256, and the caller is inside a Tokio runtime.
+///   Otherwise the hit is served normally and nothing is refreshed.
+///
+/// The refresh sends a copy of the triggering query to the same upstream group
+/// the hit was served from, without running the route hook again. It joins the
+/// same in-flight registry as ordinary misses, so it never duplicates an
+/// upstream call that is already running, and a query that arrives while it
+/// runs shares its result (unless coalescing is turned off). A successful,
+/// cacheable answer replaces the entry; an error or an uncacheable answer
+/// leaves the old entry to expire normally. The refresh emits
+/// [`CacheEvent::RefreshStarted`](crate::observability::CacheEvent::RefreshStarted)
+/// and
+/// [`CacheEvent::RefreshCompleted`](crate::observability::CacheEvent::RefreshCompleted)
+/// and no [`ObserveEvent`](crate::observability::ObserveEvent).
+///
+/// ```
+/// use dns_lattice::cache::{CacheConfig, Prefetch};
+///
+/// let config = CacheConfig::new().prefetch(Some(Prefetch::new().threshold_percent(20).min_hits(3)));
+/// # let _ = config;
+/// ```
+#[derive(Debug, Clone)]
+pub struct Prefetch {
+    threshold_percent: u8,
+    min_hits: u32,
+}
+
+impl Default for Prefetch {
+    fn default() -> Self {
+        Prefetch::new()
+    }
+}
+
+impl Prefetch {
+    /// The default policy: refresh in the last 10 % of an entry's lifetime,
+    /// once it has served at least 2 hits.
+    pub fn new() -> Self {
+        Prefetch {
+            threshold_percent: DEFAULT_PREFETCH_PERCENT,
+            min_hits: DEFAULT_PREFETCH_MIN_HITS,
+        }
+    }
+
+    /// Sets the share of an entry's lifetime, counted back from its expiry,
+    /// in which a hit starts a refresh. Clamped to `1..=50`.
+    #[must_use]
+    pub fn threshold_percent(mut self, percent: u8) -> Self {
+        self.threshold_percent = percent.clamp(MIN_PREFETCH_PERCENT, MAX_PREFETCH_PERCENT);
+        self
+    }
+
+    /// Sets how many hits an entry must have served, since it was stored,
+    /// before a hit can start a refresh. `0` and `1` both mean the first
+    /// hit already can.
+    #[must_use]
+    pub fn min_hits(mut self, hits: u32) -> Self {
+        self.min_hits = hits;
+        self
+    }
+
+    /// The threshold in percent.
+    pub(crate) fn threshold_percent_value(&self) -> u8 {
+        self.threshold_percent
+    }
+
+    /// The hit count a refresh needs.
+    pub(crate) fn min_hits_value(&self) -> u32 {
+        self.min_hits
+    }
 }
 
 impl Default for CacheConfig {
@@ -155,6 +255,7 @@ impl CacheConfig {
             },
             negative_without_soa: Some(DEFAULT_NEGATIVE_WITHOUT_SOA),
             coalesce: true,
+            prefetch: None,
         }
     }
 
@@ -244,6 +345,25 @@ impl CacheConfig {
         self
     }
 
+    /// Enables (`Some`) or disables (`None`, the default) prefetch: refreshing
+    /// popular entries in the background shortly before they expire, so a
+    /// busy name never turns into a miss.
+    ///
+    /// Prefetch is the only cache feature that spawns tasks: each refresh
+    /// runs on the Tokio runtime that served the triggering hit, and is
+    /// aborted when the [`crate::engine::Resolver`] is dropped. See
+    /// [`Prefetch`] for the trigger and its limits.
+    #[must_use]
+    pub fn prefetch(mut self, policy: Option<Prefetch>) -> Self {
+        self.prefetch = policy;
+        self
+    }
+
+    /// The prefetch policy, if enabled.
+    pub(crate) fn prefetch_policy(&self) -> Option<&Prefetch> {
+        self.prefetch.as_ref()
+    }
+
     /// Whether the configuration describes an enabled store.
     pub(crate) fn store_enabled(&self) -> bool {
         self.max_bytes > 0
@@ -297,6 +417,7 @@ pub struct CacheStats {
     pub(crate) evictions: u64,
     pub(crate) expirations: u64,
     pub(crate) oversized_rejected: u64,
+    pub(crate) refreshes: u64,
 }
 
 impl CacheStats {
@@ -319,7 +440,11 @@ impl CacheStats {
         self.capacity_bytes
     }
 
-    /// Queries answered from the store.
+    /// Queries answered from the store at their first lookup. A query that
+    /// missed, led an upstream call and then found an answer stored by
+    /// another query in the meantime was answered from the store too, but
+    /// counts as a miss (it reported `CacheMiss`), so under concurrency this
+    /// figure can be slightly below the number of queries the store served.
     pub fn hits(&self) -> u64 {
         self.hits
     }
@@ -327,6 +452,7 @@ impl CacheStats {
     /// Queries not answered from the store at lookup, including queries that
     /// bypass the cache, and every query when the store is disabled. A
     /// coalesced follower counts here too: it missed, then shared a result.
+    /// Background refreshes are not queries and are not counted.
     pub fn misses(&self) -> u64 {
         self.misses
     }
@@ -357,6 +483,12 @@ impl CacheStats {
     pub fn oversized_rejected(&self) -> u64 {
         self.oversized_rejected
     }
+
+    /// Background refreshes started by [`Prefetch`]. A refresh is counted
+    /// when its task begins, whatever its outcome.
+    pub fn refreshes(&self) -> u64 {
+        self.refreshes
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +513,31 @@ mod tests {
         );
         assert_eq!(policy.negative, TtlBounds { min: 0, max: 3_600 });
         assert_eq!(policy.negative_without_soa, Some(60));
+    }
+
+    #[test]
+    fn prefetch_is_off_by_default_and_its_defaults_match_the_documentation() {
+        assert!(CacheConfig::new().prefetch_policy().is_none());
+        let prefetch = Prefetch::default();
+        assert_eq!(prefetch.threshold_percent_value(), 10);
+        assert_eq!(prefetch.min_hits_value(), 2);
+        let config = CacheConfig::new().prefetch(Some(prefetch));
+        assert!(config.prefetch_policy().is_some());
+        assert!(config.prefetch(None).prefetch_policy().is_none());
+    }
+
+    #[test]
+    fn prefetch_threshold_is_clamped_to_one_through_fifty_percent() {
+        for (requested, expected) in [(0, 1), (1, 1), (10, 10), (50, 50), (51, 50), (255, 50)] {
+            assert_eq!(
+                Prefetch::new()
+                    .threshold_percent(requested)
+                    .threshold_percent_value(),
+                expected,
+                "threshold_percent({requested})"
+            );
+        }
+        assert_eq!(Prefetch::new().min_hits(7).min_hits_value(), 7);
     }
 
     #[test]

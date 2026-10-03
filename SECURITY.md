@@ -65,6 +65,13 @@ coalescing, so a client-specific answer is never shared between clients.
 answers on demand, and `Resolver::cache_stats` reports the cache's size and
 eviction counters so an operator can watch its pressure.
 
+Cache prefetch (`CacheConfig::prefetch`) is off by default; with it, a hit on
+a popular entry close to its expiry starts one background upstream query per
+entry, at most 256 at a time, each sharing the in-flight registry so it never
+duplicates a query already running, and aborted when the resolver is dropped.
+It adds upstream traffic of at most one query per stored entry lifetime, so
+size `min_hits` and the threshold with the upstream's rate limits in mind.
+
 ## Scope
 
 The supported `1.x` release surface includes the hand-rolled DNS message model

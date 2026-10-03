@@ -45,6 +45,30 @@ pub enum CacheEvent {
         /// The group whose upstream call was joined.
         group: UpstreamGroupId,
     },
+    /// A background refresh of a popular cache entry began (see
+    /// [`Prefetch`](crate::cache::Prefetch)). It belongs to no client query:
+    /// its `correlation_id` is fresh, shared only with the matching
+    /// [`CacheEvent::RefreshCompleted`], and no [`ObserveEvent`] carries it.
+    #[non_exhaustive]
+    RefreshStarted {
+        /// Opaque identifier of this refresh.
+        correlation_id: u64,
+        /// The group whose upstream backends are queried.
+        group: UpstreamGroupId,
+    },
+    /// A background refresh finished. It is not emitted when the refresh is
+    /// cancelled because the resolver was dropped.
+    #[non_exhaustive]
+    RefreshCompleted {
+        /// The identifier of the matching [`CacheEvent::RefreshStarted`].
+        correlation_id: u64,
+        /// The group whose upstream backends were queried.
+        group: UpstreamGroupId,
+        /// Whether a fresh answer replaced the cached entry. `false` after an
+        /// upstream error, an answer that cannot be cached, or a flush that
+        /// happened while the refresh was running.
+        refreshed: bool,
+    },
 }
 
 /// Immutable event emitted by an opted-in resolver.

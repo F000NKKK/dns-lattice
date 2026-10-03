@@ -41,6 +41,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -94,6 +95,24 @@ pub(crate) struct CachedAnswer {
     pub(crate) inserted: Instant,
     /// `inserted` plus the entry TTL; the entry is a miss from this instant.
     pub(crate) expires: Instant,
+    /// Fresh hits served from this entry (used only by prefetch).
+    pub(crate) hits: AtomicU32,
+    /// Set once a background refresh of this entry has been started, so each
+    /// entry is refreshed at most once.
+    pub(crate) refreshing: AtomicBool,
+}
+
+impl CachedAnswer {
+    /// A new entry with no hits and no refresh started.
+    pub(crate) fn new(message: Message, inserted: Instant, expires: Instant) -> Self {
+        CachedAnswer {
+            message,
+            inserted,
+            expires,
+            hits: AtomicU32::new(0),
+            refreshing: AtomicBool::new(false),
+        }
+    }
 }
 
 /// The canonical cache key of one query, built in a fixed stack buffer so a
@@ -102,6 +121,7 @@ pub(crate) struct CachedAnswer {
 /// Layout: group index (`u32`) | type (`u16`) | class (`u16`) | shape bits
 /// (`u8`: bit 0 RD, bit 1 DO) | the question name in uncompressed, lowercased
 /// wire form.
+#[derive(Clone)]
 pub(crate) struct KeyBuf {
     bytes: [u8; MAX_KEY_LEN],
     len: usize,
@@ -842,11 +862,11 @@ mod tests {
     }
 
     fn entry(base: Instant, ttl: u64, txt_bytes: usize) -> Arc<CachedAnswer> {
-        Arc::new(CachedAnswer {
-            message: message(txt_bytes),
-            inserted: base,
-            expires: base + Duration::from_secs(ttl),
-        })
+        Arc::new(CachedAnswer::new(
+            message(txt_bytes),
+            base,
+            base + Duration::from_secs(ttl),
+        ))
     }
 
     fn key(i: usize) -> Vec<u8> {
@@ -1331,11 +1351,11 @@ mod tests {
         assert_eq!(store.stats().expirations, 1);
 
         // An oversized entry is counted and not inserted.
-        let huge = Arc::new(CachedAnswer {
-            message: message(20_000),
-            inserted: base,
-            expires: base + Duration::from_secs(300),
-        });
+        let huge = Arc::new(CachedAnswer::new(
+            message(20_000),
+            base,
+            base + Duration::from_secs(300),
+        ));
         let k = key(5_000);
         assert!(!store.insert(store.hash(&k), &k, huge, base));
         assert_eq!(store.stats().oversized_rejected, 1);

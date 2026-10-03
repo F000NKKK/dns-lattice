@@ -330,6 +330,12 @@ mod facade_path_tests {
             engine::ResolverBuilder::cache;
         let _: fn(cache::CacheConfig, bool) -> cache::CacheConfig = cache::CacheConfig::coalesce;
         let _: Option<cache::CacheStats> = None;
+        let _: fn() -> cache::Prefetch = cache::Prefetch::new;
+        let _: fn(cache::Prefetch, u8) -> cache::Prefetch = cache::Prefetch::threshold_percent;
+        let _: fn(cache::Prefetch, u32) -> cache::Prefetch = cache::Prefetch::min_hits;
+        let _: fn(cache::CacheConfig, Option<cache::Prefetch>) -> cache::CacheConfig =
+            cache::CacheConfig::prefetch;
+        let _: fn(&cache::CacheStats) -> u64 = cache::CacheStats::refreshes;
         let _: fn(&engine::Resolver) -> usize = engine::Resolver::clear_cache;
         let _: fn(&engine::Resolver, &model::Name, Option<model::RecordType>) -> usize =
             engine::Resolver::purge;
