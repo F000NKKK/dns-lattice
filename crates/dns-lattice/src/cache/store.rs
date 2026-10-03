@@ -41,10 +41,11 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher, RandomState};
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use dns_lattice_core::Error;
 use dns_lattice_model::{Class, Message, Name, RData, RecordType, ResourceRecord};
 
 /// Longest key: group (4) + type (2) + class (2) + shape (1) + a name's wire
@@ -93,13 +94,32 @@ pub(crate) struct CachedAnswer {
     /// The instant captured before the upstream call; TTLs count down from
     /// here.
     pub(crate) inserted: Instant,
-    /// `inserted` plus the entry TTL; the entry is a miss from this instant.
+    /// `inserted` plus the entry TTL; the entry is a miss from this instant
+    /// (for a failure entry, the failure is served only until then).
     pub(crate) expires: Instant,
+    /// The instant the store drops the entry: `expires`, or later when it is
+    /// kept for serve-stale (an answer) or to remember a failure's backoff.
+    pub(crate) stale_until: Instant,
     /// Fresh hits served from this entry (used only by prefetch).
     pub(crate) hits: AtomicU32,
     /// Set once a background refresh of this entry has been started, so each
     /// entry is refreshed at most once.
     pub(crate) refreshing: AtomicBool,
+    /// While the entry is expired and a refresh has just failed: nanoseconds
+    /// after `inserted` until which the stale answer is served without asking
+    /// the upstream again. 0 means no such window.
+    recheck_after: AtomicU64,
+    /// Present on a cached upstream failure instead of an answer.
+    pub(crate) failure: Option<FailureState>,
+}
+
+/// What a cached upstream failure (RFC 9520) remembers.
+pub(crate) struct FailureState {
+    /// The resolution error, or `None` when the failure is the `SERVFAIL` or
+    /// `REFUSED` answer in [`CachedAnswer::message`].
+    pub(crate) error: Option<Error>,
+    /// How long this failure is served; the next one doubles it.
+    pub(crate) backoff: Duration,
 }
 
 impl CachedAnswer {
@@ -109,9 +129,49 @@ impl CachedAnswer {
             message,
             inserted,
             expires,
+            stale_until: expires,
             hits: AtomicU32::new(0),
             refreshing: AtomicBool::new(false),
+            recheck_after: AtomicU64::new(0),
+            failure: None,
         }
+    }
+
+    /// Keeps the entry in the store for `window` after it expires, so it can
+    /// still be served stale.
+    pub(crate) fn retained_for(mut self, window: Duration) -> Self {
+        self.stale_until = self.expires + window;
+        self
+    }
+
+    /// A cached failure served for `backoff` from `inserted`, then remembered
+    /// for `retain` more so the next failure can back off further.
+    pub(crate) fn failure(
+        message: Message,
+        error: Option<Error>,
+        inserted: Instant,
+        backoff: Duration,
+        retain: Duration,
+    ) -> Self {
+        let mut entry =
+            CachedAnswer::new(message, inserted, inserted + backoff).retained_for(retain);
+        entry.failure = Some(FailureState { error, backoff });
+        entry
+    }
+
+    /// Whether a failed refresh has put the entry in its recheck window at
+    /// `now`.
+    pub(crate) fn recheck_pending(&self, now: Instant) -> bool {
+        let after = self.recheck_after.load(Ordering::Relaxed);
+        let elapsed = now.saturating_duration_since(self.inserted).as_nanos();
+        after != 0 && u64::try_from(elapsed).unwrap_or(u64::MAX) < after
+    }
+
+    /// Starts (or extends) the recheck window until `until`.
+    pub(crate) fn defer_recheck(&self, until: Instant) {
+        let nanos = until.saturating_duration_since(self.inserted).as_nanos();
+        let nanos = u64::try_from(nanos).unwrap_or(u64::MAX).max(1);
+        self.recheck_after.fetch_max(nanos, Ordering::Relaxed);
     }
 }
 
@@ -317,6 +377,7 @@ struct Slot {
     hash: u64,
     entry: Arc<CachedAnswer>,
     cost: usize,
+    /// When the store drops the slot: the entry's `stale_until`.
     expires: Instant,
     freq: u8,
     queue: Queue,
@@ -512,6 +573,20 @@ impl Shard {
         Some(Arc::clone(&slot.entry))
     }
 
+    /// Removes the slot for `key` if it holds a cached failure; returns
+    /// whether it did.
+    fn forget_failure(&mut self, hash: u64, key: &[u8]) -> bool {
+        let Some(&index) = self.map.get(&hash) else {
+            return false;
+        };
+        let slot = self.slot(index);
+        if *slot.key != *key || slot.entry.failure.is_none() {
+            return false;
+        }
+        self.remove_slot(index);
+        true
+    }
+
     fn insert(&mut self, hash: u64, key: &[u8], entry: Arc<CachedAnswer>, now: Instant) -> bool {
         let cost = entry_cost(key.len(), &entry);
         // The newer answer replaces whatever the hash maps to; a key that was
@@ -535,7 +610,7 @@ impl Shard {
         let slot = Slot {
             key: key.into(),
             hash,
-            expires: entry.expires,
+            expires: entry.stale_until,
             entry,
             cost,
             freq: 0,
@@ -700,10 +775,18 @@ impl Store {
         &self.shards[(hash >> 32) as usize & self.mask]
     }
 
-    /// Returns the fresh entry for `key`, cloning only its [`Arc`] under the
-    /// shard lock. An entry found expired at `now` is removed.
+    /// Returns the entry for `key`, cloning only its [`Arc`] under the shard
+    /// lock. The entry may be past its `expires` (kept for serve-stale or a
+    /// failure's backoff): the caller decides what that means. An entry found
+    /// past its `stale_until` at `now` is removed.
     pub(crate) fn get(&self, hash: u64, key: &[u8], now: Instant) -> Option<Arc<CachedAnswer>> {
         lock(self.shard(hash)).get(hash, key, now)
+    }
+
+    /// Removes a cached failure stored under `key`, if that is what the slot
+    /// holds (an answer is left alone). Returns whether one was removed.
+    pub(crate) fn forget_failure(&self, hash: u64, key: &[u8]) -> bool {
+        lock(self.shard(hash)).forget_failure(hash, key)
     }
 
     /// Stores `entry` under `key`, evicting until its shard is within budget.
@@ -1370,5 +1453,91 @@ mod tests {
             (after.inserts, after.evictions, after.expirations),
             (before.inserts, before.evictions, before.expirations)
         );
+    }
+
+    #[test]
+    fn a_retained_entry_is_returned_after_expiry_and_removed_after_retention() {
+        let base = Instant::now();
+        let store = Store::new(64 * 1024, Some(1));
+        let k = key(1);
+        let retained = Arc::new(
+            CachedAnswer::new(message(0), base, base + Duration::from_secs(10))
+                .retained_for(Duration::from_secs(50)),
+        );
+        assert_eq!(retained.stale_until, base + Duration::from_secs(60));
+        assert!(store.insert(store.hash(&k), &k, retained, base));
+
+        let expired = base + Duration::from_secs(30);
+        let found = store.get(store.hash(&k), &k, expired).unwrap();
+        assert!(found.expires <= expired, "expired but still retained");
+        assert_eq!(store.len(), 1);
+
+        let gone = base + Duration::from_secs(61);
+        assert!(store.get(store.hash(&k), &k, gone).is_none());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn retained_entries_are_evicted_when_the_budget_is_exceeded() {
+        let base = Instant::now();
+        let budget = 16 * small_cost(base);
+        let store = Store::new(budget, Some(1));
+        for i in 0..200 {
+            let k = key(i);
+            let entry = Arc::new(
+                CachedAnswer::new(message(0), base, base + Duration::from_secs(1))
+                    .retained_for(Duration::from_secs(86_400)),
+            );
+            store.insert(store.hash(&k), &k, entry, base);
+        }
+        assert!(store.bytes() <= budget, "retention stays inside the budget");
+        assert!(store.len() < 200);
+    }
+
+    #[test]
+    fn the_recheck_window_is_per_entry_and_only_extends() {
+        let base = Instant::now();
+        let entry = CachedAnswer::new(message(0), base, base + Duration::from_secs(10));
+        let at = |seconds| base + Duration::from_secs(seconds);
+        assert!(!entry.recheck_pending(at(20)), "no window by default");
+
+        entry.defer_recheck(at(40));
+        assert!(entry.recheck_pending(at(20)));
+        assert!(entry.recheck_pending(at(39)));
+        assert!(!entry.recheck_pending(at(40)), "the window is half-open");
+
+        entry.defer_recheck(at(30)); // an earlier deadline never shortens it
+        assert!(entry.recheck_pending(at(39)));
+        entry.defer_recheck(at(50));
+        assert!(entry.recheck_pending(at(49)));
+        assert!(!entry.recheck_pending(at(50)));
+    }
+
+    #[test]
+    fn forget_failure_removes_only_a_failure_entry() {
+        let base = Instant::now();
+        let store = Store::new(64 * 1024, Some(1));
+        let failure = Arc::new(CachedAnswer::failure(
+            message(0),
+            Some(Error::Timeout),
+            base,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
+        assert!(failure.failure.is_some());
+        assert_eq!(failure.expires, base + Duration::from_secs(1));
+        assert_eq!(failure.stale_until, base + Duration::from_secs(31));
+        let (failing, answer) = (key(1), key(2));
+        assert!(store.insert(store.hash(&failing), &failing, failure, base));
+        assert!(put(&store, 2, 100, base));
+
+        assert!(store.forget_failure(store.hash(&failing), &failing));
+        assert!(!fetch(&store, 1, base));
+        assert!(!store.forget_failure(store.hash(&failing), &failing));
+        assert!(
+            !store.forget_failure(store.hash(&answer), &answer),
+            "an answer is left alone"
+        );
+        assert!(fetch(&store, 2, base));
     }
 }

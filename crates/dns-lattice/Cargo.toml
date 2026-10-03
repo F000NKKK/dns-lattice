@@ -62,5 +62,5 @@ h3-quinn = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "test-util"] }
 rcgen = { workspace = true }

@@ -11,7 +11,13 @@
 //! Concurrent misses for the same question share one upstream query; see
 //! [`CacheConfig::coalesce`]. Popular entries can be refreshed shortly before
 //! they expire with the opt-in [`Prefetch`]; it is the only part of the cache
-//! that spawns tasks.
+//! that spawns tasks (apart from the hand-over of a stale refresh under a
+//! [`ServeStale::client_timeout`]).
+//!
+//! Two more opt-in policies cover an unreachable upstream: [`ServeStale`]
+//! (RFC 8767) answers from an expired entry when resolution fails, and
+//! [`FailureCache`] (RFC 9520) remembers a failure briefly, with backoff, so
+//! that repeated queries do not all reach a dead upstream.
 //!
 //! The cache can be flushed with [`crate::engine::Resolver::clear_cache`],
 //! [`crate::engine::Resolver::purge`] and
@@ -93,6 +99,9 @@ pub(crate) struct TtlPolicy {
     /// Lifetime of a negative answer without an SOA; `None` stores no such
     /// answer.
     pub(crate) negative_without_soa: Option<u32>,
+    /// How long an expired answer stays in the store to be served stale;
+    /// zero when serve-stale is off.
+    pub(crate) stale_window: Duration,
 }
 
 /// Whole seconds of `duration`, saturating at [`u32::MAX`].
@@ -132,6 +141,249 @@ pub struct CacheConfig {
     negative_without_soa: Option<u32>,
     coalesce: bool,
     prefetch: Option<Prefetch>,
+    serve_stale: Option<ServeStale>,
+    failure_cache: Option<FailureCache>,
+}
+
+/// Smallest accepted failure-cache duration: one second (RFC 9520).
+const MIN_FAILURE_TTL: Duration = Duration::from_secs(1);
+
+/// Largest accepted failure-cache duration: five minutes (RFC 9520).
+const MAX_FAILURE_TTL: Duration = Duration::from_secs(300);
+
+/// Default first failure-cache duration.
+const DEFAULT_FAILURE_INITIAL: Duration = Duration::from_secs(1);
+
+/// Default longest failure-cache duration.
+const DEFAULT_FAILURE_MAX: Duration = Duration::from_secs(30);
+
+/// Opt-in caching of upstream failures with exponential backoff (RFC 9520);
+/// pass it to [`CacheConfig::failure_cache`].
+///
+/// When every backend of a group fails (the last error is returned) or the
+/// upstream answers `SERVFAIL` or `REFUSED`, the failure is remembered for
+/// [`initial`](FailureCache::initial) (1 s by default). Queries for the same
+/// question, group and shape that arrive meanwhile get that same outcome
+/// straight from the cache — the cached error, or the cached `SERVFAIL`/
+/// `REFUSED` answer — without another upstream call. When the window ends the
+/// next query goes upstream again; if it fails too, the window doubles, up to
+/// [`max`](FailureCache::max) (30 s by default), and any success clears the
+/// state. Without it every client retry against a dead upstream reaches the
+/// upstream.
+///
+/// It is off by default: a forwarder in front of failover groups would
+/// otherwise turn a brief upstream blip into errors for every client for a
+/// moment. Pre-cache errors (no route, hook errors) are never remembered. A
+/// query for which a stale answer is available (see [`ServeStale`]) gets
+/// that answer instead and starts its recheck window; no failure is stored.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use dns_lattice::cache::{CacheConfig, FailureCache};
+///
+/// let config = CacheConfig::new()
+///     .failure_cache(Some(FailureCache::new().max(Duration::from_secs(60))));
+/// # let _ = config;
+/// ```
+#[derive(Debug, Clone)]
+pub struct FailureCache {
+    initial: Duration,
+    max: Duration,
+}
+
+impl Default for FailureCache {
+    fn default() -> Self {
+        FailureCache::new()
+    }
+}
+
+impl FailureCache {
+    /// The default policy: remember a failure for 1 s, doubling per further
+    /// consecutive failure up to 30 s.
+    pub fn new() -> Self {
+        FailureCache {
+            initial: DEFAULT_FAILURE_INITIAL,
+            max: DEFAULT_FAILURE_MAX,
+        }
+    }
+
+    /// Sets how long the first failure is remembered. Clamped to
+    /// `1 s..=300 s`, the range RFC 9520 allows.
+    #[must_use]
+    pub fn initial(mut self, duration: Duration) -> Self {
+        self.initial = duration.clamp(MIN_FAILURE_TTL, MAX_FAILURE_TTL);
+        self
+    }
+
+    /// Sets the longest a failure is remembered, however many consecutive
+    /// failures there were. Clamped to `1 s..=300 s`; a value below
+    /// [`initial`](FailureCache::initial) acts as `initial`.
+    #[must_use]
+    pub fn max(mut self, duration: Duration) -> Self {
+        self.max = duration.clamp(MIN_FAILURE_TTL, MAX_FAILURE_TTL);
+        self
+    }
+
+    /// How long the first failure is served.
+    pub(crate) fn first_backoff(&self) -> Duration {
+        self.initial
+    }
+
+    /// The longest backoff.
+    pub(crate) fn longest_backoff(&self) -> Duration {
+        self.max.max(self.initial)
+    }
+
+    /// The backoff after a further failure following one of `previous`.
+    pub(crate) fn next_backoff(&self, previous: Duration) -> Duration {
+        previous
+            .saturating_mul(2)
+            .max(self.initial)
+            .min(self.longest_backoff())
+    }
+}
+
+/// Largest accepted serve-stale window: seven days (RFC 8767 §4).
+const MAX_STALE_WINDOW: Duration = Duration::from_secs(7 * 86_400);
+
+/// Default serve-stale window: one day.
+const DEFAULT_STALE_WINDOW: Duration = Duration::from_secs(86_400);
+
+/// TTL, in seconds, on a stale answer by default (RFC 8767 §4).
+const DEFAULT_STALE_REPLY_TTL: u32 = 30;
+
+/// Default time before a failed refresh is tried again.
+const DEFAULT_STALE_RECHECK: Duration = Duration::from_secs(30);
+
+/// Smallest accepted failure recheck interval.
+const MIN_STALE_RECHECK: Duration = Duration::from_secs(1);
+
+/// Opt-in serving of expired answers when the upstream cannot be reached
+/// (RFC 8767); pass it to [`CacheConfig::serve_stale`].
+///
+/// An expired answer is kept for [`max_stale`](ServeStale::max_stale) (one day
+/// by default) after its TTL ends. A query that finds one still goes upstream
+/// first, as for any miss. If that resolution fails — every backend failed, or
+/// the answer is `SERVFAIL` or `REFUSED` — the caller gets the expired answer
+/// instead, with every record TTL set to [`reply_ttl`](ServeStale::reply_ttl)
+/// (30 s) and, when the query carries an EDNS OPT record, an Extended DNS
+/// Error 3 ("Stale Answer", RFC 8914) option. Only a successful `NOERROR` or
+/// `NXDOMAIN` answer replaces the stored one; a failure never overwrites it.
+///
+/// After a failure the entry is marked, and for
+/// [`failure_recheck`](ServeStale::failure_recheck) (30 s) every query is
+/// answered stale immediately, without asking the upstream, so a dead upstream
+/// is not hammered. Queries arriving while a refresh is running join it
+/// (unless coalescing is off) and are served stale together if it fails, so
+/// stale answers add no upstream load and no state beyond the shared entry:
+/// the number of concurrent upstream calls stays bounded by the number of
+/// distinct stale names, never by the number of clients.
+///
+/// With [`client_timeout`](ServeStale::client_timeout) the caller is
+/// answered stale as soon as the timeout passes without a result, while the
+/// refresh keeps running in the background and stores its answer when it
+/// arrives. That needs coalescing on and a Tokio runtime (with its time
+/// driver); without a runtime the query simply waits for the upstream.
+/// Handing the refresh over spawns a task bound to the
+/// [`crate::engine::Resolver`] — dropping the resolver aborts it — and the
+/// query then emits no upstream events (the task reports
+/// [`CacheEvent::RefreshStarted`](crate::observability::CacheEvent::RefreshStarted)
+/// and
+/// [`CacheEvent::RefreshCompleted`](crate::observability::CacheEvent::RefreshCompleted)
+/// instead).
+///
+/// Serving stale changes the answer contract of the resolver: it can return
+/// data older than its TTL, so it is off by default.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use dns_lattice::cache::{CacheConfig, ServeStale};
+///
+/// let config = CacheConfig::new().serve_stale(Some(
+///     ServeStale::new().client_timeout(Some(Duration::from_millis(1_800))),
+/// ));
+/// # let _ = config;
+/// ```
+#[derive(Debug, Clone)]
+pub struct ServeStale {
+    max_stale: Duration,
+    reply_ttl: u32,
+    failure_recheck: Duration,
+    client_timeout: Option<Duration>,
+}
+
+impl Default for ServeStale {
+    fn default() -> Self {
+        ServeStale::new()
+    }
+}
+
+impl ServeStale {
+    /// The default policy: keep expired answers for one day, serve them with
+    /// TTL 30 s, recheck a failed refresh after 30 s, no client timeout.
+    pub fn new() -> Self {
+        ServeStale {
+            max_stale: DEFAULT_STALE_WINDOW,
+            reply_ttl: DEFAULT_STALE_REPLY_TTL,
+            failure_recheck: DEFAULT_STALE_RECHECK,
+            client_timeout: None,
+        }
+    }
+
+    /// Sets how long after its TTL an answer may still be served stale.
+    /// Capped at seven days (RFC 8767 §4).
+    #[must_use]
+    pub fn max_stale(mut self, duration: Duration) -> Self {
+        self.max_stale = duration.min(MAX_STALE_WINDOW);
+        self
+    }
+
+    /// Sets the TTL on a stale answer, in whole seconds, at least 1.
+    #[must_use]
+    pub fn reply_ttl(mut self, ttl: Duration) -> Self {
+        self.reply_ttl = whole_seconds(ttl).max(1);
+        self
+    }
+
+    /// Sets how long after a failed refresh a stale answer is served without
+    /// asking the upstream again. At least one second.
+    #[must_use]
+    pub fn failure_recheck(mut self, duration: Duration) -> Self {
+        self.failure_recheck = duration.max(MIN_STALE_RECHECK);
+        self
+    }
+
+    /// Sets how long a query waits for the refresh before it is answered stale
+    /// (`Some`), or makes it wait for the upstream (`None`, the default).
+    /// RFC 8767 suggests 1.8 s. See the type documentation for the
+    /// requirements.
+    #[must_use]
+    pub fn client_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.client_timeout = timeout;
+        self
+    }
+
+    /// How long an expired answer is kept.
+    pub(crate) fn max_stale_value(&self) -> Duration {
+        self.max_stale
+    }
+
+    /// The TTL on a stale answer, in seconds.
+    pub(crate) fn reply_ttl_value(&self) -> u32 {
+        self.reply_ttl
+    }
+
+    /// The recheck interval after a failed refresh.
+    pub(crate) fn failure_recheck_value(&self) -> Duration {
+        self.failure_recheck
+    }
+
+    /// The client timeout.
+    pub(crate) fn client_timeout_value(&self) -> Option<Duration> {
+        self.client_timeout
+    }
 }
 
 /// Smallest accepted prefetch threshold, in percent of an entry's lifetime.
@@ -256,6 +508,8 @@ impl CacheConfig {
             negative_without_soa: Some(DEFAULT_NEGATIVE_WITHOUT_SOA),
             coalesce: true,
             prefetch: None,
+            serve_stale: None,
+            failure_cache: None,
         }
     }
 
@@ -349,14 +603,47 @@ impl CacheConfig {
     /// popular entries in the background shortly before they expire, so a
     /// busy name never turns into a miss.
     ///
-    /// Prefetch is the only cache feature that spawns tasks: each refresh
-    /// runs on the Tokio runtime that served the triggering hit, and is
-    /// aborted when the [`crate::engine::Resolver`] is dropped. See
-    /// [`Prefetch`] for the trigger and its limits.
+    /// Prefetch, and the opt-in serve-stale client-timeout hand-over
+    /// ([`ServeStale::client_timeout`]), are the only cache features that
+    /// spawn tasks: each refresh runs on the Tokio runtime that served the
+    /// triggering query, and is aborted when the
+    /// [`crate::engine::Resolver`] is dropped. See [`Prefetch`] for the
+    /// trigger and its limits.
     #[must_use]
     pub fn prefetch(mut self, policy: Option<Prefetch>) -> Self {
         self.prefetch = policy;
         self
+    }
+
+    /// Enables (`Some`) or disables (`None`, the default) serving expired
+    /// answers when the upstream cannot be reached (RFC 8767). See
+    /// [`ServeStale`] for the rules; it keeps expired answers in the store for
+    /// its [`max_stale`](ServeStale::max_stale) window, within the same
+    /// [`CacheConfig::max_bytes`] bound.
+    #[must_use]
+    pub fn serve_stale(mut self, policy: Option<ServeStale>) -> Self {
+        self.serve_stale = policy;
+        self
+    }
+
+    /// Enables (`Some`) or disables (`None`, the default) caching of upstream
+    /// failures with backoff (RFC 9520). See [`FailureCache`]. A cached
+    /// failure takes a store entry like an answer and needs the store; with
+    /// the store disabled nothing is cached.
+    #[must_use]
+    pub fn failure_cache(mut self, policy: Option<FailureCache>) -> Self {
+        self.failure_cache = policy;
+        self
+    }
+
+    /// The serve-stale policy, if enabled.
+    pub(crate) fn serve_stale_policy(&self) -> Option<&ServeStale> {
+        self.serve_stale.as_ref()
+    }
+
+    /// The failure-cache policy, if enabled.
+    pub(crate) fn failure_cache_policy(&self) -> Option<&FailureCache> {
+        self.failure_cache.as_ref()
     }
 
     /// The prefetch policy, if enabled.
@@ -390,6 +677,10 @@ impl CacheConfig {
             positive: self.positive,
             negative: self.negative,
             negative_without_soa: self.negative_without_soa,
+            stale_window: self
+                .serve_stale
+                .as_ref()
+                .map_or(Duration::ZERO, ServeStale::max_stale_value),
         }
     }
 }
@@ -418,6 +709,8 @@ pub struct CacheStats {
     pub(crate) expirations: u64,
     pub(crate) oversized_rejected: u64,
     pub(crate) refreshes: u64,
+    pub(crate) stale_hits: u64,
+    pub(crate) failure_hits: u64,
 }
 
 impl CacheStats {
@@ -488,6 +781,21 @@ impl CacheStats {
     /// when its task begins, whatever its outcome.
     pub fn refreshes(&self) -> u64 {
         self.refreshes
+    }
+
+    /// Queries answered with an expired answer under [`ServeStale`]. Such a
+    /// query is also counted in [`hits`](CacheStats::hits) when it was
+    /// answered stale straight away (inside a failed refresh's recheck
+    /// window), and in [`misses`](CacheStats::misses) when it first tried the
+    /// upstream.
+    pub fn stale_hits(&self) -> u64 {
+        self.stale_hits
+    }
+
+    /// Queries answered with a cached upstream failure under
+    /// [`FailureCache`] (also counted in [`hits`](CacheStats::hits)).
+    pub fn failure_hits(&self) -> u64 {
+        self.failure_hits
     }
 }
 
@@ -576,6 +884,88 @@ mod tests {
         let huge = TtlBounds::new(Duration::ZERO, Duration::from_secs(u64::MAX));
         assert_eq!(huge.max, u32::MAX);
         assert_eq!(huge.clamp(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn serve_stale_and_failure_cache_are_off_by_default() {
+        let config = CacheConfig::new();
+        assert!(config.serve_stale_policy().is_none());
+        assert!(config.failure_cache_policy().is_none());
+        assert_eq!(config.ttl_policy().stale_window, Duration::ZERO);
+    }
+
+    #[test]
+    fn serve_stale_defaults_and_clamps() {
+        let stale = ServeStale::default();
+        assert_eq!(stale.max_stale_value(), Duration::from_secs(86_400));
+        assert_eq!(stale.reply_ttl_value(), 30);
+        assert_eq!(stale.failure_recheck_value(), Duration::from_secs(30));
+        assert_eq!(stale.client_timeout_value(), None);
+
+        let capped = ServeStale::new().max_stale(Duration::from_secs(30 * 86_400));
+        assert_eq!(capped.max_stale_value(), Duration::from_secs(7 * 86_400));
+        assert_eq!(
+            ServeStale::new()
+                .reply_ttl(Duration::ZERO)
+                .reply_ttl_value(),
+            1
+        );
+        assert_eq!(
+            ServeStale::new()
+                .reply_ttl(Duration::from_millis(5_900))
+                .reply_ttl_value(),
+            5
+        );
+        assert_eq!(
+            ServeStale::new()
+                .failure_recheck(Duration::ZERO)
+                .failure_recheck_value(),
+            Duration::from_secs(1)
+        );
+        let timed = ServeStale::new().client_timeout(Some(Duration::from_millis(1_800)));
+        assert_eq!(
+            timed.client_timeout_value(),
+            Some(Duration::from_millis(1_800))
+        );
+    }
+
+    #[test]
+    fn the_stale_window_reaches_the_ttl_policy() {
+        let config = CacheConfig::new()
+            .serve_stale(Some(ServeStale::new().max_stale(Duration::from_secs(600))));
+        assert_eq!(config.ttl_policy().stale_window, Duration::from_secs(600));
+        assert!(config.serve_stale_policy().is_some());
+        let off = config.serve_stale(None);
+        assert_eq!(off.ttl_policy().stale_window, Duration::ZERO);
+    }
+
+    #[test]
+    fn failure_backoff_doubles_up_to_the_clamped_maximum() {
+        let policy = FailureCache::default();
+        assert_eq!(policy.first_backoff(), Duration::from_secs(1));
+        assert_eq!(policy.longest_backoff(), Duration::from_secs(30));
+        let mut backoff = policy.first_backoff();
+        let mut seen = vec![backoff.as_secs()];
+        for _ in 0..7 {
+            backoff = policy.next_backoff(backoff);
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 30, 30, 30]);
+
+        let clamped = FailureCache::new()
+            .initial(Duration::ZERO)
+            .max(Duration::from_secs(10_000));
+        assert_eq!(clamped.first_backoff(), Duration::from_secs(1));
+        assert_eq!(clamped.longest_backoff(), Duration::from_secs(300));
+
+        let inverted = FailureCache::new()
+            .initial(Duration::from_secs(20))
+            .max(Duration::from_secs(5));
+        assert_eq!(inverted.longest_backoff(), Duration::from_secs(20));
+        assert_eq!(
+            inverted.next_backoff(Duration::from_secs(20)),
+            Duration::from_secs(20)
+        );
     }
 
     #[test]

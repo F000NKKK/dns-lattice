@@ -144,8 +144,8 @@ application-specific routing. DNS Lattice разделяет эти ответс
   Tokio на каждую UDP-датаграмму, на каждое TCP/DoT/DoH-соединение и на
   каждый DoQ-поток; все они делят один `Arc<Resolver>`.
 - **Без фоновых потоков и очередей**: резолвер не владеет потоками и не
-  владеет задачами, пока вы не включите prefetch кэша (тогда удаление
-  резолвера прерывает их), а callbacks observability выполняются синхронно
+  владеет задачами, пока вы не включите prefetch кэша или client timeout
+  serve-stale (тогда удаление резолвера прерывает их), а callbacks observability выполняются синхронно
   после освобождения блокировки шарда кэша.
 - **Платите только за нужные транспорты**: без `dot`, `doh` и `doq` в сборке
   нет зависимостей TLS, HTTP и QUIC.
@@ -534,6 +534,29 @@ Resolver имеет in-memory answer cache с учётом TTL, включая n
   и `CacheEvent::RefreshCompleted` (с полем `refreshed`), но не
   `ObserveEvent`. По умолчанию выключено: без него резолвер ничего не
   порождает.
+- **Serve-stale (opt-in, RFC 8767)**:
+  `CacheConfig::serve_stale(Some(ServeStale::new()))` хранит истёкшие ответы
+  `max_stale` (по умолчанию сутки, не более 7). Запрос, нашедший такой ответ,
+  сначала спрашивает upstream; если тот не ответил (все backend, либо
+  `SERVFAIL`/`REFUSED`), возвращается истёкший ответ с TTL всех записей
+  `reply_ttl` (30 с) и, для EDNS-клиента, Extended DNS Error 3 (Stale
+  Answer). Неудачное обновление открывает окно перепроверки в 30 с
+  (`failure_recheck`): запросы в нём получают устаревший ответ без вызова
+  upstream, а запросы, пришедшие во время обновления, делят его, поэтому
+  мёртвый upstream видит один вызов на устаревшее имя, а не на клиента.
+  Заменяют сохранённую запись только ответы `NOERROR`/`NXDOMAIN`.
+  `ServeStale::client_timeout(Some(d))` отвечает устаревшим ответом через
+  `d`, пока обновление завершается в фоновой задаче (нужны coalescing и среда
+  Tokio; задача прерывается при удалении `Resolver`). Событие:
+  `CacheEvent::StaleServed`; счётчик: `CacheStats::stale_hits`.
+- **Кэширование отказов (opt-in, RFC 9520)**:
+  `CacheConfig::failure_cache(Some(FailureCache::new()))` запоминает
+  неудачное разрешение (ошибку либо `SERVFAIL`/`REFUSED`) для каждой
+  идентичности кэша на 1 с, удваивая при каждом следующем подряд отказе до
+  30 с (`initial`, `max`; от 1 до 300 с); запросы за это время получают ту же
+  ошибку или тот же ответ со своим id без вызова upstream. Успех сбрасывает
+  паузу, а устаревший ответ имеет приоритет. Событие:
+  `CacheEvent::FailureServed`; счётчик: `CacheStats::failure_hits`.
 - **Время жизни**: по умолчанию сохранённые TTL ограничены 86 400 с
   (positive) и 3 600 с (negative); `CacheConfig::positive_ttl` и
   `CacheConfig::negative_ttl` задают другие границы. Positive-запись живёт по

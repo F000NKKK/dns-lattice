@@ -175,7 +175,19 @@ entry that has served at least two hits and has at most 10% of its lifetime left
 background refresh of that entry on the current Tokio runtime (none outside a runtime). The
 refresh shares the in-flight registry with ordinary misses, never duplicates an upstream
 call, emits `CacheEvent::RefreshStarted`/`RefreshCompleted` rather than `ObserveEvent`s, and
-is aborted when the `Resolver` is dropped. Without prefetch the resolver spawns no tasks.
+is aborted when the `Resolver` is dropped. Without prefetch (or the serve-stale client
+timeout below) the resolver spawns no tasks.
+
+**Serve-stale and failure caching.** Both are opt-in. `CacheConfig::serve_stale(Some(ServeStale::new()))`
+keeps expired answers for up to a day (RFC 8767): a query that finds one asks the upstream first
+and, if that fails (every backend, or `SERVFAIL`/`REFUSED`), gets the expired answer with a 30 s
+TTL and, for an EDNS client, Extended DNS Error 3. A failed refresh opens a 30 s window in which
+queries are answered stale without an upstream call, so a dead upstream sees one call per stale
+name. `ServeStale::client_timeout` answers stale after a delay while the refresh finishes in a
+background task. `CacheConfig::failure_cache(Some(FailureCache::new()))` (RFC 9520) remembers a
+failed resolution for 1 s, doubling to at most 30 s, and answers the same error without an
+upstream call; a stale answer takes precedence. Events: `CacheEvent::StaleServed` and
+`CacheEvent::FailureServed`; counters: `CacheStats::stale_hits` and `CacheStats::failure_hits`.
 
 Details: [ARCHITECTURE.md](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#resolver-data-flow)
 and [docs.rs](https://docs.rs/dns-lattice).

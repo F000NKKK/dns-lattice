@@ -336,6 +336,26 @@ mod facade_path_tests {
         let _: fn(cache::CacheConfig, Option<cache::Prefetch>) -> cache::CacheConfig =
             cache::CacheConfig::prefetch;
         let _: fn(&cache::CacheStats) -> u64 = cache::CacheStats::refreshes;
+        let _: fn() -> cache::ServeStale = cache::ServeStale::new;
+        let _: fn(cache::ServeStale, std::time::Duration) -> cache::ServeStale =
+            cache::ServeStale::max_stale;
+        let _: fn(cache::ServeStale, std::time::Duration) -> cache::ServeStale =
+            cache::ServeStale::reply_ttl;
+        let _: fn(cache::ServeStale, std::time::Duration) -> cache::ServeStale =
+            cache::ServeStale::failure_recheck;
+        let _: fn(cache::ServeStale, Option<std::time::Duration>) -> cache::ServeStale =
+            cache::ServeStale::client_timeout;
+        let _: fn(cache::CacheConfig, Option<cache::ServeStale>) -> cache::CacheConfig =
+            cache::CacheConfig::serve_stale;
+        let _: fn() -> cache::FailureCache = cache::FailureCache::new;
+        let _: fn(cache::FailureCache, std::time::Duration) -> cache::FailureCache =
+            cache::FailureCache::initial;
+        let _: fn(cache::FailureCache, std::time::Duration) -> cache::FailureCache =
+            cache::FailureCache::max;
+        let _: fn(cache::CacheConfig, Option<cache::FailureCache>) -> cache::CacheConfig =
+            cache::CacheConfig::failure_cache;
+        let _: fn(&cache::CacheStats) -> u64 = cache::CacheStats::stale_hits;
+        let _: fn(&cache::CacheStats) -> u64 = cache::CacheStats::failure_hits;
         let _: fn(&engine::Resolver) -> usize = engine::Resolver::clear_cache;
         let _: fn(&engine::Resolver, &model::Name, Option<model::RecordType>) -> usize =
             engine::Resolver::purge;

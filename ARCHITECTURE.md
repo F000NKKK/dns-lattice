@@ -248,8 +248,8 @@ longer than one shard and does not stop queries. A query that missed, led,
 and found an answer stored in the meantime reports `CacheMiss` and counts as
 a miss, so `hits` can slightly undercount the answers the store served.
 
-Prefetch (`CacheConfig::prefetch`, off by default) is the only feature that
-spawns. The resolver is a thin handle over a shared inner state (`Arc`) plus a
+Prefetch (`CacheConfig::prefetch`, off by default) and the serve-stale client
+timeout are the only features that spawn. The resolver is a thin handle over a shared inner state (`Arc`) plus a
 `JoinSet` of refresh tasks; the tasks hold the inner state, never the handle,
 so dropping the `Resolver` drops the set and aborts every refresh. Each entry
 counts its fresh hits and carries a one-shot `refreshing` flag. A fresh hit
@@ -264,6 +264,31 @@ joined. It emits only `CacheEvent::RefreshStarted` and
 `ObserveEvent`, and honours the purge epoch like any leader. Without a
 runtime nothing happens and nothing panics. The task-set lock is held only
 to reap finished tasks and spawn; no sink callback runs under it.
+
+Serve-stale (`CacheConfig::serve_stale`, off by default) and failure caching
+(`CacheConfig::failure_cache`, off by default) reuse the same store. An entry
+carries a retention instant beyond its expiry, and the store's expiry index
+and eviction use that instant, so an expired answer stays inside the byte
+bound until it is evicted or its stale window ends. A lookup classifies what
+it finds against the clock: fresh (the ordinary hit path), a remembered
+failure (served without an upstream call), an expired answer inside its
+recheck window (served stale without a call), or an expired answer to refresh.
+A refresh is the ordinary leader: it takes the in-flight registry, queries the
+group, and on an error, `SERVFAIL` or `REFUSED` serves the stale answer with
+a short TTL and Extended DNS Error 3 instead, marks the entry's recheck
+deadline (an atomic, so followers and later queries read it without a lock),
+and publishes a stale outcome so every follower is answered the same way. A
+refresh never overwrites an answer with a failure, and only `NOERROR` and
+`NXDOMAIN` replace one. A failure entry is an ordinary entry carrying the
+error or the `SERVFAIL`/`REFUSED` answer and its backoff; it expires after the
+backoff but is retained for the longest backoff so the next failure doubles
+it, a success removes it, and the purge epoch keeps a flush from being
+undone by a call that was already running. With a client timeout the leader
+hands the refresh to a task in the same `JoinSet` as prefetch (the task holds
+the inner state, never the handle) and waits on a follower of its own flight
+with a timer; on expiry, or if the task is abandoned, it serves stale while
+the task goes on to store the answer. Without coalescing or a runtime the
+query waits inline.
 
 Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
 answer — is aligned with the query's EDNS(0) state: without a query OPT

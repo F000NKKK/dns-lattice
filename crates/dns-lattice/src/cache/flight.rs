@@ -40,6 +40,9 @@ pub(crate) enum Outcome {
     Raw(Arc<Message>),
     /// The leader's resolution error.
     Failed(Error),
+    /// The refresh failed and the leader answers from this expired entry
+    /// (serve-stale); followers do the same.
+    Stale(Arc<CachedAnswer>),
 }
 
 /// The observable state of one flight.
@@ -192,6 +195,14 @@ pub(crate) struct LeaderGuard {
 }
 
 impl LeaderGuard {
+    /// A follower of this flight, so the leader itself can wait for a result
+    /// that a background task will publish.
+    pub(crate) fn follower(&self) -> Follower {
+        Follower {
+            receiver: self.sender.subscribe(),
+        }
+    }
+
     /// Unregisters the flight, then publishes `outcome` to the followers that
     /// already joined. The outcome is built only if there are any.
     ///
@@ -247,6 +258,32 @@ mod tests {
             Wait::Done(Outcome::Failed(Error::NoRoute)) => {}
             _ => panic!("follower must receive the published outcome"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_follower_made_from_the_guard_receives_the_outcome() {
+        let flights = flights();
+        let Join::Lead(leader) = flights.join_or_lead(3, b"key") else {
+            panic!("first caller must lead");
+        };
+        let follower = leader.follower();
+        assert_eq!(flights.len(), 1);
+        leader.finish(|| Outcome::Failed(Error::Timeout));
+        assert!(matches!(
+            follower.wait().await,
+            Wait::Done(Outcome::Failed(Error::Timeout))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_follower_made_from_a_dropped_guard_is_abandoned() {
+        let flights = flights();
+        let Join::Lead(leader) = flights.join_or_lead(4, b"key") else {
+            panic!("first caller must lead");
+        };
+        let follower = leader.follower();
+        drop(leader);
+        assert!(matches!(follower.wait().await, Wait::Abandoned));
     }
 
     #[tokio::test]

@@ -143,8 +143,8 @@ public resolvers.
   per UDP datagram, per TCP/DoT/DoH connection, and per DoQ stream, all
   sharing one `Arc<Resolver>`.
 - **No background threads or queues**: the resolver owns no threads, and no
-  tasks unless you opt into cache prefetch (then dropping the resolver
-  aborts them); observability callbacks run synchronously after the cache
+  tasks unless you opt into cache prefetch or the serve-stale client timeout
+  (then dropping the resolver aborts them); observability callbacks run synchronously after the cache
   shard lock is released.
 - **Pay only for the transports you use**: without `dot`, `doh`, or `doq`
   the build has no TLS, HTTP, or QUIC dependency.
@@ -530,6 +530,28 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   `CacheEvent::RefreshStarted` and `CacheEvent::RefreshCompleted` (with
   `refreshed`) but no `ObserveEvent`. Off by default: without it the
   resolver spawns nothing.
+- **Serve-stale (opt-in, RFC 8767)**:
+  `CacheConfig::serve_stale(Some(ServeStale::new()))` keeps expired answers
+  for `max_stale` (default 1 day, at most 7). A query that finds one asks the
+  upstream first; if that fails (every backend, or `SERVFAIL`/`REFUSED`) the
+  expired answer is returned with every TTL set to `reply_ttl` (30 s) and,
+  for an EDNS client, Extended DNS Error 3 (Stale Answer). A failed refresh
+  opens a 30 s recheck window (`failure_recheck`) in which queries are
+  answered stale without an upstream call, and queries arriving during a
+  refresh share it, so a dead upstream sees one call per stale name, not one
+  per client. Only `NOERROR`/`NXDOMAIN` answers replace a stored one.
+  `ServeStale::client_timeout(Some(d))` answers stale after `d` while the
+  refresh finishes in a background task (needs coalescing and a Tokio
+  runtime; the task is aborted when the `Resolver` is dropped). Events:
+  `CacheEvent::StaleServed`; counter: `CacheStats::stale_hits`.
+- **Failure caching (opt-in, RFC 9520)**:
+  `CacheConfig::failure_cache(Some(FailureCache::new()))` remembers a failed
+  resolution (an error, or `SERVFAIL`/`REFUSED`) per cache identity for 1 s,
+  doubling per further consecutive failure up to 30 s (`initial`, `max`;
+  1 to 300 s); queries in that time get the same error or answer, with their
+  own id, without an upstream call. A success clears the backoff and a stale
+  answer takes precedence. Events: `CacheEvent::FailureServed`; counter:
+  `CacheStats::failure_hits`.
 - **Lifetimes**: by default stored TTLs are capped at 86 400 s (positive)
   and 3 600 s (negative); `CacheConfig::positive_ttl` and
   `CacheConfig::negative_ttl` set other bounds. A positive entry lives for

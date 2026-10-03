@@ -72,6 +72,21 @@ duplicates a query already running, and aborted when the resolver is dropped.
 It adds upstream traffic of at most one query per stored entry lifetime, so
 size `min_hits` and the threshold with the upstream's rate limits in mind.
 
+Serve-stale (`CacheConfig::serve_stale`) and failure caching
+(`CacheConfig::failure_cache`) are off by default. Serve-stale changes the
+answer contract: a client can receive data older than its TTL (at most
+`max_stale`, seven days at the most) with a 30 s TTL and, for EDNS clients,
+Extended DNS Error 3, so enable it only where availability outranks freshness.
+Retained answers and remembered failures count against the cache's byte
+bound, and neither adds upstream load: a failed refresh opens a recheck
+window, and queries arriving during a refresh share it, so a dead upstream
+sees at most one call per stale name rather than one per client. Failure
+caching bounds repeat queries to a failing name to one call per backoff (1 to
+300 s) and is keyed like any answer, so a failure on one name never affects
+another; a flush drops remembered failures. The serve-stale client timeout
+spawns a task per handed-over refresh, bounded by the same limit of 256 as
+prefetch and aborted when the resolver is dropped.
+
 ## Scope
 
 The supported `1.x` release surface includes the hand-rolled DNS message model

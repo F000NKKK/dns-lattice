@@ -24,16 +24,16 @@ use std::time::{Duration, Instant};
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{
-    Class, Edns, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy,
-    UpstreamGroupId,
+    Class, Edns, EdnsOption, Message, Name, Opcode, RData, Rcode, RecordType, ResourceRecord,
+    SplitDnsPolicy, UpstreamGroupId,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinSet;
 
 use crate::cache::TtlPolicy;
-use crate::cache::flight::{Flights, Join, LeaderGuard, Outcome, Wait};
+use crate::cache::flight::{Flights, Follower, Join, LeaderGuard, Outcome, Wait};
 use crate::cache::store::{CachedAnswer, KeyBuf, Store};
-use crate::cache::{CacheConfig, CacheStats, Prefetch};
+use crate::cache::{CacheConfig, CacheStats, FailureCache, Prefetch, ServeStale};
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
@@ -111,8 +111,10 @@ impl Clock for FakeClock {
 ///
 /// Construct via [`Resolver::builder`], call [`Resolver::resolve`] as many
 /// times as needed, then drop. The resolver spawns no threads and no tasks
-/// unless [`CacheConfig::prefetch`] is configured; with it, a cache hit may
-/// start a background refresh on the Tokio runtime it runs in. There is no
+/// unless [`CacheConfig::prefetch`] is configured (a cache hit may start a
+/// background refresh on the Tokio runtime it runs in) or serve-stale has a
+/// [`client_timeout`](crate::cache::ServeStale::client_timeout) (a query on
+/// an expired answer hands its refresh to a background task). There is no
 /// explicit `shutdown` method — dropping the resolver aborts every refresh
 /// still running, and Rust's ordinary drop semantics release everything else
 /// it owns (including any sockets a registered
@@ -142,6 +144,10 @@ struct ResolverInner {
     cache_epoch: AtomicU64,
     /// Opt-in prefetch policy.
     prefetch: Option<Prefetch>,
+    /// Opt-in serve-stale policy.
+    serve_stale: Option<ServeStale>,
+    /// Opt-in upstream failure caching; always `None` without a store.
+    failure_cache: Option<FailureCache>,
     /// Lookup outcome counters behind [`Resolver::cache_stats`].
     counters: QueryCounters,
     fake_ip: Option<FakeIpResolverConfig>,
@@ -158,6 +164,8 @@ struct QueryCounters {
     misses: AtomicU64,
     coalesced: AtomicU64,
     refreshes: AtomicU64,
+    stale_hits: AtomicU64,
+    failure_hits: AtomicU64,
 }
 
 /// The most background refreshes running at once; a hit that would start
@@ -287,6 +295,30 @@ impl Resolver {
     /// starts none). The hit itself is answered from the cache exactly as
     /// above; the refresh is aborted if the resolver is dropped. See
     /// [`crate::cache::Prefetch`].
+    ///
+    /// # Serve-stale
+    ///
+    /// Only when [`CacheConfig::serve_stale`] is configured, an expired
+    /// answer is kept for the configured window. A query that finds one asks
+    /// the upstream first; if that fails (every backend failed, or the answer
+    /// is `SERVFAIL`/`REFUSED`) it is answered from the expired entry with a
+    /// short TTL and, for an EDNS client, Extended DNS Error 3, and emits
+    /// [`CacheEvent::StaleServed`].
+    /// Further queries within the recheck window are answered stale without an
+    /// upstream call. With a client timeout, a query that waits longer is
+    /// answered stale while the refresh continues in a background task. See
+    /// [`crate::cache::ServeStale`].
+    ///
+    /// # Failure caching
+    ///
+    /// Only when [`CacheConfig::failure_cache`] is configured, a failed
+    /// resolution (an error, or a `SERVFAIL`/`REFUSED` answer) is remembered
+    /// per cache identity for a short, exponentially growing backoff; queries
+    /// inside it get the same error or answer (with their own id) without an
+    /// upstream call, and emit
+    /// [`CacheEvent::FailureServed`].
+    /// A usable stale answer takes precedence over a remembered failure. See
+    /// [`crate::cache::FailureCache`].
     ///
     /// # EDNS(0)
     ///
@@ -451,28 +483,47 @@ impl ResolverInner {
         };
 
         let now = self.clock.now();
-        if let Some(cached) = stored
+        let found = stored
             .as_ref()
-            .and_then(|(store, key, hash)| store.get(*hash, key.as_bytes(), now))
-        {
-            let mut answer = cache_hit_response(query, &cached, now);
-            align_edns(query, &mut answer);
-            self.counters.hits.fetch_add(1, Ordering::Relaxed);
-            self.emit(ObserveEvent::CacheHit {
-                correlation_id,
-                group: group.clone(),
-            });
-            self.emit(ObserveEvent::Completed {
-                correlation_id,
-                rcode: answer.header.rcode,
-            });
-            if let (Some(prefetch), Some((_, key, hash))) = (&self.prefetch, &stored) {
-                self.maybe_prefetch(
-                    prefetch, background, query, &group, key, *hash, &cached, now,
-                );
+            .and_then(|(store, key, hash)| store.get(*hash, key.as_bytes(), now));
+        let (mut stale, mut previous_backoff) = match self.classify(found, now) {
+            Found::Fresh(cached) => {
+                let mut answer = cache_hit_response(query, &cached, now);
+                align_edns(query, &mut answer);
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                self.emit(ObserveEvent::CacheHit {
+                    correlation_id,
+                    group: group.clone(),
+                });
+                self.emit(ObserveEvent::Completed {
+                    correlation_id,
+                    rcode: answer.header.rcode,
+                });
+                if let (Some(prefetch), Some((_, key, hash))) = (&self.prefetch, &stored) {
+                    self.maybe_prefetch(
+                        prefetch, background, query, &group, key, *hash, &cached, now,
+                    );
+                }
+                return Ok(answer);
             }
-            return Ok(answer);
-        }
+            Found::Failure(cached) => {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                self.emit(ObserveEvent::CacheHit {
+                    correlation_id,
+                    group: group.clone(),
+                });
+                return self.serve_failure(query, &cached, correlation_id, &group, now);
+            }
+            Found::StaleNow(cached) => {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                self.emit(ObserveEvent::CacheHit {
+                    correlation_id,
+                    group: group.clone(),
+                });
+                return self.serve_stale(query, &cached, correlation_id, &group);
+            }
+            Found::Refresh { stale, backoff } => (stale, backoff),
+        };
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
         self.emit(ObserveEvent::CacheMiss {
             correlation_id,
@@ -483,7 +534,7 @@ impl ResolverInner {
         // leader proceeds; a follower returns the leader's outcome, and a
         // follower whose leader was cancelled goes round again.
         let mut announced = false;
-        let guard = match (&self.flights, &key) {
+        let mut guard = match (&self.flights, &key) {
             (Some(flights), Some(key)) => {
                 let flight_hash = flights.hash(key.as_bytes());
                 loop {
@@ -498,8 +549,26 @@ impl ResolverInner {
                                     group: group.clone(),
                                 });
                             }
-                            if let Wait::Done(outcome) = follower.wait().await {
-                                return self.finish_follower(query, outcome, correlation_id);
+                            match self.wait_for_flight(follower, stale.as_ref()).await {
+                                FlightWait::Done(outcome) => {
+                                    return self.finish_follower(
+                                        query,
+                                        outcome,
+                                        correlation_id,
+                                        &group,
+                                    );
+                                }
+                                FlightWait::TimedOut => {
+                                    if let Some(stale) = &stale {
+                                        return self.serve_stale(
+                                            query,
+                                            stale,
+                                            correlation_id,
+                                            &group,
+                                        );
+                                    }
+                                }
+                                FlightWait::Abandoned => {}
                             }
                         }
                     }
@@ -509,23 +578,78 @@ impl ResolverInner {
         };
 
         // The leader re-checks the cache: another leader may have stored an
-        // answer and unregistered between this query's miss and its
-        // registration.
+        // answer (or recorded a failure) and unregistered between this
+        // query's miss and its registration.
         if guard.is_some()
             && let Some((store, key, hash)) = &stored
         {
             let now = self.clock.now();
-            if let Some(cached) = store.get(*hash, key.as_bytes(), now) {
-                if let Some(guard) = guard {
-                    guard.finish(|| Outcome::Cached(Arc::clone(&cached)));
+            match self.classify(store.get(*hash, key.as_bytes(), now), now) {
+                Found::Fresh(cached) => {
+                    if let Some(guard) = guard {
+                        guard.finish(|| Outcome::Cached(Arc::clone(&cached)));
+                    }
+                    let mut answer = cache_hit_response(query, &cached, now);
+                    align_edns(query, &mut answer);
+                    self.emit(ObserveEvent::Completed {
+                        correlation_id,
+                        rcode: answer.header.rcode,
+                    });
+                    return Ok(answer);
                 }
-                let mut answer = cache_hit_response(query, &cached, now);
-                align_edns(query, &mut answer);
-                self.emit(ObserveEvent::Completed {
-                    correlation_id,
-                    rcode: answer.header.rcode,
-                });
-                return Ok(answer);
+                Found::Failure(cached) => {
+                    if let Some(guard) = guard {
+                        guard.finish(|| outcome_of_failure(&cached));
+                    }
+                    return self.serve_failure(query, &cached, correlation_id, &group, now);
+                }
+                Found::StaleNow(cached) => {
+                    if let Some(guard) = guard {
+                        guard.finish(|| Outcome::Stale(Arc::clone(&cached)));
+                    }
+                    return self.serve_stale(query, &cached, correlation_id, &group);
+                }
+                Found::Refresh {
+                    stale: found_stale,
+                    backoff,
+                } => {
+                    stale = found_stale;
+                    previous_backoff = backoff;
+                }
+            }
+        }
+
+        // With a client timeout, a stale entry's refresh runs as a background
+        // task and this query waits for it only that long.
+        if let (Some(stale_entry), Some(timeout), Some((_, key, hash))) = (
+            &stale,
+            self.serve_stale
+                .as_ref()
+                .and_then(ServeStale::client_timeout_value),
+            &stored,
+        ) && let Some(flight) = guard.take()
+        {
+            match self.spawn_stale_refresh(
+                background,
+                flight,
+                query,
+                &group,
+                key,
+                *hash,
+                stale_entry,
+            ) {
+                Ok(follower) => {
+                    return match tokio::time::timeout(timeout, follower.wait()).await {
+                        Ok(Wait::Done(outcome)) => {
+                            self.finish_follower(query, outcome, correlation_id, &group)
+                        }
+                        Ok(Wait::Abandoned) | Err(_) => {
+                            self.serve_stale(query, stale_entry, correlation_id, &group)
+                        }
+                    };
+                }
+                // No runtime or too many refreshes running: wait inline.
+                Err(flight) => guard = Some(flight),
             }
         }
 
@@ -544,8 +668,22 @@ impl ResolverInner {
                 epoch,
             )
             .await;
+        let stale_used = self.settle_failure(
+            query,
+            &result,
+            stale.as_ref(),
+            stored,
+            previous_backoff,
+            epoch,
+        );
         if let Some(guard) = guard {
-            guard.finish(|| outcome_of(&result));
+            guard.finish(|| match &stale_used {
+                Some(entry) => Outcome::Stale(Arc::clone(entry)),
+                None => outcome_of(&result),
+            });
+        }
+        if let Some(entry) = stale_used {
+            return self.serve_stale(query, &entry, correlation_id, &group);
         }
         match result {
             Ok((mut answer, _, _)) => {
@@ -606,6 +744,8 @@ impl ResolverInner {
             expirations: store.expirations,
             oversized_rejected: store.oversized_rejected,
             refreshes: self.counters.refreshes.load(Ordering::Relaxed),
+            stale_hits: self.counters.stale_hits.load(Ordering::Relaxed),
+            failure_hits: self.counters.failure_hits.load(Ordering::Relaxed),
         }
     }
 
@@ -616,8 +756,12 @@ impl ResolverInner {
         query: &Message,
         outcome: Outcome,
         correlation_id: u64,
+        group: &UpstreamGroupId,
     ) -> Result<Message> {
         let mut answer = match outcome {
+            Outcome::Stale(entry) => {
+                return self.serve_stale(query, &entry, correlation_id, group);
+            }
             Outcome::Cached(cached) => cache_hit_response(query, &cached, self.clock.now()),
             Outcome::Raw(answer) => {
                 // Not cacheable, so not rewritten: only the transaction
@@ -644,6 +788,223 @@ impl ResolverInner {
             rcode: answer.header.rcode,
         });
         Ok(answer)
+    }
+
+    /// Decides what a stored entry means for a query at `now`.
+    fn classify(&self, entry: Option<Arc<CachedAnswer>>, now: Instant) -> Found {
+        let Some(entry) = entry else {
+            return Found::Refresh {
+                stale: None,
+                backoff: None,
+            };
+        };
+        if let Some(failure) = &entry.failure {
+            // An expired failure is kept only to remember its backoff.
+            return if now < entry.expires {
+                Found::Failure(entry)
+            } else {
+                Found::Refresh {
+                    stale: None,
+                    backoff: Some(failure.backoff),
+                }
+            };
+        }
+        if now < entry.expires {
+            return Found::Fresh(entry);
+        }
+        if self.serve_stale.is_some() && now < entry.stale_until {
+            return if entry.recheck_pending(now) {
+                Found::StaleNow(entry)
+            } else {
+                Found::Refresh {
+                    stale: Some(entry),
+                    backoff: None,
+                }
+            };
+        }
+        Found::Refresh {
+            stale: None,
+            backoff: None,
+        }
+    }
+
+    /// Answers from a remembered upstream failure; the caller has counted
+    /// the lookup as a hit.
+    fn serve_failure(
+        &self,
+        query: &Message,
+        cached: &CachedAnswer,
+        correlation_id: u64,
+        group: &UpstreamGroupId,
+        now: Instant,
+    ) -> Result<Message> {
+        self.counters.failure_hits.fetch_add(1, Ordering::Relaxed);
+        self.emit_cache(CacheEvent::FailureServed {
+            correlation_id,
+            group: group.clone(),
+        });
+        if let Some(error) = cached.failure.as_ref().and_then(|f| f.error.clone()) {
+            self.emit(ObserveEvent::Failed {
+                correlation_id,
+                failure: observe_failure(&error),
+            });
+            return Err(error);
+        }
+        let mut answer = cache_hit_response(query, cached, now);
+        align_edns(query, &mut answer);
+        self.emit(ObserveEvent::Completed {
+            correlation_id,
+            rcode: answer.header.rcode,
+        });
+        Ok(answer)
+    }
+
+    /// Answers from an expired entry (RFC 8767): every record TTL is the
+    /// configured reply TTL and an EDNS client also gets Extended DNS Error 3.
+    fn serve_stale(
+        &self,
+        query: &Message,
+        entry: &CachedAnswer,
+        correlation_id: u64,
+        group: &UpstreamGroupId,
+    ) -> Result<Message> {
+        let reply_ttl = self
+            .serve_stale
+            .as_ref()
+            .map_or(DEFAULT_STALE_REPLY_TTL, ServeStale::reply_ttl_value);
+        let mut answer = stale_response(query, entry, reply_ttl);
+        align_edns(query, &mut answer);
+        mark_stale_answer(query, &mut answer);
+        self.counters.stale_hits.fetch_add(1, Ordering::Relaxed);
+        self.emit_cache(CacheEvent::StaleServed {
+            correlation_id,
+            group: group.clone(),
+        });
+        self.emit(ObserveEvent::Completed {
+            correlation_id,
+            rcode: answer.header.rcode,
+        });
+        Ok(answer)
+    }
+
+    /// Waits for the flight's leader. A query that holds a stale answer gives
+    /// up after the serve-stale client timeout, when one is configured and a
+    /// Tokio runtime is available to time it.
+    async fn wait_for_flight(
+        &self,
+        follower: Follower,
+        stale: Option<&Arc<CachedAnswer>>,
+    ) -> FlightWait {
+        let timeout = stale
+            .and(self.serve_stale.as_ref())
+            .and_then(ServeStale::client_timeout_value)
+            .filter(|_| Handle::try_current().is_ok());
+        let waited = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, follower.wait()).await {
+                Ok(waited) => waited,
+                Err(_) => return FlightWait::TimedOut,
+            },
+            None => follower.wait().await,
+        };
+        match waited {
+            Wait::Done(outcome) => FlightWait::Done(outcome),
+            Wait::Abandoned => FlightWait::Abandoned,
+        }
+    }
+
+    /// Hands the refresh of an expired entry to a background task that leads
+    /// `guard`'s flight, and returns a follower of that flight for the caller
+    /// to wait on. Gives the guard back when there is no Tokio runtime or
+    /// [`MAX_REFRESH_TASKS`] refreshes already run.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_stale_refresh(
+        self: &Arc<Self>,
+        background: &Mutex<JoinSet<()>>,
+        guard: LeaderGuard,
+        query: &Message,
+        group: &UpstreamGroupId,
+        key: &KeyBuf,
+        hash: u64,
+        stale: &Arc<CachedAnswer>,
+    ) -> std::result::Result<Follower, LeaderGuard> {
+        let Ok(handle) = Handle::try_current() else {
+            return Err(guard);
+        };
+        let mut tasks = lock(background);
+        while tasks.try_join_next().is_some() {}
+        if tasks.len() >= MAX_REFRESH_TASKS {
+            return Err(guard);
+        }
+        let follower = guard.follower();
+        let task = Arc::clone(self).refresh(
+            query.clone(),
+            group.clone(),
+            key.clone(),
+            hash,
+            Some(guard),
+            Some(Arc::clone(stale)),
+        );
+        tasks.spawn_on(task, &handle);
+        Ok(follower)
+    }
+
+    /// Reacts to the outcome of an upstream resolution that may be a failure
+    /// (an error, or a `SERVFAIL`/`REFUSED` answer).
+    ///
+    /// - A failure while `stale` holds an expired answer starts that entry's
+    ///   recheck window and returns it: the caller answers stale.
+    /// - Otherwise, with failure caching on, the failure is stored with a
+    ///   backoff that doubles `previous` (the backoff of the failure that
+    ///   expired just before), unless a purge has bumped `epoch`.
+    /// - A success forgets an expired remembered failure.
+    fn settle_failure(
+        &self,
+        query: &Message,
+        result: &Result<UpstreamAnswer>,
+        stale: Option<&Arc<CachedAnswer>>,
+        stored: Option<(&Store, &KeyBuf, u64)>,
+        previous: Option<Duration>,
+        epoch: u64,
+    ) -> Option<Arc<CachedAnswer>> {
+        if !is_failure(result) {
+            if previous.is_some()
+                && let Some((store, key, hash)) = stored
+            {
+                store.forget_failure(hash, key.as_bytes());
+            }
+            return None;
+        }
+        // The upstream call may have taken a while: both windows start now.
+        let at = self.clock.now();
+        if let (Some(entry), Some(policy)) = (stale, &self.serve_stale) {
+            entry.defer_recheck(at + policy.failure_recheck_value());
+            return Some(Arc::clone(entry));
+        }
+        if let (Some(policy), Some((store, key, hash))) = (&self.failure_cache, stored) {
+            let backoff = previous.map_or(policy.first_backoff(), |previous| {
+                policy.next_backoff(previous)
+            });
+            let (message, error) = match result {
+                Ok((answer, _, _)) => {
+                    let mut message = answer.clone();
+                    message.set_edns(None);
+                    (message, None)
+                }
+                // Never served: an error is replayed as the error itself.
+                Err(error) => (local_response(query, Rcode::ServFail), Some(error.clone())),
+            };
+            let entry = Arc::new(CachedAnswer::failure(
+                message,
+                error,
+                at,
+                backoff,
+                policy.longest_backoff(),
+            ));
+            store.insert_if(hash, key.as_bytes(), entry, at, || {
+                self.cache_epoch.load(Ordering::Acquire) == epoch
+            });
+        }
+        None
     }
 
     /// Tries the group's backends in registration order and returns the first
@@ -778,12 +1139,18 @@ impl ResolverInner {
             }
             None => None,
         };
-        let task = Arc::clone(self).refresh(query.clone(), group.clone(), key.clone(), hash, guard);
+        let task =
+            Arc::clone(self).refresh(query.clone(), group.clone(), key.clone(), hash, guard, None);
         tasks.spawn_on(task, &handle);
     }
 
-    /// Fetches a fresh answer for a popular entry in the background and
-    /// stores it, as a coalescing leader. Emits only cache events.
+    /// Fetches a fresh answer in the background and stores it, as a
+    /// coalescing leader. Emits only cache events.
+    ///
+    /// `stale` is the expired entry being revalidated, if that is why the
+    /// refresh runs (a prefetch refreshes a fresh entry and has none): when the
+    /// refresh fails, that entry's recheck window starts and the flight is
+    /// told to answer stale.
     async fn refresh(
         self: Arc<Self>,
         query: Message,
@@ -791,6 +1158,7 @@ impl ResolverInner {
         key: KeyBuf,
         hash: u64,
         guard: Option<LeaderGuard>,
+        stale: Option<Arc<CachedAnswer>>,
     ) {
         let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         self.counters.refreshes.fetch_add(1, Ordering::Relaxed);
@@ -813,8 +1181,21 @@ impl ResolverInner {
                         epoch,
                     )
                     .await;
+                let stale_used = stale.as_ref().and_then(|stale| {
+                    self.settle_failure(
+                        &query,
+                        &result,
+                        Some(stale),
+                        Some((store, &key, hash)),
+                        None,
+                        epoch,
+                    )
+                });
                 if let Some(guard) = guard {
-                    guard.finish(|| outcome_of(&result));
+                    guard.finish(|| match &stale_used {
+                        Some(entry) => Outcome::Stale(Arc::clone(entry)),
+                        None => outcome_of(&result),
+                    });
                 }
                 matches!(result, Ok((_, _, true)))
             }
@@ -1149,6 +1530,86 @@ fn parse_reverse_name(name: &Name) -> Option<std::net::IpAddr> {
 /// entry when it is cacheable, and whether that entry was stored.
 type UpstreamAnswer = (Message, Option<Arc<CachedAnswer>>, bool);
 
+/// The TTL of a stale answer when no policy says otherwise (RFC 8767 §4).
+const DEFAULT_STALE_REPLY_TTL: u32 = 30;
+
+/// What a lookup found.
+enum Found {
+    /// A fresh answer.
+    Fresh(Arc<CachedAnswer>),
+    /// A remembered upstream failure that is still being served.
+    Failure(Arc<CachedAnswer>),
+    /// An expired answer inside the recheck window of a failed refresh: serve
+    /// it without asking the upstream.
+    StaleNow(Arc<CachedAnswer>),
+    /// Nothing usable: ask the upstream. `stale` is an expired answer kept for
+    /// serve-stale, `backoff` the length of a failure that just expired.
+    Refresh {
+        stale: Option<Arc<CachedAnswer>>,
+        backoff: Option<Duration>,
+    },
+}
+
+/// How waiting on another query's flight ended.
+enum FlightWait {
+    Done(Outcome),
+    Abandoned,
+    /// The serve-stale client timeout passed.
+    TimedOut,
+}
+
+/// Whether `result` is an upstream failure: an error, or a `SERVFAIL` or
+/// `REFUSED` answer.
+fn is_failure(result: &Result<UpstreamAnswer>) -> bool {
+    match result {
+        Ok((answer, _, _)) => matches!(answer.header.rcode, Rcode::ServFail | Rcode::Refused),
+        Err(_) => true,
+    }
+}
+
+/// The outcome a coalescing leader publishes for a remembered failure.
+fn outcome_of_failure(entry: &CachedAnswer) -> Outcome {
+    match entry.failure.as_ref().and_then(|f| f.error.clone()) {
+        Some(error) => Outcome::Failed(error),
+        None => Outcome::Raw(Arc::new(entry.message.clone())),
+    }
+}
+
+/// Projects an expired entry onto a stale response for `query`: like a cache
+/// hit, but every non-OPT record TTL is `reply_ttl`.
+fn stale_response(query: &Message, entry: &CachedAnswer, reply_ttl: u32) -> Message {
+    let mut response = entry.message.clone();
+    response.header.id = query.header.id;
+    response.header.recursion_desired = query.header.recursion_desired;
+    response.header.authoritative = false;
+    response.questions = query.questions.clone();
+    for record in ttl_records_mut(&mut response) {
+        record.ttl = reply_ttl;
+    }
+    response
+}
+
+/// The Extended DNS Error option code (RFC 8914).
+const EDE_OPTION_CODE: u16 = 15;
+
+/// The Extended DNS Error info code "Stale Answer" (RFC 8914).
+const EDE_STALE_ANSWER: u16 = 3;
+
+/// Adds Extended DNS Error 3 ("Stale Answer") to `answer`'s OPT record when
+/// `query` carries a well-formed one; other queries get no OPT.
+fn mark_stale_answer(query: &Message, answer: &mut Message) {
+    if !matches!(query.edns(), Ok(Some(_))) {
+        return;
+    }
+    if let Ok(Some(mut edns)) = answer.edns()
+        && let Ok(option) =
+            EdnsOption::new(EDE_OPTION_CODE, EDE_STALE_ANSWER.to_be_bytes().to_vec())
+    {
+        edns.push_option(option);
+        answer.set_edns(Some(edns));
+    }
+}
+
 /// The outcome a coalescing leader publishes for `result`.
 fn outcome_of(result: &Result<UpstreamAnswer>) -> Outcome {
     match result {
@@ -1255,11 +1716,14 @@ fn cacheable_answer(
     if ttl == 0 {
         return None;
     }
-    Some(CachedAnswer::new(
-        message,
-        inserted,
-        inserted + Duration::from_secs(u64::from(ttl)),
-    ))
+    Some(
+        CachedAnswer::new(
+            message,
+            inserted,
+            inserted + Duration::from_secs(u64::from(ttl)),
+        )
+        .retained_for(policy.stale_window),
+    )
 }
 
 /// Builds a [`Resolver`] from a split-DNS policy and one or more upstream
@@ -1339,8 +1803,9 @@ impl ResolverBuilder {
         self
     }
 
-    /// Configures the answer cache: its memory bound, shard count and TTL
-    /// clamps. Without this call the resolver uses [`CacheConfig::new`], a
+    /// Configures the answer cache: its memory bound, shard count, TTL
+    /// clamps, and the opt-in prefetch, serve-stale and failure-caching
+    /// policies. Without this call the resolver uses [`CacheConfig::new`], a
     /// store bounded to 16 MiB (estimated). Pass [`CacheConfig::disabled`] to
     /// keep nothing; every query then goes to its upstream group.
     ///
@@ -1386,6 +1851,12 @@ impl ResolverBuilder {
                     .then(|| Arc::new(Flights::new())),
                 cache_epoch: AtomicU64::new(0),
                 prefetch: self.cache.prefetch_policy().cloned(),
+                serve_stale: self.cache.serve_stale_policy().cloned(),
+                failure_cache: self
+                    .cache
+                    .store_enabled()
+                    .then(|| self.cache.failure_cache_policy().cloned())
+                    .flatten(),
                 counters: QueryCounters::default(),
                 fake_ip: self.fake_ip,
                 route_hook: self.route_hook,
@@ -5516,5 +5987,634 @@ mod tests {
         let answer = p.resolver.resolve(&query).await.unwrap();
         assert_eq!(answer.answers[0].ttl, 95);
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Serve-stale and failure caching. ------------------------------------
+
+    fn stale_config() -> CacheConfig {
+        CacheConfig::new().serve_stale(Some(ServeStale::new()))
+    }
+
+    fn servfail_answer() -> Message {
+        let mut msg = a_answer("example.com", 0);
+        msg.answers.clear();
+        msg.header.rcode = Rcode::ServFail;
+        msg
+    }
+
+    fn first_ok() -> Result<Message> {
+        Ok(a_answer("example.com", 100))
+    }
+
+    fn count_cache_events(p: &Prefetching, wanted: fn(&CacheEvent) -> bool) -> usize {
+        cache_events(p).iter().filter(|event| wanted(event)).count()
+    }
+
+    fn is_stale_served(event: &CacheEvent) -> bool {
+        matches!(event, CacheEvent::StaleServed { .. })
+    }
+
+    fn is_failure_served(event: &CacheEvent) -> bool {
+        matches!(event, CacheEvent::FailureServed { .. })
+    }
+
+    fn count_observed(p: &Prefetching, wanted: fn(&ObserveEvent) -> bool) -> usize {
+        p.log
+            .observed
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .filter(|event| wanted(event))
+            .count()
+    }
+
+    fn is_cache_hit(event: &ObserveEvent) -> bool {
+        matches!(event, ObserveEvent::CacheHit { .. })
+    }
+
+    /// Resolves `queries` together on the current thread; once all are parked
+    /// at the gate, releases `permits`.
+    async fn resolve_all(
+        p: &Prefetching,
+        queries: &[Message],
+        permits: usize,
+    ) -> Vec<Result<Message>> {
+        let mut futures: Vec<_> = queries
+            .iter()
+            .map(|query| Box::pin(p.resolver.resolve(query)))
+            .collect();
+        let mut results: Vec<Option<Result<Message>>> = queries.iter().map(|_| None).collect();
+        for (future, result) in futures.iter_mut().zip(results.iter_mut()) {
+            tokio::select! {
+                biased;
+                done = future.as_mut() => *result = Some(done),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        p.gate.add_permits(permits);
+        for (future, result) in futures.iter_mut().zip(results.iter_mut()) {
+            if result.is_none() {
+                *result = Some(future.await);
+            }
+        }
+        results.into_iter().map(|r| r.expect("resolved")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_serves_the_stale_answer() {
+        let p = prefetching(stale_config(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+
+        let answer = p
+            .resolver
+            .resolve(&query_with_id("example.com", 7))
+            .await
+            .unwrap();
+        assert_eq!(answer.header.id, 7, "the caller's own id");
+        assert_eq!(answer.questions, query_with_id("example.com", 7).questions);
+        assert_eq!(answer.answers[0].ttl, 30, "stale reply TTL");
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            2,
+            "the upstream was asked first"
+        );
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 1);
+        assert_eq!(count_cache_events(&p, is_stale_served), 1);
+        assert!(
+            answer.edns().unwrap().is_none(),
+            "no OPT without a query OPT"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edns_client_gets_the_stale_answer_error() {
+        let p = prefetching(
+            stale_config(),
+            vec![first_ok(), Err(Error::Transport("down".into()))],
+        );
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+
+        let answer = p
+            .resolver
+            .resolve(&edns_query_for("example.com", 1232, false))
+            .await
+            .unwrap();
+        let edns = answer.edns().unwrap().expect("OPT present");
+        let ede: Vec<_> = edns
+            .options()
+            .iter()
+            .filter(|option| option.code() == 15)
+            .collect();
+        assert_eq!(ede.len(), 1);
+        assert_eq!(ede[0].data(), &[0, 3], "info code 3, Stale Answer");
+    }
+
+    #[tokio::test]
+    async fn queries_in_the_recheck_window_skip_the_upstream() {
+        let p = prefetching(stale_config(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap(); // fails, marks
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        let hits_before = count_observed(&p, is_cache_hit);
+
+        p.clock.advance(secs(10));
+        for id in 0..3 {
+            let answer = p
+                .resolver
+                .resolve(&query_with_id("example.com", id))
+                .await
+                .unwrap();
+            assert_eq!(answer.header.id, id);
+            assert_eq!(answer.answers[0].ttl, 30);
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "no upstream call");
+        assert_eq!(
+            count_observed(&p, is_cache_hit) - hits_before,
+            3,
+            "a cache hit"
+        );
+        assert_eq!(count_cache_events(&p, is_stale_served), 4);
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 4);
+
+        // The window ends 30 s after the failure: the upstream is asked again
+        // and a fresh answer replaces the entry.
+        p.clock.advance(secs(20));
+        p.gate.add_permits(1);
+        let fresh = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(fresh.answers[0].ttl, 100);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3, "now a fresh hit");
+    }
+
+    #[tokio::test]
+    async fn a_servfail_refresh_serves_stale_and_keeps_the_entry() {
+        for rcode in [Rcode::ServFail, Rcode::Refused] {
+            let mut failure = servfail_answer();
+            failure.header.rcode = rcode;
+            let p = prefetching(stale_config(), vec![first_ok(), Ok(failure)]);
+            p.resolver.resolve(&query_for("example.com")).await.unwrap();
+            p.clock.advance(secs(101));
+            p.gate.add_permits(1);
+            let answer = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+            assert_eq!(answer.header.rcode, Rcode::NoError, "{rcode:?}");
+            assert_eq!(answer.answers[0].ttl, 30);
+            assert_eq!(cache_len(&p.resolver), 1);
+            assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn another_error_answer_is_returned_and_does_not_touch_the_stale_entry() {
+        let mut formerr = servfail_answer();
+        formerr.header.rcode = Rcode::FormErr;
+        let p = prefetching(stale_config(), vec![first_ok(), Ok(formerr)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+        let answer = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(answer.header.rcode, Rcode::FormErr);
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 0);
+        assert_eq!(cache_len(&p.resolver), 1, "the stale entry is kept");
+
+        // Not a failed refresh: no recheck window, the next query asks again.
+        p.gate.add_permits(1);
+        let fresh = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(fresh.answers[0].ttl, 100);
+    }
+
+    #[tokio::test]
+    async fn an_answer_older_than_max_stale_is_not_served() {
+        let config = CacheConfig::new().serve_stale(Some(ServeStale::new().max_stale(secs(60))));
+        let p = prefetching(
+            config,
+            vec![first_ok(), Err(Error::Timeout), Err(Error::Timeout)],
+        );
+        p.resolver.resolve(&query_for("example.com")).await.unwrap(); // expires at 100
+        p.clock.advance(secs(150)); // 50 s stale
+        p.gate.add_permits(1);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_ok());
+
+        p.clock.advance(secs(20)); // 70 s stale: past max_stale (60 s)
+        p.gate.add_permits(1);
+        let result = p.resolver.resolve(&query_for("example.com")).await;
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_stale_is_off_by_default() {
+        let p = prefetching(CacheConfig::new(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+        let result = p.resolver.resolve(&query_for("example.com")).await;
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 0);
+        assert_eq!(cache_len(&p.resolver), 0, "nothing is retained");
+    }
+
+    #[tokio::test]
+    async fn reply_ttl_and_failure_recheck_are_configurable() {
+        let config = CacheConfig::new().serve_stale(Some(
+            ServeStale::new()
+                .reply_ttl(secs(5))
+                .failure_recheck(secs(2)),
+        ));
+        let p = prefetching(config, vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+        let answer = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(answer.answers[0].ttl, 5);
+
+        p.clock.advance(secs(1));
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "still inside 2 s");
+        p.clock.advance(secs(1));
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3, "window over");
+    }
+
+    #[tokio::test]
+    async fn many_queries_on_a_stale_entry_cost_one_upstream_call() {
+        let p = prefetching(stale_config(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+
+        let queries: Vec<_> = (100..120)
+            .map(|id| query_with_id("example.com", id))
+            .collect();
+        let results = resolve_all(&p, &queries, 1).await;
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            2,
+            "one refresh for 20 queries"
+        );
+        for (query, result) in queries.iter().zip(results) {
+            let answer = result.unwrap();
+            assert_eq!(answer.header.id, query.header.id);
+            assert_eq!(answer.answers[0].ttl, 30);
+        }
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 20);
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 0);
+
+        // A second batch inside the recheck window makes no call at all.
+        let again: Vec<_> = (200..220)
+            .map(|id| query_with_id("example.com", id))
+            .collect();
+        let results = resolve_all(&p, &again, 0).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 40);
+    }
+
+    #[tokio::test]
+    async fn stale_answers_are_per_cache_key() {
+        let p = prefetching(stale_config(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(2);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap(); // stale
+        // Another name has nothing stale: it goes upstream and is cached.
+        let other = p
+            .resolver
+            .resolve(&query_for("other.example"))
+            .await
+            .unwrap();
+        assert_eq!(other.answers[0].ttl, 100);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(cache_len(&p.resolver), 2);
+    }
+
+    // Failure caching.
+
+    fn failure_config() -> CacheConfig {
+        CacheConfig::new().failure_cache(Some(FailureCache::new()))
+    }
+
+    fn millis(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_served_without_an_upstream_call_until_its_backoff_ends() {
+        let p = prefetching(
+            failure_config(),
+            vec![Err(Error::Timeout), Err(Error::Timeout)],
+        );
+        let first = p.resolver.resolve(&query_for("example.com")).await;
+        assert!(matches!(first, Err(Error::Timeout)));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+
+        p.clock.advance(millis(500));
+        let cached = p.resolver.resolve(&query_with_id("example.com", 9)).await;
+        assert!(matches!(cached, Err(Error::Timeout)));
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "served from the failure entry"
+        );
+        assert_eq!(p.resolver.cache_stats().failure_hits(), 1);
+        assert_eq!(count_cache_events(&p, is_failure_served), 1);
+        assert_eq!(count_observed(&p, is_cache_hit), 1);
+
+        p.clock.advance(millis(500)); // 1 s: the first backoff is over
+        p.gate.add_permits(1);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_back_off_exponentially_up_to_the_maximum() {
+        let config = CacheConfig::new().failure_cache(Some(FailureCache::new().max(secs(4))));
+        let p = prefetching(config, (0..8).map(|_| Err(Error::Timeout)).collect());
+        let mut expected_calls = 0;
+        // Each tuple is the backoff the failure just stored.
+        for backoff in [1, 2, 4, 4] {
+            p.gate.add_permits(1);
+            assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+            expected_calls += 1;
+            assert_eq!(p.calls.load(Ordering::SeqCst), expected_calls);
+
+            p.clock.advance(secs(backoff) - millis(1));
+            assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+            assert_eq!(
+                p.calls.load(Ordering::SeqCst),
+                expected_calls,
+                "still cached after just under {backoff} s"
+            );
+            p.clock.advance(millis(1));
+        }
+        assert_eq!(p.resolver.cache_stats().failure_hits(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_failure_backoff() {
+        let p = prefetching(
+            failure_config(),
+            vec![
+                Err(Error::Timeout),
+                Err(Error::Timeout),
+                first_ok(),
+                Err(Error::Timeout),
+            ],
+        );
+        for step in [1, 2] {
+            p.gate.add_permits(1);
+            assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+            p.clock.advance(secs(step)); // exactly the backoff just stored
+        }
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap(); // success
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        p.clock.advance(secs(101)); // the answer expires
+
+        p.gate.add_permits(1);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+        assert_eq!(p.calls.load(Ordering::SeqCst), 4);
+        // The backoff started over at 1 s, not 4 s.
+        p.clock.advance(secs(1));
+        p.gate.add_permits(1);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_ok());
+        assert_eq!(p.calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn a_cached_servfail_answer_carries_the_current_query_id() {
+        let p = prefetching(failure_config(), vec![Ok(servfail_answer())]);
+        let first = p
+            .resolver
+            .resolve(&query_with_id("example.com", 1))
+            .await
+            .unwrap();
+        assert_eq!(first.header.rcode, Rcode::ServFail);
+
+        let second = p
+            .resolver
+            .resolve(&query_with_id("example.com", 2))
+            .await
+            .unwrap();
+        assert_eq!(second.header.rcode, Rcode::ServFail);
+        assert_eq!(second.header.id, 2);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(p.resolver.cache_stats().failure_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_caching_is_off_by_default() {
+        let p = prefetching(
+            CacheConfig::new(),
+            vec![Err(Error::Timeout), Err(Error::Timeout)],
+        );
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+        p.gate.add_permits(1);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(p.resolver.cache_stats().failure_hits(), 0);
+        assert_eq!(cache_len(&p.resolver), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failure_does_not_affect_other_names() {
+        let p = prefetching(failure_config(), vec![Err(Error::Timeout)]);
+        assert!(p.resolver.resolve(&query_for("example.com")).await.is_err());
+        p.gate.add_permits(1);
+        let other = p
+            .resolver
+            .resolve(&query_for("other.example"))
+            .await
+            .unwrap();
+        assert_eq!(other.header.rcode, Rcode::NoError);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stale_entry_wins_over_failure_caching() {
+        let config = stale_config().failure_cache(Some(FailureCache::new()));
+        let p = prefetching(
+            config,
+            vec![first_ok(), Err(Error::Timeout), Err(Error::Timeout)],
+        );
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1);
+        let stale = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(stale.answers[0].ttl, 30);
+
+        // After the recheck window the upstream is asked again and the stale
+        // answer is still there: no failure entry replaced it.
+        p.clock.advance(secs(31));
+        p.gate.add_permits(1);
+        let again = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(again.answers[0].ttl, 30);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(p.resolver.cache_stats().failure_hits(), 0);
+        assert_eq!(count_cache_events(&p, is_failure_served), 0);
+    }
+
+    #[tokio::test]
+    async fn a_flush_during_the_call_stops_the_failure_from_being_stored() {
+        let p = prefetching(failure_config(), vec![Err(Error::Timeout)]);
+        p.gate.acquire().await.unwrap().forget(); // park the first call
+        let query = query_for("example.com");
+        let mut future = Box::pin(p.resolver.resolve(&query));
+        tokio::select! {
+            biased;
+            _ = future.as_mut() => panic!("must park at the gate"),
+            () = tokio::task::yield_now() => {}
+        }
+        p.resolver.clear_cache();
+        p.gate.add_permits(1);
+        assert!(future.await.is_err());
+        assert_eq!(cache_len(&p.resolver), 0, "the stale epoch is not stored");
+
+        p.gate.add_permits(1);
+        p.resolver.resolve(&query).await.unwrap();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    // Client timeout (Tokio paused time: the timer auto-advances when idle).
+
+    fn timeout_config() -> CacheConfig {
+        CacheConfig::new().serve_stale(Some(ServeStale::new().client_timeout(Some(millis(200)))))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_client_timeout_serves_stale_while_the_refresh_continues() {
+        let p = prefetching(timeout_config(), vec![first_ok()]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101)); // stale; the gate has no permit
+
+        let answer = p
+            .resolver
+            .resolve(&query_with_id("example.com", 5))
+            .await
+            .unwrap();
+        assert_eq!(answer.header.id, 5);
+        assert_eq!(answer.answers[0].ttl, 30);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "the refresh is running");
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 1);
+        assert_eq!(
+            upstream_attempts(&p),
+            1,
+            "the timed-out query made no attempt of its own"
+        );
+        assert!(
+            cache_events(&p)
+                .iter()
+                .any(|event| matches!(event, CacheEvent::RefreshStarted { .. }))
+        );
+
+        p.gate.add_permits(1);
+        settle().await;
+        assert_eq!(p.in_flight.load(Ordering::SeqCst), 0);
+        assert!(cache_events(&p).iter().any(|event| matches!(
+            event,
+            CacheEvent::RefreshCompleted {
+                refreshed: true,
+                ..
+            }
+        )));
+        let fresh = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(fresh.answers[0].ttl, 100);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_fails_after_the_timeout_starts_the_recheck_window() {
+        let p = prefetching(timeout_config(), vec![first_ok(), Err(Error::Timeout)]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.resolver.resolve(&query_for("example.com")).await.unwrap(); // timed out
+        p.gate.add_permits(1);
+        settle().await;
+        assert!(cache_events(&p).iter().any(|event| matches!(
+            event,
+            CacheEvent::RefreshCompleted {
+                refreshed: false,
+                ..
+            }
+        )));
+
+        let answer = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(answer.answers[0].ttl, 30);
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "the window holds");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_queries_on_a_stale_entry_time_out_on_one_refresh() {
+        let p = prefetching(timeout_config(), vec![first_ok()]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+
+        let (q1, q2, q3) = (
+            query_with_id("example.com", 1),
+            query_with_id("example.com", 2),
+            query_with_id("example.com", 3),
+        );
+        let (a, b, c) = tokio::join!(
+            p.resolver.resolve(&q1),
+            p.resolver.resolve(&q2),
+            p.resolver.resolve(&q3),
+        );
+        for (id, result) in [(1, a), (2, b), (3, c)] {
+            let answer = result.unwrap();
+            assert_eq!(answer.header.id, id);
+            assert_eq!(answer.answers[0].ttl, 30);
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2, "one refresh");
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_faster_than_the_timeout_returns_the_fresh_answer() {
+        let p = prefetching(
+            timeout_config(),
+            vec![first_ok(), Ok(a_answer("example.com", 77))],
+        );
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+        p.gate.add_permits(1); // the refresh answers at once
+
+        let answer = p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(answer.answers[0].ttl, 77);
+        assert_eq!(p.resolver.cache_stats().stale_hits(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_client_timeout_needs_coalescing() {
+        let config = timeout_config().coalesce(false);
+        let p = prefetching(config, vec![first_ok()]);
+        p.resolver.resolve(&query_for("example.com")).await.unwrap();
+        p.clock.advance(secs(101));
+
+        let query = query_for("example.com");
+        let mut future = Box::pin(p.resolver.resolve(&query));
+        tokio::select! {
+            biased;
+            _ = future.as_mut() => panic!("must wait for the upstream"),
+            () = tokio::task::yield_now() => {}
+        }
+        p.gate.add_permits(1);
+        let answer = future.await.unwrap();
+        assert_eq!(
+            answer.answers[0].ttl, 100,
+            "waited inline for the fresh answer"
+        );
+        assert!(
+            !cache_events(&p)
+                .iter()
+                .any(|event| matches!(event, CacheEvent::RefreshStarted { .. }))
+        );
     }
 }

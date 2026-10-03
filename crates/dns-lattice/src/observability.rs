@@ -45,8 +45,36 @@ pub enum CacheEvent {
         /// The group whose upstream call was joined.
         group: UpstreamGroupId,
     },
-    /// A background refresh of a popular cache entry began (see
-    /// [`Prefetch`](crate::cache::Prefetch)). It belongs to no client query:
+    /// The query was answered with an expired answer (see
+    /// [`ServeStale`](crate::cache::ServeStale)). It is emitted before the
+    /// terminal [`ObserveEvent::Completed`]: either after
+    /// [`ObserveEvent::CacheHit`] (the entry is inside the recheck window of a
+    /// failed refresh and the upstream was not asked) or after
+    /// [`ObserveEvent::CacheMiss`] (the refresh failed or timed out).
+    #[non_exhaustive]
+    StaleServed {
+        /// Opaque identifier correlating every event emitted for this query.
+        correlation_id: u64,
+        /// The group whose cache scope held the answer.
+        group: UpstreamGroupId,
+    },
+    /// The query was answered with a remembered upstream failure (see
+    /// [`FailureCache`](crate::cache::FailureCache)) without an upstream call.
+    /// It is emitted after [`ObserveEvent::CacheHit`] and before the terminal
+    /// [`ObserveEvent::Completed`] (a cached `SERVFAIL`/`REFUSED` answer) or
+    /// [`ObserveEvent::Failed`] (a cached error).
+    #[non_exhaustive]
+    FailureServed {
+        /// Opaque identifier correlating every event emitted for this query.
+        correlation_id: u64,
+        /// The group whose cache scope held the failure.
+        group: UpstreamGroupId,
+    },
+    /// A background refresh of a cache entry began: a popular entry about to
+    /// expire (see [`Prefetch`](crate::cache::Prefetch)) or an expired one a
+    /// query handed over under a
+    /// [`ServeStale::client_timeout`](crate::cache::ServeStale::client_timeout).
+    /// It belongs to no client query:
     /// its `correlation_id` is fresh, shared only with the matching
     /// [`CacheEvent::RefreshCompleted`], and no [`ObserveEvent`] carries it.
     #[non_exhaustive]

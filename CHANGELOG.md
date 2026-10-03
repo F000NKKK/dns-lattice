@@ -68,6 +68,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at most 256 refreshes run at a time, a hit outside a Tokio runtime starts
   none, and dropping the `Resolver` aborts the running refreshes. It is off
   by default: without it the resolver still spawns no tasks.
+- Opt-in serve-stale (RFC 8767): `dns_lattice::cache::ServeStale` (`new`,
+  `max_stale`, `reply_ttl`, `failure_recheck`, `client_timeout`),
+  `CacheConfig::serve_stale`, `CacheStats::stale_hits` and
+  `CacheEvent::StaleServed`. An expired answer is kept for `max_stale`
+  (default one day, at most seven) after its TTL. A query that finds one
+  still asks the upstream first; if the resolution fails (every backend
+  failed, or `SERVFAIL`/`REFUSED`) it gets the expired answer with every
+  record TTL set to `reply_ttl` (default 30 s) and, for a query with an EDNS
+  OPT record, Extended DNS Error 3 (Stale Answer, RFC 8914). A failed
+  refresh starts a `failure_recheck` window (default 30 s) in which queries
+  are answered stale without an upstream call, and queries arriving during a
+  refresh share it, so a dead upstream sees at most one call per stale name.
+  Only a `NOERROR` or `NXDOMAIN` answer replaces a stored one. With
+  `client_timeout` the caller is answered stale once the timeout passes
+  while the refresh continues in a background task that stores its answer
+  (this needs coalescing and a Tokio runtime, spawns a task bound to the
+  `Resolver`, and reports `CacheEvent::RefreshStarted`/`RefreshCompleted`).
+  It is off by default; expired answers are then dropped as before.
+- Opt-in failure caching (RFC 9520): `dns_lattice::cache::FailureCache`
+  (`new`, `initial`, `max`), `CacheConfig::failure_cache`,
+  `CacheStats::failure_hits` and `CacheEvent::FailureServed`. A failed
+  resolution (an error, or a `SERVFAIL`/`REFUSED` answer) is remembered per
+  cache identity for `initial` (default 1 s, clamped to 1 to 300 s), doubling
+  per further consecutive failure up to `max` (default 30 s); queries in
+  that time get the same error or answer, with their own id, without an
+  upstream call. A success clears the backoff, a flush drops it, and a
+  stale answer, when serve-stale holds one, takes precedence. It is off by
+  default; failures are then never stored. The entries count against the
+  cache's byte bound.
 
 ### Changed
 
