@@ -377,6 +377,11 @@ mod facade_path_tests {
         let _: Option<fakeip::FakeIpPool> = None;
         let _: Option<server::Server> = None;
         let _: Option<upstream::UdpBackend> = None;
+        let _: fn() -> upstream::PoolConfig = upstream::PoolConfig::new;
+        let _: fn() -> upstream::PoolConfig = upstream::PoolConfig::disabled;
+        let _: fn(&upstream::PoolConfig) -> bool = upstream::PoolConfig::is_enabled;
+        let _: Option<upstream::PoolStats> = None;
+        let _: fn(&upstream::PoolStats) -> u64 = upstream::PoolStats::connections_open;
         let _: Option<core::Error> = None;
         let _: Option<core::Result<()>> = None;
     }

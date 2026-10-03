@@ -78,6 +78,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
+// The pool core (admission, connect de-duplication, lifecycle, wire-id
+// table) is exercised by its own tests only until the transport backends
+// adopt it; the allow goes away as they do.
+#[allow(dead_code)]
+mod pool;
+pub use pool::{PoolConfig, PoolStats};
+
 #[cfg(feature = "dot")]
 mod dot;
 #[cfg(feature = "dot")]

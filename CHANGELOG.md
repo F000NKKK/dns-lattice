@@ -97,6 +97,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale answer, when serve-stale holds one, takes precedence. It is off by
   default; failures are then never stored. The entries count against the
   cache's byte bound.
+- `upstream::PoolConfig` and `upstream::PoolStats` describe upstream
+  connection reuse and report its counters. `PoolConfig` holds the policy:
+  `max_connections` (default 4, clamped to 1..=16), `max_in_flight` queries
+  per connection (default 64, clamped to 1..=256), `idle_timeout` (default
+  20 s, at least 1 s) and `max_lifetime` (default 10 minutes, `None` for
+  unlimited, otherwise at least 1 s); `PoolConfig::disabled` switches reuse
+  off. `PoolStats` is a snapshot of the connection, query, retry, queueing
+  and unsolicited-frame counters. The pool core behind them bounds admission
+  to `max_connections x max_in_flight` queries in arrival order, shares one
+  connection attempt between waiting callers, and ends idle and over-age
+  connections; the transport backends adopt it in later changes, so nothing
+  reuses a connection yet.
 
 ### Changed
 
