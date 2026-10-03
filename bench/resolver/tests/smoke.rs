@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use dns_lattice::upstream::PoolConfig;
 use dns_lattice_bench_resolver::Proto;
 use dns_lattice_bench_resolver::dl::{Connect, DlContestant};
 use dns_lattice_bench_resolver::fixture::Fixture;
@@ -213,7 +214,7 @@ async fn the_stats_port_reports_the_counters() {
 // ----------------------------------------------------- connection models ---
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dns_lattice_opens_a_connection_per_query_and_hickory_reuses_one() {
+async fn dns_lattice_pools_tcp_and_dot_while_doh_still_opens_a_connection_per_query() {
     const QUERIES: u64 = 5;
     for proto in [Proto::Tcp, Proto::Dot, Proto::Doh2] {
         let env = start(ResponderConfig::default()).await;
@@ -223,10 +224,31 @@ async fn dns_lattice_opens_a_connection_per_query_and_hickory_reuses_one() {
         }
         let seen = env.responder.counters().snapshot(proto);
         assert_eq!(seen.queries, QUERIES, "dl {proto}");
-        assert_eq!(
-            seen.connections, QUERIES,
-            "dl {proto}: one connection per query"
-        );
+        if proto == Proto::Doh2 {
+            // DoH has no connection reuse yet.
+            assert_eq!(
+                seen.connections, QUERIES,
+                "dl {proto}: one connection per query"
+            );
+        } else {
+            assert_eq!(seen.connections, 1, "dl {proto}: one pooled connection");
+        }
+
+        if proto != Proto::Doh2 {
+            // With the pool switched off the earlier model is still there.
+            let env = start(ResponderConfig::default()).await;
+            let dl = DlContestant::with_pool(&env.connect(proto, TIMEOUT), PoolConfig::disabled())
+                .unwrap();
+            for index in 0..QUERIES {
+                assert_eq!(one(&dl, Mix::A, &format!("0-{index}")).await, Outcome::Ok);
+            }
+            let seen = env.responder.counters().snapshot(proto);
+            assert_eq!(seen.queries, QUERIES, "dl {proto} unpooled");
+            assert_eq!(
+                seen.connections, QUERIES,
+                "dl {proto} unpooled: one connection per query"
+            );
+        }
 
         let env = start(ResponderConfig::default()).await;
         let hk = HkContestant::new(&env.connect(proto, TIMEOUT)).unwrap();
@@ -241,14 +263,17 @@ async fn dns_lattice_opens_a_connection_per_query_and_hickory_reuses_one() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn handshakes_are_counted_per_encrypted_connection() {
-    let env = start(ResponderConfig::default()).await;
-    let dl = DlContestant::new(&env.connect(Proto::Dot, TIMEOUT)).unwrap();
-    for index in 0..3 {
-        assert_eq!(one(&dl, Mix::A, &format!("0-{index}")).await, Outcome::Ok);
+    // Pooled: one connection, one handshake. Unpooled: a handshake per query.
+    for (pool, handshakes) in [(PoolConfig::new(), 1), (PoolConfig::disabled(), 3)] {
+        let env = start(ResponderConfig::default()).await;
+        let dl = DlContestant::with_pool(&env.connect(Proto::Dot, TIMEOUT), pool).unwrap();
+        for index in 0..3 {
+            assert_eq!(one(&dl, Mix::A, &format!("0-{index}")).await, Outcome::Ok);
+        }
+        let seen = env.responder.counters().snapshot(Proto::Dot);
+        assert_eq!(seen.handshakes, handshakes);
+        assert!(seen.resumed <= seen.handshakes);
     }
-    let seen = env.responder.counters().snapshot(Proto::Dot);
-    assert_eq!(seen.handshakes, 3);
-    assert!(seen.resumed <= seen.handshakes);
 }
 
 // ---------------------------------------------------------- fairness knobs ---

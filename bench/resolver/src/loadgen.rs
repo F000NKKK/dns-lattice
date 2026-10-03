@@ -8,7 +8,7 @@
 //! resolution itself is identical.
 //!
 //! A run has a warm-up phase, whose samples are discarded (it establishes
-//! hickory's connection pool and TLS tickets for both sides), and a
+//! the connection pools and TLS tickets of both sides), and a
 //! measurement phase. A query counts toward the measurement if it was
 //! *started* during the measurement phase; workers finish their last
 //! in-flight query after the phase ends.

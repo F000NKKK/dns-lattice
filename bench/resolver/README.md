@@ -118,12 +118,16 @@ Fairness settings, identical for both libraries:
 | Responder | The same process and settings for both; one responder instance per client run. |
 
 Connection model (read this before comparing encrypted-transport rows):
-dns-lattice opens a new connection (and, for DoT, DoH and DoQ, a new TLS or
-QUIC handshake, resumed when the server issues a ticket) for every query,
-whereas hickory pools and multiplexes connections: one per concurrent
-worker with 16 workers in a loop. The responder counters in each result
-show it. The encrypted-transport rows therefore compare two connection
-models, not only two codecs and runtimes. hickory's pooled connections
+on TCP and DoT dns-lattice reuses and pipelines a small pool of connections
+(by default up to 4, with 64 queries in flight on each), whereas hickory
+pools and multiplexes connections of its own: one per concurrent worker with
+16 workers in a loop. On DoH over HTTP/2, DoH over HTTP/3 and DoQ dns-lattice
+still opens a new connection (and a new TLS or QUIC handshake, resumed when
+the server issues a ticket) for every query; those transports move to pooling
+in later changes. The responder counters in each result show the connection
+counts, so the TCP and DoT rows compare two pooling designs and the other
+encrypted rows still compare two connection models, not only two codecs and
+runtimes. hickory's pooled connections
 also have a bounded request queue (32 slots); a burst of more than 32
 simultaneous requests onto one already-established connection fails with
 a "channel is full" error that the client binary reports under its own

@@ -12,7 +12,9 @@
 //!   requires; DoH and DoH3 set their own);
 //! - the default answer cache.
 //!
-//! dns-lattice opens a connection per query on TCP, DoT, DoH, DoH3 and DoQ.
+//! dns-lattice reuses and pipelines connections on TCP and DoT by default
+//! (a small pool; [`DlContestant::with_pool`] can switch it off), and still
+//! opens a connection per query on DoH, DoH3 and DoQ.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -26,8 +28,8 @@ use dns_lattice::model::{
 };
 use dns_lattice::upstream::{
     Doh3Backend, Doh3BackendConfig, DohBackend, DohBackendConfig, DohMethod, DoqBackend,
-    DoqBackendConfig, DotBackend, DotBackendConfig, TcpBackend, TcpBackendConfig, UdpBackend,
-    UdpBackendConfig,
+    DoqBackendConfig, DotBackend, DotBackendConfig, PoolConfig, TcpBackend, TcpBackendConfig,
+    UdpBackend, UdpBackendConfig,
 };
 use rustls::pki_types::ServerName;
 
@@ -69,6 +71,17 @@ impl DlContestant {
     ///
     /// Returns a message if the TLS configuration or a name is invalid.
     pub fn new(connect: &Connect) -> Result<Self, String> {
+        Self::with_pool(connect, PoolConfig::new())
+    }
+
+    /// Builds the contestant for `connect` with an explicit connection-reuse
+    /// policy for the TCP and DoT backends (the other transports have none
+    /// yet and ignore it).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the TLS configuration or a name is invalid.
+    pub fn with_pool(connect: &Connect, pool: PoolConfig) -> Result<Self, String> {
         let server = SocketAddr::from((Ipv4Addr::LOCALHOST, connect.port));
         let tls = Arc::new(fixture::client_config(&connect.ca_der).map_err(|e| e.to_string())?);
         let server_name =
@@ -94,7 +107,8 @@ impl DlContestant {
                     server,
                     connect_timeout: connect.timeout,
                     read_timeout: connect.timeout,
-                }),
+                })
+                .with_pool(pool),
             ),
             Proto::Dot => builder.backend(
                 group,
@@ -104,7 +118,8 @@ impl DlContestant {
                     tls_config: tls,
                     connect_timeout: connect.timeout,
                     read_timeout: connect.timeout,
-                }),
+                })
+                .with_pool(pool),
             ),
             Proto::Doh2 => builder.backend(
                 group,
