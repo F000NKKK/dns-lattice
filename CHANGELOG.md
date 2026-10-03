@@ -107,10 +107,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and unsolicited-frame counters. The pool core behind them bounds admission
   to `max_connections x max_in_flight` queries in arrival order, shares one
   connection attempt between waiting callers, and ends idle and over-age
-  connections; the transport backends adopt it in later changes, so nothing
-  reuses a connection yet.
+  connections.
+- `TcpBackend::with_pool`, `DotBackend::with_pool` and the matching
+  `pool_stats` snapshot accessors choose the connection-reuse policy of a
+  backend and read its counters. `PoolConfig::disabled()` restores the
+  earlier behaviour of one connection per query.
 
 ### Changed
+
+- `TcpBackend` and `DotBackend` now reuse connections by default and pipeline
+  queries (RFC 7766 section 6.2.1.1, RFC 7858 section 3.3). Each backend
+  owns a small pool (by default up to 4 connections with 64 queries in
+  flight each) with one reader task and one writer task per connection; idle
+  connections close after 20 s and every connection is replaced after 10
+  minutes. The caller's message id is replaced by a per-connection id on the
+  wire and restored on the answer. A DoT reconnect still resumes the TLS
+  session through the shared `ClientConfig`. Consequences to plan for:
+  - a backend now spawns Tokio tasks and holds sockets while it is alive, so
+    it must be used from one Tokio runtime (use `PoolConfig::disabled()` for a
+    backend shared across short-lived runtimes), and dropping it closes its
+    connections;
+  - an upstream sees one connection carrying the queries of many clients;
+  - a query that fails because a reused connection was closed is sent once
+    more on a fresh connection (only for opcode QUERY and only while its
+    time budget lasts); timeouts, TLS and validation errors are never
+    retried;
+  - the error classes are unchanged, with one exception: a reply whose
+    message id matches no pending query is an unsolicited frame, which is
+    dropped, so such a query ends with `Error::Timeout` instead of
+    `Error::Transport`. A connection that receives more than 16 unsolicited
+    frames in a row, not counting frames answering queries that were
+    cancelled or timed out, is closed;
+  - a reply that cannot be decoded closes the connection and fails the
+    queries pending on it;
+  - the time budget of one call is not longer than before: connect timeout
+    plus two read timeouts for TCP, plus three for DoT.
+  `UdpBackend` is unchanged, and its fallback to TCP after a truncated answer
+  still uses one connection per query.
 
 - Raised the minimum supported Rust version (MSRV) from 1.93 to 1.99 for
   every crate and the benchmark harness. No public API change.

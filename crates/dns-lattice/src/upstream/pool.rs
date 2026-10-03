@@ -111,6 +111,16 @@ const MAX_TABLE_CAPACITY: usize = u16::MAX as usize;
 /// many clients, so the upstream can correlate them more easily than with one
 /// connection per query.
 ///
+/// Pass a configuration to [`TcpBackend::with_pool`](super::TcpBackend::with_pool)
+/// (and the matching `with_pool` of the other connection-reusing backends);
+/// [`TcpBackend::pool_stats`](super::TcpBackend::pool_stats) reports the
+/// resulting [`PoolStats`].
+#[cfg_attr(feature = "dot", doc = "")]
+#[cfg_attr(
+    feature = "dot",
+    doc = "The DoT backend takes it through [`DotBackend::with_pool`](super::DotBackend::with_pool)."
+)]
+///
 /// # Example
 ///
 /// ```
@@ -249,7 +259,9 @@ impl PoolConfig {
     }
 }
 
-/// A snapshot of one backend's connection-pool counters.
+/// A snapshot of one backend's connection-pool counters, returned by
+/// [`TcpBackend::pool_stats`](super::TcpBackend::pool_stats) and the matching
+/// method of the other connection-reusing backends.
 ///
 /// The counters are read individually with relaxed atomics, so under load the
 /// values are each correct but not an atomic cut across all of them. A
@@ -354,7 +366,24 @@ struct Counters {
     reused_queries: AtomicU64,
     retries: AtomicU64,
     queued: AtomicU64,
-    unsolicited: AtomicU64,
+    /// Shared with the connections' reader tasks through [`PoolHooks`].
+    unsolicited: Arc<AtomicU64>,
+}
+
+/// What a connection's background tasks may report to the pool that owns it.
+///
+/// It holds only a counter, never the pool, so a task that keeps it alive
+/// cannot keep the pool alive.
+#[derive(Debug, Clone)]
+pub(crate) struct PoolHooks {
+    unsolicited: Arc<AtomicU64>,
+}
+
+impl PoolHooks {
+    /// Counts one frame that matched no pending query.
+    pub(crate) fn record_unsolicited(&self) {
+        Counters::bump(&self.unsolicited);
+    }
 }
 
 impl Counters {
@@ -400,6 +429,11 @@ impl AbortOnDrop {
     pub(crate) fn is_finished(&self) -> bool {
         self.0.is_finished()
     }
+
+    /// Aborts the task now, without waiting for the guard to be dropped.
+    pub(crate) fn abort(&self) {
+        self.0.abort();
+    }
 }
 
 impl Drop for AbortOnDrop {
@@ -423,8 +457,9 @@ pub(crate) trait Connector: Send + Sync + 'static {
     /// bound itself with the transport's own connect timeout (a transport
     /// must pass its `connect_timeout` here): a connect that never completes
     /// would keep every caller waiting until its own deadline, and the pool
-    /// only stops the connect when the pool is dropped.
-    fn connect(&self) -> impl Future<Output = Result<Self::Conn>> + Send;
+    /// only stops the connect when the pool is dropped. `hooks` lets the
+    /// connection's tasks report to the pool's counters.
+    fn connect(&self, hooks: PoolHooks) -> impl Future<Output = Result<Self::Conn>> + Send;
 
     /// Whether the connection is still usable. It is called while the pool's
     /// state lock is held, so it must be a cheap, synchronous check that
@@ -606,7 +641,13 @@ impl<K: Connector> Shared<K> {
             .is_some_and(|until| now < until)
     }
 
-    fn pick(&self, st: &State<K::Conn>, now: Instant) -> Pick {
+    /// Chooses where one caller goes. With `fresh` the caller wants a
+    /// connection that has not answered a query yet (a retry after a reused
+    /// connection failed): an existing one is used when there is one, a
+    /// connect is waited for or started when there is room for one, and only
+    /// a pool already at `max_connections` falls back to the least loaded
+    /// connection.
+    fn pick(&self, st: &State<K::Conn>, now: Instant, fresh: bool) -> Pick {
         let cap = self.config.max_in_flight_value();
         let max_connections = self.config.max_connections_value();
         let threshold = (cap / 4).max(1);
@@ -616,12 +657,26 @@ impl<K: Connector> Shared<K> {
             .filter(|e| e.draining_since.is_none())
             .count();
         let connecting = st.connecting.is_some();
-        let best = st
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.draining_since.is_none() && e.in_flight < cap)
-            .min_by_key(|(_, e)| e.in_flight);
+        let usable = |e: &Entry<K::Conn>| e.draining_since.is_none() && e.in_flight < cap;
+        let fresh_best = if fresh {
+            st.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| usable(e) && !e.answered)
+                .min_by_key(|(_, e)| e.in_flight)
+        } else {
+            None
+        };
+        if fresh && fresh_best.is_none() && (connecting || live < max_connections) {
+            return Pick::Wait { start: !connecting };
+        }
+        let best = fresh_best.or_else(|| {
+            st.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| usable(e))
+                .min_by_key(|(_, e)| e.in_flight)
+        });
         match best {
             Some((idx, entry)) => Pick::Use {
                 idx,
@@ -759,7 +814,18 @@ async fn run_connect<K: Connector>(shared: Weak<Shared<K>>, connector: Arc<K>, e
         epoch,
         armed: true,
     };
-    let result = connector.connect().await;
+    let hooks = {
+        // Not held across the connect: the pool must stay droppable while a
+        // connect is in progress.
+        let Some(strong) = shared.upgrade() else {
+            guard.armed = false;
+            return;
+        };
+        PoolHooks {
+            unsolicited: Arc::clone(&strong.counters.unsolicited),
+        }
+    };
+    let result = connector.connect(hooks).await;
     guard.armed = false;
     if let Some(shared) = shared.upgrade() {
         Shared::finish_connect(&shared, epoch, result);
@@ -818,6 +884,10 @@ pub(crate) struct Lease<K: Connector> {
     shared: Arc<Shared<K>>,
     entry_id: u64,
     conn: Arc<K::Conn>,
+    /// The connection had answered a query when the lease was granted; only
+    /// the tests read it back (the stream engine asks the connection itself
+    /// whether it has answered, at the time of the failure).
+    #[cfg_attr(not(test), allow(dead_code))]
     reused: bool,
     // Dropped after the slot is released in `Drop::drop`.
     _permit: OwnedSemaphorePermit,
@@ -830,8 +900,8 @@ impl<K: Connector> Lease<K> {
     }
 
     /// Whether the connection had already answered a query when this lease
-    /// was granted (so a failure may be a stale-pool artefact worth one
-    /// retry on a fresh connection).
+    /// was granted.
+    #[cfg(test)]
     pub(crate) fn is_reused(&self) -> bool {
         self.reused
     }
@@ -964,11 +1034,6 @@ impl<K: Connector> Pool<K> {
         }
     }
 
-    /// The pool's configuration.
-    pub(crate) fn config(&self) -> &PoolConfig {
-        &self.shared.config
-    }
-
     /// A snapshot of the pool's counters.
     pub(crate) fn stats(&self) -> PoolStats {
         self.shared.counters.snapshot()
@@ -977,11 +1042,6 @@ impl<K: Connector> Pool<K> {
     /// Counts one query resent on a fresh connection.
     pub(crate) fn record_retry(&self) {
         Counters::bump(&self.shared.counters.retries);
-    }
-
-    /// Counts one frame that matched no pending query.
-    pub(crate) fn record_unsolicited(&self) {
-        Counters::bump(&self.shared.counters.unsolicited);
     }
 
     /// Retires idle, rotated and dead connections now, without waiting for
@@ -1004,6 +1064,18 @@ impl<K: Connector> Pool<K> {
     /// waiting on it. A connect failure is returned to every caller that was
     /// waiting for it.
     pub(crate) async fn acquire(&self, deadline: Instant) -> Result<Lease<K>> {
+        self.acquire_inner(deadline, false).await
+    }
+
+    /// Like [`Pool::acquire`], for a retry after a reused connection failed:
+    /// prefers a connection that has not answered a query yet, opening one
+    /// when the pool has room, so the retry does not land on another
+    /// possibly stale connection.
+    pub(crate) async fn acquire_fresh(&self, deadline: Instant) -> Result<Lease<K>> {
+        self.acquire_inner(deadline, true).await
+    }
+
+    async fn acquire_inner(&self, deadline: Instant, fresh: bool) -> Result<Lease<K>> {
         let shared = &self.shared;
         let mut queued = false;
         let permit = match Arc::clone(&shared.admission).try_acquire_owned() {
@@ -1026,7 +1098,7 @@ impl<K: Connector> Pool<K> {
             let step = {
                 let mut st = lock(&shared.state);
                 shared.sweep_locked(&mut st, now, &mut closing);
-                match shared.pick(&st, now) {
+                match shared.pick(&st, now, fresh) {
                     Pick::Use { idx, scale_up } => {
                         if scale_up {
                             Shared::start_connect_locked(shared, &mut st);
@@ -1158,16 +1230,19 @@ impl<T> PendingTable<T> {
     }
 
     /// Slots in use, pending and orphaned.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// Whether no slot is in use.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
     /// Slots holding a pending query.
+    #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.slots
             .values()
@@ -1222,9 +1297,23 @@ impl<T> PendingTable<T> {
 
     /// Turns a pending query into a tombstone (it was cancelled or timed
     /// out), returning its value. `None` when `id` is not pending.
+    #[cfg(test)]
     pub(crate) fn orphan(&mut self, id: u16, now: Instant) -> Option<T> {
-        if !matches!(self.slots.get(&id), Some(Slot::Pending(_))) {
-            return None;
+        self.orphan_if(id, now, |_| true)
+    }
+
+    /// Like [`PendingTable::orphan`], but only when the pending value passes
+    /// `owned`: a guard that outlived its slot (the answer was delivered and
+    /// the id was handed out again) must not tombstone someone else's query.
+    pub(crate) fn orphan_if(
+        &mut self,
+        id: u16,
+        now: Instant,
+        owned: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
+        match self.slots.get(&id) {
+            Some(Slot::Pending(value)) if owned(value) => {}
+            _ => return None,
         }
         let number = self.next_tombstone;
         self.next_tombstone += 1;
@@ -1300,6 +1389,7 @@ mod tests {
         probes: Mutex<Vec<Arc<ConnProbe>>>,
         dropped_connect: Arc<AtomicBool>,
         hang: AtomicBool,
+        hooks: Mutex<Vec<PoolHooks>>,
     }
 
     impl Fake {
@@ -1312,6 +1402,7 @@ mod tests {
                 probes: Mutex::new(Vec::new()),
                 dropped_connect: Arc::new(AtomicBool::new(false)),
                 hang: AtomicBool::new(false),
+                hooks: Mutex::new(Vec::new()),
             })
         }
 
@@ -1345,7 +1436,8 @@ mod tests {
     impl Connector for Fake {
         type Conn = FakeConn;
 
-        async fn connect(&self) -> Result<FakeConn> {
+        async fn connect(&self, hooks: PoolHooks) -> Result<FakeConn> {
+            lock(&self.hooks).push(hooks);
             let _flag = SetOnDrop(Arc::clone(&self.dropped_connect));
             self.connects.fetch_add(1, Ordering::SeqCst);
             if self.hang.load(Ordering::SeqCst) {
@@ -1874,7 +1966,9 @@ mod tests {
         let pool = pool_with(config(1, 1), &fake);
         pool.record_retry();
         pool.record_retry();
-        pool.record_unsolicited();
+        // A connection's tasks report through the hooks the connector got.
+        pool.acquire(deadline()).await.unwrap().complete();
+        lock(&fake.hooks)[0].record_unsolicited();
         assert_eq!(pool.stats().retries(), 2);
         assert_eq!(pool.stats().unsolicited(), 1);
     }
@@ -1998,6 +2092,67 @@ mod tests {
         assert_eq!(pool.stats().connections_open(), 1);
         assert_eq!(pool.stats().closed_idle(), 1);
         drop(l1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_idle_connection_is_closed_on_time_while_the_janitor_sleeps_on_a_long_lifetime() {
+        let fake = Fake::new();
+        // The first connection's lifetime deadline is 600 s away, so the
+        // janitor sleeps until then unless a new connection wakes it.
+        let pool = pool_with(
+            config(2, 4)
+                .max_lifetime(Some(Duration::from_secs(600)))
+                .idle_timeout(Duration::from_secs(20)),
+            &fake,
+        );
+        let l1 = pool.acquire(deadline()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let l2 = pool.acquire(deadline()).await.unwrap(); // scale-up starts
+        drop(l2);
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 2);
+        // The second connection went idle at t=10 and is due at t=30 while
+        // the first stays busy and the janitor's own deadline is t=600.
+        tokio::time::advance(Duration::from_secs(21)).await;
+        settle().await;
+        let stats = pool.stats();
+        assert_eq!(stats.connections_open(), 1);
+        assert_eq!(stats.closed_idle(), 1);
+        drop(l1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_acquire_opens_a_new_connection_when_every_one_has_answered() {
+        let fake = Fake::new();
+        let pool = pool_with(config(2, 4), &fake);
+        pool.acquire(deadline()).await.unwrap().complete();
+        let lease = pool.acquire_fresh(deadline()).await.unwrap();
+        assert_eq!(fake.connects(), 2);
+        assert!(
+            !lease.is_reused(),
+            "the new connection has answered nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_acquire_falls_back_to_the_least_loaded_connection_when_the_pool_is_full() {
+        let fake = Fake::new();
+        let pool = pool_with(config(1, 4), &fake);
+        pool.acquire(deadline()).await.unwrap().complete();
+        let lease = pool.acquire_fresh(deadline()).await.unwrap();
+        assert_eq!(fake.connects(), 1);
+        assert!(lease.is_reused());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_acquire_reuses_a_connection_that_has_not_answered_yet() {
+        let fake = Fake::new();
+        let pool = pool_with(config(1, 4), &fake);
+        let first = pool.acquire(deadline()).await.unwrap();
+        let second = pool.acquire_fresh(deadline()).await.unwrap();
+        assert_eq!(fake.connects(), 1);
+        assert!(!second.is_reused());
+        drop((first, second));
     }
 
     #[tokio::test(start_paused = true)]

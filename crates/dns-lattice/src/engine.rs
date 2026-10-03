@@ -110,16 +110,20 @@ impl Clock for FakeClock {
 /// # Lifecycle
 ///
 /// Construct via [`Resolver::builder`], call [`Resolver::resolve`] as many
-/// times as needed, then drop. The resolver spawns no threads and no tasks
-/// unless [`CacheConfig::prefetch`] is configured (a cache hit may start a
-/// background refresh on the Tokio runtime it runs in) or serve-stale has a
+/// times as needed, then drop. The resolver itself spawns no threads and no
+/// tasks unless [`CacheConfig::prefetch`] is configured (a cache hit may
+/// start a background refresh on the Tokio runtime it runs in) or
+/// serve-stale has a
 /// [`client_timeout`](crate::cache::ServeStale::client_timeout) (a query on
-/// an expired answer hands its refresh to a background task). There is no
-/// explicit `shutdown` method — dropping the resolver aborts every refresh
+/// an expired answer hands its refresh to a background task). A registered
+/// [`crate::upstream::TcpBackend`] or DoT backend keeps pooled connections
+/// and spawns two tasks per connection on the runtime that first used it, so
+/// the resolver then has to stay on one Tokio runtime (see
+/// [`PoolConfig::disabled`](crate::upstream::PoolConfig::disabled)). There is
+/// no explicit `shutdown` method — dropping the resolver aborts every refresh
 /// still running, and Rust's ordinary drop semantics release everything else
-/// it owns (including any sockets a registered
-/// [`crate::upstream::UdpBackend`]/[`crate::upstream::TcpBackend`] opens per
-/// call).
+/// it owns, including the pooled connections of its backends and any socket
+/// a [`crate::upstream::UdpBackend`] opens per call.
 pub struct Resolver {
     inner: Arc<ResolverInner>,
     /// Background refresh tasks; dropping the set aborts them.

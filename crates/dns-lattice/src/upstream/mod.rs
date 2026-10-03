@@ -60,6 +60,15 @@
 //! client config, HTTP method) live on the new config structs, not the
 //! trait.
 //!
+//! # Connection reuse
+//!
+//! [`TcpBackend`] and the DoT backend keep a bounded pool of connections to
+//! their upstream and pipeline the queries of all callers over them; see
+//! [`PoolConfig`], [`PoolStats`] and each backend's `with_pool` and
+//! `pool_stats`. Reuse is on by default and [`PoolConfig::disabled`] turns it
+//! off. [`UdpBackend`] (including its TCP fallback for truncated answers) and
+//! the DoH and DoQ backends still use a socket or connection per query.
+//!
 //! # Runtime requirement
 //!
 //! Both [`UdpBackend`] and [`TcpBackend`] perform real socket I/O via
@@ -67,6 +76,15 @@
 //! [`UpstreamBackend::resolve`] (and therefore
 //! [`crate::engine::Resolver::resolve`], once a backend of this kind is
 //! registered) from inside a `tokio` runtime context.
+//!
+//! A backend with connection reuse enabled also starts Tokio tasks (a reader
+//! and a writer per connection) the first time it needs a connection. Such a
+//! backend must stay on the one runtime for its whole life; a program that
+//! builds a runtime for each call must switch reuse off with
+//! [`PoolConfig::disabled`]. A pool whose runtime has shut down notices that
+//! its connections are dead and reconnects on the runtime that calls it next
+//! (a query that finds a connection dead is sent again on a fresh one), so
+//! it degrades to a connection per runtime rather than failing for good.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -78,12 +96,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
-// The pool core (admission, connect de-duplication, lifecycle, wire-id
-// table) is exercised by its own tests only until the transport backends
-// adopt it; the allow goes away as they do.
-#[allow(dead_code)]
 mod pool;
 pub use pool::{PoolConfig, PoolStats};
+
+mod stream;
+use stream::{StreamOpen, StreamPool};
 
 #[cfg(feature = "dot")]
 mod dot;
@@ -404,27 +421,124 @@ pub struct TcpBackendConfig {
 
 /// Baseline TCP upstream backend (RFC 1035 §4.2.2: 2-byte big-endian length
 /// prefix followed by the encoded message).
+///
+/// # Connection reuse
+///
+/// By default the backend keeps a small pool of connections to the upstream
+/// and sends the queries of all callers over them, several at a time and
+/// without waiting for each answer (RFC 7766 §6.2.1.1 pipelining). The
+/// upstream may answer in any order; every caller gets the answer to its own
+/// question, with its own message id. A [`PoolConfig`] passed to
+/// [`with_pool`](Self::with_pool) sets the bounds (connections, queries per
+/// connection, idle timeout, maximum lifetime), and
+/// [`pool_stats`](Self::pool_stats) reports what the pool did.
+/// [`PoolConfig::disabled`] restores one connection per query.
+///
+/// A query is sent again, once, on a fresh connection when the pooled
+/// connection it used had already answered a query and then failed at the
+/// connection level (the server closed or reset it) and the query's opcode
+/// is `QUERY`. Timeouts, validation mismatches and undecodable answers are
+/// never retried, and the error classes are the ones the backend always
+/// returned.
+///
+/// A response is accepted only for a query that is waiting for it. A frame
+/// that matches no waiting query (for example a response with a different
+/// message id) is dropped, so such a reply is no longer reported as
+/// [`Error::Transport`] but leaves the query to time out; a response that
+/// matches a waiting query but not its question is reported as
+/// [`Error::Transport`], as before. An upstream that sends more than 16
+/// stray frames in a row has its connection closed.
+///
+/// With reuse enabled the backend starts Tokio tasks and keeps sockets open
+/// between queries, so it must be used from one Tokio runtime for its whole
+/// life (a pattern that builds a runtime per call must use
+/// [`PoolConfig::disabled`]); dropping the backend closes its connections
+/// and ends its tasks. One connection then carries the queries of many
+/// clients, which the upstream can correlate more easily than one
+/// connection per query.
 pub struct TcpBackend {
     config: TcpBackendConfig,
+    pool: Option<StreamPool<TcpOpen>>,
 }
 
 impl TcpBackend {
-    /// Builds a TCP backend from `config`.
+    /// Builds a TCP backend from `config` with connection reuse on
+    /// ([`PoolConfig::new`]).
     pub fn new(config: TcpBackendConfig) -> Self {
-        Self { config }
+        Self { config, pool: None }.with_pool(PoolConfig::new())
+    }
+
+    /// Replaces the connection-reuse policy. [`PoolConfig::disabled`] makes
+    /// every query use a connection of its own, as before connection reuse
+    /// existed.
+    #[must_use]
+    pub fn with_pool(mut self, pool: PoolConfig) -> Self {
+        self.pool = pool.is_enabled().then(|| {
+            let read = self.config.read_timeout;
+            StreamPool::new(
+                pool,
+                TcpOpen {
+                    server: self.config.server,
+                    connect_timeout: self.config.connect_timeout,
+                },
+                read,
+                // The longest one call could take without reuse: connect,
+                // write, read.
+                self.config
+                    .connect_timeout
+                    .saturating_add(read.saturating_mul(2)),
+            )
+        });
+        self
+    }
+
+    /// A snapshot of the connection pool's counters. All zeros when reuse is
+    /// disabled.
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool
+            .as_ref()
+            .map_or_else(PoolStats::default, StreamPool::stats)
+    }
+}
+
+/// Opens the plain TCP connections of a [`TcpBackend`] pool.
+struct TcpOpen {
+    server: SocketAddr,
+    connect_timeout: Duration,
+}
+
+impl StreamOpen for TcpOpen {
+    type Stream = TcpStream;
+
+    async fn open(&self) -> Result<TcpStream> {
+        let stream = timeout(self.connect_timeout, TcpStream::connect(self.server))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|err| Error::Transport(err.to_string()))?;
+        // Pipelined queries are small and latency sensitive: do not let
+        // Nagle's algorithm hold a query back until the previous one is
+        // acknowledged.
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
     }
 }
 
 #[async_trait]
 impl UpstreamBackend for TcpBackend {
     async fn resolve(&self, query: &Message) -> Result<Message> {
-        tcp_query(
-            self.config.server,
-            self.config.connect_timeout,
-            self.config.read_timeout,
-            query,
-        )
-        .await
+        match &self.pool {
+            Some(pool) => pool.query(query).await,
+            None => {
+                tcp_query(
+                    self.config.server,
+                    self.config.connect_timeout,
+                    self.config.read_timeout,
+                    query,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -585,6 +699,8 @@ mod tests {
     use dns_lattice_model::{
         Class, Header, Name, Opcode, Question, RData, Rcode, RecordType, ResourceRecord,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     fn query_for(name: &str) -> Message {
@@ -615,6 +731,19 @@ mod tests {
         msg.header.id = id;
         msg.header.qr = true;
         msg
+    }
+
+    /// Binds a UDP socket and a TCP listener on the same loopback port. An
+    /// ephemeral UDP port can already be taken by a TCP socket of another
+    /// test, so the pair is retried on a fresh port.
+    async fn bind_udp_tcp_pair() -> (UdpSocket, TcpListener) {
+        for _ in 0..50 {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
+                return (udp, tcp);
+            }
+        }
+        panic!("no free loopback port for a UDP/TCP pair");
     }
 
     #[tokio::test]
@@ -649,9 +778,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_backend_falls_back_to_tcp_on_truncated_response() {
-        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (udp_server, tcp_listener) = bind_udp_tcp_pair().await;
         let udp_addr = udp_server.local_addr().unwrap();
-        let tcp_listener = TcpListener::bind(udp_addr).await.unwrap();
 
         let udp_responder = tokio::spawn(async move {
             let mut buf = [0u8; 512];
@@ -1232,9 +1360,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_backend_falls_back_to_tcp_without_the_opt_when_truncated() {
-        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (udp_server, tcp_listener) = bind_udp_tcp_pair().await;
         let addr = udp_server.local_addr().unwrap();
-        let tcp_listener = TcpListener::bind(addr).await.unwrap();
 
         let udp_responder = tokio::spawn(async move {
             let (query, from) = recv_query(&udp_server).await;
@@ -1294,37 +1421,68 @@ mod tests {
         framed.extend_from_slice(&framed_len.to_be_bytes());
         framed.extend_from_slice(&bytes);
         stream.write_all(&framed).await.unwrap();
+        // Keep the connection open until the client closes it, so a pooled
+        // client's behaviour does not depend on the server hanging up.
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest).await;
     }
 
+    /// The backend must reject a response that does not answer the query.
+    /// Without pooling the id is compared against the one sent, so a wrong
+    /// id is a transport error. A pooled connection matches answers by the
+    /// id it assigned itself, so an answer carrying an unknown id is an
+    /// unsolicited frame that is dropped, and the query times out.
     #[tokio::test]
-    async fn tcp_backend_rejects_mismatching_responses_as_transport_errors() {
-        let responders: [fn(&Message) -> Message; 3] = [
-            |query| answer_for("example.com", query.header.id.wrapping_add(1)),
-            |query| {
-                let mut reply = answer_for("example.com", query.header.id);
-                reply.header.qr = false;
-                reply
-            },
-            |query| answer_for("example.org", query.header.id),
+    async fn tcp_backend_rejects_mismatching_responses() {
+        type Respond = fn(&Message) -> Message;
+        let responders: [(&str, Respond, bool); 3] = [
+            (
+                "wrong id",
+                |query| answer_for("example.com", query.header.id.wrapping_add(1)),
+                true,
+            ),
+            (
+                "qr zero",
+                |query| {
+                    let mut reply = answer_for("example.com", query.header.id);
+                    reply.header.qr = false;
+                    reply
+                },
+                false,
+            ),
+            (
+                "wrong question",
+                |query| answer_for("example.org", query.header.id),
+                false,
+            ),
         ];
 
-        for respond in responders {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let responder = tokio::spawn(serve_one_tcp_response(listener, respond));
+        for pool in [PoolConfig::disabled(), PoolConfig::new()] {
+            let pooled = pool.is_enabled();
+            for (case, respond, id_case) in responders {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let responder = tokio::spawn(serve_one_tcp_response(listener, respond));
 
-            let backend = TcpBackend::new(TcpBackendConfig {
-                server: addr,
-                connect_timeout: Duration::from_secs(2),
-                read_timeout: Duration::from_secs(2),
-            });
+                let backend = TcpBackend::new(TcpBackendConfig {
+                    server: addr,
+                    connect_timeout: Duration::from_secs(2),
+                    read_timeout: Duration::from_millis(400),
+                })
+                .with_pool(pool.clone());
 
-            let err = backend
-                .resolve(&query_for("example.com"))
-                .await
-                .expect_err("a mismatching tcp response is rejected");
-            assert!(matches!(err, Error::Transport(_)), "{err:?}");
-            responder.await.unwrap();
+                let err = backend
+                    .resolve(&query_for("example.com"))
+                    .await
+                    .expect_err("a mismatching tcp response is rejected");
+                if pooled && id_case {
+                    assert!(matches!(err, Error::Timeout), "{case}: {err:?}");
+                } else {
+                    assert!(matches!(err, Error::Transport(_)), "{case}: {err:?}");
+                }
+                drop(backend);
+                responder.await.unwrap();
+            }
         }
     }
 
@@ -1347,6 +1505,7 @@ mod tests {
             .await
             .expect("the name comparison is case-insensitive");
         assert!(answer.header.qr);
+        drop(backend);
         responder.await.unwrap();
     }
 
@@ -1387,7 +1546,173 @@ mod tests {
             .await
             .expect("the resolver fails over to the matching upstream");
         assert_eq!(answer.questions, query_for("example.com").questions);
+        drop(resolver);
         bad_responder.await.unwrap();
         good_responder.await.unwrap();
+    }
+
+    // ---- pooled TCP over loopback ---------------------------------------------
+
+    /// A loopback TCP DNS server that counts accepted connections. Each
+    /// connection answers every query immediately and, when
+    /// `answers_per_connection` is set, hangs up after that many answers.
+    struct CountingServer {
+        addr: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    impl CountingServer {
+        async fn start(answers_per_connection: Option<usize>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve_connection(stream, answers_per_connection));
+                }
+            });
+            CountingServer { addr, accepted }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        fn backend(&self) -> TcpBackend {
+            TcpBackend::new(TcpBackendConfig {
+                server: self.addr,
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(5),
+            })
+        }
+    }
+
+    async fn serve_connection(mut stream: TcpStream, limit: Option<usize>) {
+        let mut served = 0usize;
+        loop {
+            if limit.is_some_and(|n| served >= n) {
+                return;
+            }
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let mut payload = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            let query = Message::decode(&payload).unwrap();
+            let mut response = query.clone();
+            response.header.qr = true;
+            let bytes = response.encode().unwrap();
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            if stream.write_all(&framed).await.is_err() {
+                return;
+            }
+            served += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_tcp_backend_reuses_one_connection_for_sequential_queries() {
+        let server = CountingServer::start(None).await;
+        let backend = server.backend();
+        for i in 0..5 {
+            let name = format!("n{i}.example.com");
+            let answer = backend.resolve(&query_for(&name)).await.unwrap();
+            assert_eq!(answer.questions, query_for(&name).questions);
+            assert_eq!(answer.header.id, 11);
+        }
+        assert_eq!(server.accepted(), 1);
+        let stats = backend.pool_stats();
+        assert_eq!(stats.queries(), 5);
+        assert_eq!(stats.reused_queries(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_concurrent_tcp_queries_share_a_few_connections() {
+        let server = CountingServer::start(None).await;
+        let backend = Arc::new(
+            server
+                .backend()
+                .with_pool(PoolConfig::new().max_connections(2)),
+        );
+        let calls: Vec<_> = (0..200)
+            .map(|i| {
+                let backend = Arc::clone(&backend);
+                tokio::spawn(async move {
+                    let name = format!("c{i}.example.com");
+                    let answer = backend.resolve(&query_for(&name)).await.unwrap();
+                    assert_eq!(answer.questions, query_for(&name).questions);
+                    assert_eq!(answer.header.id, 11);
+                })
+            })
+            .collect();
+        for call in calls {
+            call.await.unwrap();
+        }
+        assert!(server.accepted() <= 2, "{} connections", server.accepted());
+        assert_eq!(backend.pool_stats().queries(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_pool_opens_one_connection_per_query() {
+        let server = CountingServer::start(None).await;
+        let backend = server.backend().with_pool(PoolConfig::disabled());
+        for i in 0..3 {
+            backend
+                .resolve(&query_for(&format!("d{i}.example.com")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(server.accepted(), 3);
+        assert_eq!(backend.pool_stats(), PoolStats::default());
+    }
+
+    #[tokio::test]
+    async fn tcp_backend_reconnects_after_the_server_closes_after_a_few_answers() {
+        let server = CountingServer::start(Some(2)).await;
+        let backend = server.backend();
+        for i in 0..6 {
+            let name = format!("r{i}.example.com");
+            let answer = backend.resolve(&query_for(&name)).await.unwrap();
+            assert_eq!(answer.questions, query_for(&name).questions);
+        }
+        assert_eq!(server.accepted(), 3);
+    }
+
+    /// The pool belongs to the runtime that first used it: after that
+    /// runtime is gone, the next query on another runtime replaces the dead
+    /// connection transparently.
+    #[test]
+    fn a_pooled_backend_recovers_when_its_runtime_is_replaced() {
+        let server_rt = tokio::runtime::Runtime::new().unwrap();
+        let server = server_rt.block_on(CountingServer::start(None));
+        let backend = server.backend();
+
+        let first = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        first
+            .block_on(backend.resolve(&query_for("one.example.com")))
+            .unwrap();
+        drop(first);
+
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answer = second
+            .block_on(backend.resolve(&query_for("two.example.com")))
+            .expect("the dead connection is replaced");
+        assert_eq!(answer.questions, query_for("two.example.com").questions);
+        assert_eq!(server.accepted(), 2);
     }
 }
