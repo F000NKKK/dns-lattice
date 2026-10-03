@@ -1,0 +1,26 @@
+# Client scenarios run by `scripts/bench-resolver.sh run`.
+# Tab-separated: id, group, proto, mix, cache, concurrency.
+# Every row runs both libraries (dl-client and hk-client) against the same
+# responder, so a row is a head-to-head pair. `--variants` selects rows by
+# group or by id. Use 0 in the concurrency column to take --concurrency.
+# cold: distinct names, upstream TTL 0. warm: shared names, upstream TTL 3600,
+# valid only if the upstream saw no query during the measurement.
+client-udp-c16	client-udp	udp	a	cold	16
+client-udp-c256	client-udp	udp	a	cold	256
+client-tcp-c16	client-tcp	tcp	a	cold	16
+client-tcp-c256	client-tcp	tcp	a	cold	256
+client-dot-c16	client-dot	dot	a	cold	16
+client-dot-c256	client-dot	dot	a	cold	256
+client-doh2-c16	client-doh2	doh2	a	cold	16
+client-doh2-c256	client-doh2	doh2	a	cold	256
+client-doh3-c16	client-doh3	doh3	a	cold	16
+client-doh3-c256	client-doh3	doh3	a	cold	256
+client-doq-c16	client-doq	doq	a	cold	16
+client-doq-c256	client-doq	doq	a	cold	256
+mix-udp-aaaa	mix	udp	aaaa	cold	16
+mix-udp-txt	mix	udp	txt	cold	16
+mix-udp-nx	mix	udp	nx	cold	16
+cache-udp-c16	cache	udp	a	warm	16
+cache-udp-c256	cache	udp	a	warm	256
+cache-dot-c16	cache	dot	a	warm	16
+cache-doh2-c16	cache	doh2	a	warm	16

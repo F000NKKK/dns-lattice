@@ -22,18 +22,66 @@ publish = false
 description = "Unpublished benchmark harness comparing the dns-lattice resolver with hickory."
 readme = "README.md"
 
-# The harness library (`src/`) parses and builds DNS bytes by hand, so it
-# depends on neither library under test. Requirements are kept identical to
-# the root workspace's [workspace.dependencies] where they share one;
-# update them together.
-[dev-dependencies]
+# The harness library's wire module parses and builds DNS bytes by hand, so
+# the upstream responder depends on neither library under test; only the
+# contestant binaries (dl-client, hk-client) and the smoke tests use them.
+# Requirements are kept identical to the root workspace's
+# [workspace.dependencies] where they share one; update them together.
+[dependencies]
 dns-lattice = { path = "../../crates/dns-lattice", features = ["dot", "doh", "doq"] }
+# hickory: aws-lc-rs only (never ring), no system-config so resolv.conf and
+# the registry are never read. `webpki-roots` only lets its default
+# TlsConfig compile; the roots actually used are injected by the harness.
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
+    "tokio",
+    "tls-aws-lc-rs",
+    "https-aws-lc-rs",
+    "quic-aws-lc-rs",
+    "h3-aws-lc-rs",
+    "webpki-roots",
+] }
+tokio = { version = "1.53.1", default-features = false, features = [
+    "net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync", "signal", "io-std",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["tls12", "std", "aws-lc-rs"] }
+rustls-pki-types = "1.15.1"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+hyper = { version = "1.11.1", features = ["server", "http2"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "http2"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rcgen = "0.14.10"
+hdrhistogram = { version = "7", default-features = false }
+serde_json = "1.0.151"
+
+[dev-dependencies]
 # Codec and name comparison only: `std` (its only default feature), no
 # DNSSEC and no `ring`.
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 async-trait = "0.1.92"
-tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
+[[bin]]
+name = "responder"
+path = "src/bin/responder.rs"
+bench = false
+test = false
+
+[[bin]]
+name = "dl-client"
+path = "src/bin/dl-client.rs"
+bench = false
+test = false
+
+[[bin]]
+name = "hk-client"
+path = "src/bin/hk-client.rs"
+bench = false
+test = false
 
 # The library has no libtest benchmarks; keeping it out of `cargo bench`
 # lets criterion options (`--warm-up-time`, `--save-baseline`, ...) pass

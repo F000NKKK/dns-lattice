@@ -13,22 +13,33 @@ publish.
 
 ## Status
 
-The criterion micro-benchmarks below are in place. A loopback resolver
-benchmark (both libraries resolving against one library-neutral upstream
-over UDP, TCP, DoT, DoH and DoQ) and a forwarding-server benchmark are
-planned on top of the same harness.
+The criterion micro-benchmarks and the loopback client benchmark are in
+place: both libraries resolve against one library-neutral upstream over UDP,
+TCP, DoT, DoH over HTTP/2, DoH over HTTP/3 and DoQ, with cold and
+cache-hit scenarios. A forwarding-server benchmark is planned on top of the
+same harness.
 
 ## Requirements
 
 - Rust 1.93 or newer (the dns-lattice MSRV).
 - Any platform for the micro-benchmarks. No privileges and no network
   access are needed: everything runs in-process.
+- Linux for the client benchmark's CPU and memory figures (they read
+  `/proc`) and for `scripts/bench-resolver.sh run`. Everything binds to
+  `127.0.0.1` on ephemeral ports and needs no privileges.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `src/wire.rs` | Hand-written DNS query parsing and deterministic response building. It uses neither library under test, so it can serve as a neutral upstream and as identical codec input for both. |
+| `src/fixture.rs` | A throwaway CA and leaf certificate (`dns.bench.test` and `127.0.0.1`), and the one TLS client configuration both libraries share. |
+| `src/responder.rs`, `src/bin/responder.rs` | The loopback upstream: UDP, TCP, DoT (pipelined), DoH2, DoH3 and DoQ. Fixed reply latency, A, AAAA, TXT and NXDOMAIN-with-SOA answers, and per-transport counters (queries, connections, handshakes, resumed) served on a stats port. |
+| `src/loadgen.rs` | The closed-loop load generator: each worker keeps one query in flight; warm-up, measurement and stop phases; an HDR histogram per run. |
+| `src/dl.rs`, `src/hk.rs`, `src/bin/dl-client.rs`, `src/bin/hk-client.rs` | The two contestants behind one interface, and a client binary per library that prints one JSON result. |
+| `src/metrics.rs`, `src/cli.rs` | Process CPU and memory from `/proc`; argument handling for the binaries. |
+| `variants.tsv` | The client scenarios `scripts/bench-resolver.sh run` executes. |
+| `tests/smoke.rs` | Loopback tests of the responder, both contestants, the load loop and the client binaries. |
 | `benches/codec.rs` | Message decode and encode, dns-lattice and hickory-proto on the same bytes. |
 | `benches/name.rs` | Name parsing, hashing (`HashMap` lookups) and case-insensitive equality, both libraries. |
 | `benches/matcher.rs` | `DomainMatcher` and `SplitDnsPolicy` with 10, 1,000 and 100,000 rules (dns-lattice only). |
@@ -72,9 +83,73 @@ Things to keep in mind when reading the numbers:
   of the rules are exact, a third suffix and a third wildcard. The probes
   are taken from the middle of the set.
 
+## Client benchmark
+
+`dl-client` and `hk-client` run a closed loop (a fixed number of workers,
+each with one query in flight) against the responder and print one JSON
+document: queries, queries per second, latency percentiles (p50, p90, p99,
+p99.9, max), outcome counts, process CPU per 1,000 queries, resident
+memory, and the responder's connection and handshake counts during the
+measurement. A run is marked `valid: false` (and the binary exits 1) if no
+query completed, more than 0.1% of the queries failed, or, in a warm run,
+the upstream saw any query during the measurement.
+
+Scenarios (`variants.tsv`):
+
+- **client-\<transport\>**: distinct names per worker, upstream TTL 0, so
+  every query goes to the wire; concurrency 16 and 256.
+- **mix**: AAAA, TXT (about 1.1 KB) and NXDOMAIN answers over UDP.
+- **cache**: all workers share a small set of names that is resolved first
+  and served with TTL 3600, so the measurement is answer-cache hits.
+
+Fairness settings, identical for both libraries:
+
+| Setting | Value |
+| --- | --- |
+| Attempts | One. dns-lattice never retries a backend; hickory's `attempts` counts retries, so it is set to `0` (a test checks that this sends exactly one query). |
+| Timeout | 2 s per query. |
+| EDNS(0) | On, 1232-byte payload, on every transport. |
+| Concurrency limit | hickory `max_active_requests = 256`, at least the highest concurrency, so its default of 32 cannot produce busy errors. |
+| TLS | One client configuration (aws-lc-rs, default protocol versions, only the fixture CA trusted). |
+| Answer cache | Each library's default. |
+| hickory | `num_concurrent_reqs = 1`, no TCP retry on error, no 0x20 case randomization, hosts file off, one name server. |
+| Responder | The same process and settings for both; one responder instance per client run. |
+
+Connection model (read this before comparing encrypted-transport rows):
+dns-lattice opens a new connection (and, for DoT, DoH and DoQ, a new TLS or
+QUIC handshake, resumed when the server issues a ticket) for every query,
+whereas hickory pools and multiplexes connections: one per concurrent
+worker with 16 workers in a loop. The responder counters in each result
+show it. The encrypted-transport rows therefore compare two connection
+models, not only two codecs and runtimes. hickory's pooled connections
+also have a bounded request queue (32 slots); a burst of more than 32
+simultaneous requests onto one already-established connection fails with
+a "channel is full" error that the client binary reports under its own
+label, not as busy. The closed-loop scenarios do not hit it at
+concurrency 256.
+
 ## Running
 
 From the repository root:
+
+```sh
+# Build the responder and the two clients (release).
+scripts/bench-resolver.sh build
+
+# A short local pass over a few scenarios.
+scripts/bench-resolver.sh run --variants client-udp-c16,client-dot-c16,cache --reps 1 --duration 2 --warmup 1
+
+# Everything, three repetitions, results kept under a directory.
+scripts/bench-resolver.sh run --out target/bench-resolver/results/full
+```
+
+`run` writes `meta.json` (commit, toolchain, kernel, resolved versions)
+and, per scenario and repetition, `dl.json`, `hk.json` and the responder's
+final counters. It pins the clients and the responder to disjoint CPU
+halves when `taskset` and at least four CPUs are available
+(`--no-pin` disables that), and alternates which library runs first.
+
+The micro-benchmarks:
 
 ```sh
 # Every micro-benchmark, criterion's default timing.
