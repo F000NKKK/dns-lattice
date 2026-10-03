@@ -7,7 +7,7 @@
 [![crates.io](https://img.shields.io/crates/v/dns-lattice-model.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice-model)
 [![docs.rs](https://img.shields.io/docsrs/dns-lattice-model?cacheSeconds=86400)](https://docs.rs/dns-lattice-model)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
 
 [Overview](#-overview) • [Features](#-key-features)
 • [Installation](#-installation) • [Quick Start](#-quick-start)

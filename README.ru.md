@@ -11,7 +11,7 @@
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
 [![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](Cargo.toml)
 
 ![Linux](https://img.shields.io/badge/Linux-supported-success)
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
@@ -163,7 +163,7 @@ application-specific routing. DNS Lattice разделяет эти ответс
   запросам без неё (с одним повтором без неё после `FORMERR` или `NOTIMP` и
   удалением её из ответа);
 - входящий сервер отвечает UDP-клиентам с EDNS(0) не более чем
-  min(размер payload клиента, поднятый до 512, 1232 байта)
+  min(max(размер payload клиента, 512), 1232 байта), то есть не менее 512
   (`ServerBuilder::edns_udp_payload_size`
   меняет 1232), а клиентам без EDNS — не более чем 512 байтами; более
   крупные ответы отправляются пустыми с `TC=1`, и клиент повторяет запрос
@@ -698,7 +698,7 @@ DNS Lattice не выпускает сертификаты и не владее�
 
 ## ✅ Feature и platform constraints
 
-MSRV: **Rust 1.93**.
+MSRV: **Rust 1.99**.
 
 CI валидирует поддерживаемый facade surface на:
 

@@ -100,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the minimum supported Rust version (MSRV) from 1.93 to 1.99 for
+  every crate and the benchmark harness. No public API change.
 - Resolver query coalescing, default behaviour: concurrent cache misses for
   the same cache identity now share one upstream query instead of sending
   one each. The first query leads; the others wait for its result and are

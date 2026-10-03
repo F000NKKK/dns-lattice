@@ -9,7 +9,7 @@
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
 [![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](https://github.com/F000NKKK/dns-lattice/blob/main/LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](https://github.com/F000NKKK/dns-lattice)
 
 ![Linux](https://img.shields.io/badge/Linux-supported-success)
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
@@ -60,7 +60,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
 Features are independent and default-off; without any of them the crate builds UDP and TCP,
-client and server, on `tokio` alone. MSRV: Rust 1.93.
+client and server, on `tokio` alone. MSRV: Rust 1.99.
 
 - `dot`: DNS-over-TLS (`rustls`, `tokio-rustls`, `webpki-roots`);
 - `doh`: DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3 (`hyper`, `hyper-rustls`, `h3`,

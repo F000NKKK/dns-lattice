@@ -16,7 +16,7 @@
 name = "dns-lattice-bench-resolver"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.99"
 license = "MPL-2.0"
 publish = false
 description = "Unpublished benchmark harness comparing the dns-lattice resolver with hickory."

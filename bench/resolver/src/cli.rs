@@ -115,8 +115,9 @@ usage: <client> --proto udp|tcp|dot|doh2|doh3|doq --port PORT --ca FILE [options
   --timeout-ms MS         per-query timeout, one attempt (default 2000)
   --workers N             runtime worker threads (default: available CPUs)
   --stats-port PORT       responder stats port: counters are recorded around
-                          the measurement, and a warm run is invalid if the
-                          responder saw any query during it
+                          the measurement; a warm run is invalid if the
+                          responder saw any query during it, and a cold run
+                          is invalid if it saw fewer than the client completed
   --out FILE              write the JSON result there instead of stdout";
 
 const CLIENT_OPTIONS: &[&str] = &[
@@ -399,6 +400,11 @@ where
                         "warm run: the responder saw {upstream} queries during the measurement"
                     ));
                 }
+                if let Some(reason) =
+                    cold_shortfall(args.cache, upstream, stats.queries, args.concurrency)
+                {
+                    invalid.push(reason);
+                }
             }
             None => invalid.push("the responder stats could not be read".to_string()),
         }
@@ -410,9 +416,50 @@ where
     Ok(result)
 }
 
+/// Validity rule for a cold run: every client query uses a fresh name, so
+/// the responder must have seen at least as many queries as the client
+/// completed. Fewer means some answers were served without reaching the
+/// upstream (a cache or coalescing effect), so the row does not measure a
+/// cold resolve. The window edges are not synchronized between the client
+/// and the responder, so up to `concurrency` in-flight queries of slack are
+/// tolerated. Returns the invalid reason, or `None` when the run is fine or
+/// is not a cold run.
+fn cold_shortfall(
+    cache: NameMode,
+    upstream: u64,
+    client_queries: u64,
+    concurrency: u32,
+) -> Option<String> {
+    if cache != NameMode::Cold {
+        return None;
+    }
+    let slack = u64::from(concurrency);
+    if upstream.saturating_add(slack) < client_queries {
+        return Some(format!(
+            "cold run: the responder saw {upstream} queries but the client completed \
+             {client_queries}; some answers did not reach the upstream"
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cold_run_with_fewer_responder_queries_than_client_queries_is_invalid() {
+        // Fewer upstream queries than completed client queries, beyond the
+        // in-flight slack: invalid.
+        let reason = cold_shortfall(NameMode::Cold, 900, 1000, 16).expect("invalid");
+        assert!(reason.contains("900") && reason.contains("1000"));
+        // Within the in-flight slack, equal, or more: valid.
+        assert_eq!(cold_shortfall(NameMode::Cold, 990, 1000, 16), None);
+        assert_eq!(cold_shortfall(NameMode::Cold, 1000, 1000, 16), None);
+        assert_eq!(cold_shortfall(NameMode::Cold, 1200, 1000, 16), None);
+        // A warm run is judged by its own rule, not this one.
+        assert_eq!(cold_shortfall(NameMode::Warm, 0, 1000, 16), None);
+    }
 
     fn parse(args: &[&str]) -> Result<ClientArgs, String> {
         ClientArgs::parse(args.iter().map(|arg| (*arg).to_string()))

@@ -21,7 +21,7 @@ same harness.
 
 ## Requirements
 
-- Rust 1.93 or newer (the dns-lattice MSRV).
+- Rust 1.99 or newer (the dns-lattice MSRV).
 - Any platform for the micro-benchmarks. No privileges and no network
   access are needed: everything runs in-process.
 - Linux for the client benchmark's CPU and memory figures (they read
@@ -91,8 +91,10 @@ document: queries, queries per second, latency percentiles (p50, p90, p99,
 p99.9, max), outcome counts, process CPU per 1,000 queries, resident
 memory, and the responder's connection and handshake counts during the
 measurement. A run is marked `valid: false` (and the binary exits 1) if no
-query completed, more than 0.1% of the queries failed, or, in a warm run,
-the upstream saw any query during the measurement.
+query completed, more than 0.1% of the queries failed, in a warm run the
+upstream saw any query during the measurement, or in a cold run the
+upstream saw fewer queries than the client completed (beyond a slack of
+`--concurrency` in-flight queries at the window edges).
 
 Scenarios (`variants.tsv`):
 

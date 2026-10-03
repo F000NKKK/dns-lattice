@@ -11,7 +11,7 @@
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
 [![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.93-lightgrey.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](Cargo.toml)
 
 ![Linux](https://img.shields.io/badge/Linux-supported-success)
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
@@ -162,7 +162,7 @@ Current limits, stated plainly:
   to queries that have none (retrying once without it after `FORMERR` or
   `NOTIMP`, and removing it from the answer);
 - the inbound server answers UDP EDNS(0) clients with at most
-  min(client payload size raised to 512, 1232 bytes)
+  min(max(client payload size, 512), 1232 bytes), so never below 512
   (`ServerBuilder::edns_udp_payload_size`
   changes the 1232) and non-EDNS clients with at most 512 bytes; larger
   answers are sent empty with `TC=1`, so clients retry over TCP;
@@ -697,7 +697,7 @@ privileged-port setup.
 
 ## ✅ Feature and Platform Constraints
 
-MSRV: **Rust 1.93**.
+MSRV: **Rust 1.99**.
 
 CI validates the supported facade surface on:
 
