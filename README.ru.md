@@ -171,8 +171,8 @@ application-specific routing. DNS Lattice разделяет эти ответс
   (`CacheConfig::max_bytes`; это оценка занятой кучи, а не точное значение
   аллокатора) и не имеет фоновой очистки: истёкшая запись удаляется, когда
   на тот же вопрос приходит новый запрос или когда вставке нужно место.
-  Одновременные одинаковые запросы пока не объединяются; каждый идёт в
-  upstream.
+  Одновременные одинаковые промахи объединяются в один upstream-запрос
+  (см. «Семантика кэша»).
 
 ### 📊 Бенчмарки
 
@@ -505,7 +505,18 @@ Resolver имеет in-memory answer cache с учётом TTL, включая n
   только с opcode QUERY, `TC=0` и расширенным RCODE EDNS, равным 0.
   `SERVFAIL`, `REFUSED`, другие коды ошибок, усечённые ответы и ответы с
   TTL 0 возвращаются, но не сохраняются. Запросы, в которых не ровно один
-  question или другой opcode, идут мимо кэша.
+  question, другой opcode, опция EDNS Client Subnet или любая опция EDNS,
+  кроме NSID, COOKIE, TCP keepalive и Padding, идут мимо кэша и
+  объединения.
+- **Объединение запросов (coalescing)**: параллельные промахи с одной cache
+  identity делят один upstream-запрос (`CacheConfig::coalesce(false)`
+  отключает это). Первый запрос ведущий: он сохраняет ответ и передаёт его
+  остальным, которые отвечают со своими id, question и битом RD либо
+  получают его ошибку. Ожидающий запрос не выдаёт upstream-событий; sink
+  получает `CacheEvent::Coalesced` через `ObservabilitySink::record_cache`.
+  Если future ведущего `resolve` отброшен, ожидающий запрос берёт ведение на
+  себя; ничего не порождается (spawn), поэтому это работает на любом
+  executor.
 - **Время жизни**: по умолчанию сохранённые TTL ограничены 86 400 с
   (positive) и 3 600 с (negative); `CacheConfig::positive_ttl` и
   `CacheConfig::negative_ttl` задают другие границы. Positive-запись живёт по
@@ -585,6 +596,11 @@ DNS Lattice намеренно **не** определяет durable Fake IP per
 - cache hit/miss;
 - upstream attempts/outcomes;
 - timeout и terminal error paths.
+
+Сигналы кэша вне этого упорядоченного потока, например присоединение запроса
+к чужому in-flight upstream-вызову, приходят как `observability::CacheEvent`
+через метод `ObservabilitySink::record_cache` с реализацией по умолчанию;
+sink, который его не переопределяет, их игнорирует.
 
 Sink non-authoritative. Он не может менять routing, answers, cache state или
 retries; не получает resolver/backend handles; resolver locks освобождаются до

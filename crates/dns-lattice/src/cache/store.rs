@@ -587,6 +587,7 @@ impl Store {
     /// Stores `entry` under `key`, evicting until its shard is within budget.
     /// Returns `false` when the entry is too large to be stored (more than an
     /// eighth of a shard's budget); nothing else is evicted in that case.
+    #[cfg(test)]
     pub(crate) fn insert(
         &self,
         hash: u64,
@@ -595,6 +596,22 @@ impl Store {
         now: Instant,
     ) -> bool {
         lock(self.shard(hash)).insert(hash, key, entry, now)
+    }
+
+    /// Like [`Store::insert`], but stores only if `allowed` returns `true`,
+    /// evaluated while the shard lock is held. A concurrent purge that bumps
+    /// its epoch and then locks the shard therefore either sees this entry
+    /// and removes it, or makes `allowed` fail first.
+    pub(crate) fn insert_if(
+        &self,
+        hash: u64,
+        key: &[u8],
+        entry: Arc<CachedAnswer>,
+        now: Instant,
+        allowed: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut shard = lock(self.shard(hash));
+        allowed() && shard.insert(hash, key, entry, now)
     }
 
     /// Number of entries.

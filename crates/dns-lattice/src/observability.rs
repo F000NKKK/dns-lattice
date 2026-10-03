@@ -15,6 +15,36 @@ use crate::model::{Class, Name, Rcode, RecordType, UpstreamGroupId};
 pub trait ObservabilitySink: Send + Sync {
     /// Receives one immutable, ordered event.
     fn record(&self, event: &ObserveEvent);
+
+    /// Receives one immutable [`CacheEvent`], a cache signal that is not part
+    /// of the ordered [`ObserveEvent`] stream. The default implementation
+    /// ignores it, so existing sinks keep working unchanged.
+    ///
+    /// The same rules as [`ObservabilitySink::record`] apply: it is called
+    /// without any resolver lock held and a panic is ignored.
+    fn record_cache(&self, _event: &CacheEvent) {}
+}
+
+/// Immutable cache signal emitted by an opted-in resolver through
+/// [`ObservabilitySink::record_cache`].
+///
+/// The enum and every variant are `#[non_exhaustive]`: later releases may add
+/// variants and fields, so match with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheEvent {
+    /// The query joined another query's in-flight upstream call instead of
+    /// making its own. It is emitted after [`ObserveEvent::CacheMiss`] and
+    /// before the terminal [`ObserveEvent::Completed`] or
+    /// [`ObserveEvent::Failed`]; the query emits no
+    /// [`ObserveEvent::UpstreamAttempt`] or [`ObserveEvent::UpstreamOutcome`].
+    #[non_exhaustive]
+    Coalesced {
+        /// Opaque identifier correlating every event emitted for this query.
+        correlation_id: u64,
+        /// The group whose upstream call was joined.
+        group: UpstreamGroupId,
+    },
 }
 
 /// Immutable event emitted by an opted-in resolver.

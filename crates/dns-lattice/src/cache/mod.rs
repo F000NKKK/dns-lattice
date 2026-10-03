@@ -8,6 +8,9 @@
 //! out the names that are asked for repeatedly. The cache is never flushed
 //! as a whole to make room.
 //!
+//! Concurrent misses for the same question share one upstream query; see
+//! [`CacheConfig::coalesce`].
+//!
 //! Configure it through [`crate::engine::ResolverBuilder::cache`]:
 //!
 //! ```
@@ -29,6 +32,7 @@
 
 use std::time::Duration;
 
+pub(crate) mod flight;
 pub(crate) mod store;
 
 /// Default memory bound of the answer store: 16 MiB (estimated).
@@ -119,6 +123,7 @@ pub struct CacheConfig {
     positive: TtlBounds,
     negative: TtlBounds,
     negative_without_soa: Option<u32>,
+    coalesce: bool,
 }
 
 impl Default for CacheConfig {
@@ -144,11 +149,13 @@ impl CacheConfig {
                 max: DEFAULT_NEGATIVE_MAX,
             },
             negative_without_soa: Some(DEFAULT_NEGATIVE_WITHOUT_SOA),
+            coalesce: true,
         }
     }
 
     /// A configuration with no answer store: every query goes to its
-    /// upstream group and nothing is kept.
+    /// upstream group and nothing is kept. Concurrent identical queries are
+    /// still coalesced unless [`CacheConfig::coalesce`] turns that off.
     pub fn disabled() -> Self {
         CacheConfig::new().max_bytes(0)
     }
@@ -211,6 +218,27 @@ impl CacheConfig {
         self
     }
 
+    /// Turns in-flight query coalescing on or off. It is on by default.
+    ///
+    /// With coalescing, concurrent cache misses for the same cache identity
+    /// share one upstream query: the first caller queries, the others wait
+    /// for its result and are answered from it, emitting no upstream events
+    /// of their own. If the first caller is cancelled (its `resolve` future
+    /// is dropped), one of the waiting callers takes over, so no caller is
+    /// left without an answer and nothing is spawned. A waiting caller also
+    /// receives an upstream error, or an answer that is not cacheable (such
+    /// as `SERVFAIL`), exactly as the first caller did.
+    ///
+    /// Queries that bypass the cache are never coalesced: more or fewer than
+    /// one question, an opcode other than `QUERY`, an EDNS Client Subnet
+    /// option, or any EDNS option other than NSID, COOKIE, TCP keepalive and
+    /// Padding. With `false`, every miss queries its upstream group itself.
+    #[must_use]
+    pub fn coalesce(mut self, enabled: bool) -> Self {
+        self.coalesce = enabled;
+        self
+    }
+
     /// Whether the configuration describes an enabled store.
     pub(crate) fn store_enabled(&self) -> bool {
         self.max_bytes > 0
@@ -219,6 +247,11 @@ impl CacheConfig {
     /// The configured memory bound.
     pub(crate) fn max_bytes_value(&self) -> usize {
         self.max_bytes
+    }
+
+    /// Whether coalescing is enabled.
+    pub(crate) fn coalesce_enabled(&self) -> bool {
+        self.coalesce
     }
 
     /// The explicit shard count, if one was set.
@@ -245,6 +278,8 @@ mod tests {
         let config = CacheConfig::default();
         assert_eq!(config.max_bytes_value(), 16 * 1024 * 1024);
         assert!(config.store_enabled());
+        assert!(config.coalesce_enabled());
+        assert!(!config.clone().coalesce(false).coalesce_enabled());
         assert_eq!(config.shards_value(), None);
         let policy = config.ttl_policy();
         assert_eq!(

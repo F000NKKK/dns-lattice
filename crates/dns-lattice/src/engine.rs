@@ -30,11 +30,13 @@ use dns_lattice_model::{
 
 use crate::cache::CacheConfig;
 use crate::cache::TtlPolicy;
+use crate::cache::flight::{Flights, Join, Outcome, Wait};
 use crate::cache::store::{CachedAnswer, KeyBuf, Store};
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
-    HookObserveDecision, ObservabilitySink, ObserveEvent, ObserveFailure, UpstreamObserveOutcome,
+    CacheEvent, HookObserveDecision, ObservabilitySink, ObserveEvent, ObserveFailure,
+    UpstreamObserveOutcome,
 };
 use crate::upstream::{DEFAULT_EDNS_UDP_PAYLOAD_SIZE, UpstreamBackend};
 
@@ -121,6 +123,11 @@ pub struct Resolver {
     /// The bounded answer store; `None` when the cache is disabled.
     cache: Option<Store>,
     ttl_policy: TtlPolicy,
+    /// In-flight query registry; `None` when coalescing is off.
+    flights: Option<Arc<Flights>>,
+    /// Bumped whenever cached content is invalidated; a leader stores its
+    /// answer only if the epoch is unchanged since its upstream call began.
+    cache_epoch: AtomicU64,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
     observability_sink: Option<Arc<dyn ObservabilitySink>>,
@@ -172,9 +179,13 @@ impl Resolver {
     ///
     /// # Cache
     ///
-    /// A query uses the cache only when it has exactly one question and
-    /// opcode `QUERY`; any other query goes straight to the upstream group
-    /// (reported as a cache miss) and its answer is not stored. The cache
+    /// A query uses the cache only when it has exactly one question, opcode
+    /// `QUERY`, and an EDNS OPT record (if any) whose options are limited to
+    /// NSID, COOKIE, TCP keepalive and Padding; a query carrying EDNS Client
+    /// Subnet or any other option, like any other query, goes straight to the
+    /// upstream group (reported as a cache miss), is never coalesced, and its
+    /// answer is not stored, so a client-specific answer is never shared. The
+    /// cache
     /// identity is the question's name (case-insensitively), type and class,
     /// the effective upstream group, the query's RD bit, and the DO bit of
     /// the query's EDNS OPT record (false without a well-formed OPT).
@@ -218,6 +229,21 @@ impl Resolver {
     /// question section and RD bit, and AA cleared. The entry is a miss from
     /// the instant its lifetime ends and is removed when such a lookup finds
     /// it.
+    ///
+    /// # Coalescing
+    ///
+    /// Unless [`CacheConfig::coalesce`] turns it off, concurrent misses for
+    /// the same cache identity share one upstream query. The first caller (the
+    /// leader) re-checks the cache, queries the group, stores the answer and
+    /// only then hands its result to the others (followers). A follower
+    /// receives the leader's answer rebuilt like a cache hit (its own message
+    /// id, question and RD bit, AA cleared), or the leader's error. It emits
+    /// `QueryReceived`, `StaticRoute`, the optional `HookDecision`,
+    /// `CacheMiss`, a [`CacheEvent::Coalesced`] through
+    /// [`ObservabilitySink::record_cache`], and the terminal event, but no
+    /// `UpstreamAttempt` or `UpstreamOutcome`. If the leader's `resolve`
+    /// future is dropped, one follower takes over as the new leader; nothing
+    /// is spawned, so this works on any executor.
     ///
     /// # EDNS(0)
     ///
@@ -304,25 +330,26 @@ impl Resolver {
             };
         // The canonical key is built once, on the stack, and hashed once; the
         // same hash selects the shard on lookup and on insert.
-        let key = self
-            .cache
-            .as_ref()
-            .filter(|_| query_uses_cache(query))
-            .and_then(|store| {
-                let key = KeyBuf::new(
+        let key = (self.cache.is_some() || self.flights.is_some())
+            .then(|| query_uses_cache(query))
+            .filter(|uses_cache| *uses_cache)
+            .and_then(|_| {
+                KeyBuf::new(
                     group_index,
                     question.qtype,
                     question.qclass,
                     query.header.recursion_desired,
                     query_dnssec_ok(query),
                     &question.name,
-                )?;
-                let hash = store.hash(key.as_bytes());
-                Some((store, key, hash))
+                )
             });
+        let stored = match (&self.cache, &key) {
+            (Some(store), Some(key)) => Some((store, key, store.hash(key.as_bytes()))),
+            _ => None,
+        };
 
         let now = self.clock.now();
-        if let Some(cached) = key
+        if let Some(cached) = stored
             .as_ref()
             .and_then(|(store, key, hash)| store.get(*hash, key.as_bytes(), now))
         {
@@ -343,6 +370,143 @@ impl Resolver {
             group: group.clone(),
         });
 
+        // Concurrent misses for one key share one upstream query. Only the
+        // leader proceeds; a follower returns the leader's outcome, and a
+        // follower whose leader was cancelled goes round again.
+        let mut announced = false;
+        let guard = match (&self.flights, &key) {
+            (Some(flights), Some(key)) => {
+                let flight_hash = flights.hash(key.as_bytes());
+                loop {
+                    match flights.join_or_lead(flight_hash, key.as_bytes()) {
+                        Join::Lead(guard) => break Some(guard),
+                        Join::Follow(follower) => {
+                            if !announced {
+                                announced = true;
+                                self.emit_cache(CacheEvent::Coalesced {
+                                    correlation_id,
+                                    group: group.clone(),
+                                });
+                            }
+                            if let Wait::Done(outcome) = follower.wait().await {
+                                return self.finish_follower(query, outcome, correlation_id);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // The leader re-checks the cache: another leader may have stored an
+        // answer and unregistered between this query's miss and its
+        // registration.
+        if guard.is_some()
+            && let Some((store, key, hash)) = &stored
+        {
+            let now = self.clock.now();
+            if let Some(cached) = store.get(*hash, key.as_bytes(), now) {
+                if let Some(guard) = guard {
+                    guard.finish(|| Outcome::Cached(Arc::clone(&cached)));
+                }
+                let mut answer = cache_hit_response(query, &cached, now);
+                align_edns(query, &mut answer);
+                self.emit(ObserveEvent::Completed {
+                    correlation_id,
+                    rcode: answer.header.rcode,
+                });
+                return Ok(answer);
+            }
+        }
+
+        // The lifetime is measured from before the upstream call. A leader
+        // that took over from a cancelled one measures from its own start.
+        let now = if announced { self.clock.now() } else { now };
+        let epoch = self.cache_epoch.load(Ordering::Acquire);
+        let result = self
+            .query_upstream(query, &group, backends, correlation_id, stored, now, epoch)
+            .await;
+        if let Some(guard) = guard {
+            guard.finish(|| match &result {
+                Ok((_, Some(entry))) => Outcome::Cached(Arc::clone(entry)),
+                Ok((answer, None)) => Outcome::Raw(Arc::new(answer.clone())),
+                Err(error) => Outcome::Failed(error.clone()),
+            });
+        }
+        match result {
+            Ok((mut answer, _)) => {
+                align_edns(query, &mut answer);
+                self.emit(ObserveEvent::Completed {
+                    correlation_id,
+                    rcode: answer.header.rcode,
+                });
+                Ok(answer)
+            }
+            Err(error) => {
+                self.emit(ObserveEvent::Failed {
+                    correlation_id,
+                    failure: observe_failure(&error),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Answers a coalesced follower from its leader's `outcome`, emitting the
+    /// follower's terminal event.
+    fn finish_follower(
+        &self,
+        query: &Message,
+        outcome: Outcome,
+        correlation_id: u64,
+    ) -> Result<Message> {
+        let mut answer = match outcome {
+            Outcome::Cached(cached) => cache_hit_response(query, &cached, self.clock.now()),
+            Outcome::Raw(answer) => {
+                // Not cacheable, so not rewritten: only the transaction
+                // fields are the follower's own.
+                let mut response = (*answer).clone();
+                response.set_edns(None);
+                response.header.id = query.header.id;
+                response.header.recursion_desired = query.header.recursion_desired;
+                response.header.authoritative = false;
+                response.questions = query.questions.clone();
+                response
+            }
+            Outcome::Failed(error) => {
+                self.emit(ObserveEvent::Failed {
+                    correlation_id,
+                    failure: observe_failure(&error),
+                });
+                return Err(error);
+            }
+        };
+        align_edns(query, &mut answer);
+        self.emit(ObserveEvent::Completed {
+            correlation_id,
+            rcode: answer.header.rcode,
+        });
+        Ok(answer)
+    }
+
+    /// Tries the group's backends in registration order and returns the first
+    /// answer together with its normalised cache entry when it is cacheable.
+    ///
+    /// A cacheable answer is stored here, before the caller publishes it to
+    /// any coalesced follower, unless a purge has bumped `epoch` since the
+    /// upstream call began. Emits the per-backend upstream events; the
+    /// terminal event is the caller's.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_upstream(
+        &self,
+        query: &Message,
+        group: &UpstreamGroupId,
+        backends: &[Box<dyn UpstreamBackend>],
+        correlation_id: u64,
+        stored: Option<(&Store, &KeyBuf, u64)>,
+        now: Instant,
+        epoch: u64,
+    ) -> Result<(Message, Option<Arc<CachedAnswer>>)> {
         let mut last_err = None;
         for (backend_index, backend) in backends.iter().enumerate() {
             self.emit(ObserveEvent::UpstreamAttempt {
@@ -351,26 +515,23 @@ impl Resolver {
                 backend_index,
             });
             match backend.resolve(query).await {
-                Ok(mut answer) => {
+                Ok(answer) => {
                     self.emit(ObserveEvent::UpstreamOutcome {
                         correlation_id,
                         group: group.clone(),
                         backend_index,
                         outcome: UpstreamObserveOutcome::Success,
                     });
-                    if let Some((store, key, hash)) = &key
-                        && let Some(entry) = cacheable_answer(&answer, now, &self.ttl_policy)
-                    {
+                    let entry = stored.and_then(|(store, key, hash)| {
+                        let entry = Arc::new(cacheable_answer(&answer, now, &self.ttl_policy)?);
                         // An entry too large for its shard is simply not
                         // stored; the answer is still returned.
-                        store.insert(*hash, key.as_bytes(), Arc::new(entry), now);
-                    }
-                    align_edns(query, &mut answer);
-                    self.emit(ObserveEvent::Completed {
-                        correlation_id,
-                        rcode: answer.header.rcode,
+                        store.insert_if(hash, key.as_bytes(), Arc::clone(&entry), now, || {
+                            self.cache_epoch.load(Ordering::Acquire) == epoch
+                        });
+                        Some(entry)
                     });
-                    return Ok(answer);
+                    return Ok((answer, entry));
                 }
                 Err(e) if is_retryable(&e) => {
                     self.emit(ObserveEvent::UpstreamOutcome {
@@ -388,26 +549,24 @@ impl Resolver {
                         backend_index,
                         outcome: UpstreamObserveOutcome::Failure,
                     });
-                    self.emit(ObserveEvent::Failed {
-                        correlation_id,
-                        failure: observe_failure(&e),
-                    });
                     return Err(e);
                 }
             }
         }
-
-        let error = last_err.expect("at least one backend was tried since backends is non-empty");
-        self.emit(ObserveEvent::Failed {
-            correlation_id,
-            failure: observe_failure(&error),
-        });
-        Err(error)
+        Err(last_err.expect("at least one backend was tried since backends is non-empty"))
     }
 
     fn emit(&self, event: ObserveEvent) {
         if let Some(sink) = &self.observability_sink {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(&event)));
+        }
+    }
+
+    fn emit_cache(&self, event: CacheEvent) {
+        if let Some(sink) = &self.observability_sink {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sink.record_cache(&event);
+            }));
         }
     }
 
@@ -467,10 +626,24 @@ impl Resolver {
     }
 }
 
-/// Whether `query` may be answered from, and stored in, the cache: exactly
-/// one question and opcode `QUERY`.
+/// EDNS option codes that do not change the answer's content and so leave a
+/// query cacheable: NSID (3), COOKIE (10), TCP keepalive (11) and Padding (12).
+const CACHEABLE_EDNS_OPTIONS: [u16; 4] = [3, 10, 11, 12];
+
+/// Whether `query` may be answered from, stored in, and coalesced through the
+/// cache: exactly one question, opcode `QUERY`, and no EDNS option that can
+/// make the answer client-specific (Client Subnet, or any option other than
+/// [`CACHEABLE_EDNS_OPTIONS`]). A malformed OPT record is not inspected.
 fn query_uses_cache(query: &Message) -> bool {
-    query.questions.len() == 1 && query.header.opcode == Opcode::Query
+    query.questions.len() == 1
+        && query.header.opcode == Opcode::Query
+        && match query.edns() {
+            Ok(Some(edns)) => edns
+                .options()
+                .iter()
+                .all(|option| CACHEABLE_EDNS_OPTIONS.contains(&option.code())),
+            Ok(None) | Err(_) => true,
+        }
 }
 
 /// The query's EDNS DO bit for the cache identity: false when the query has
@@ -922,6 +1095,11 @@ impl ResolverBuilder {
             clock: self.clock,
             cache,
             ttl_policy: self.cache.ttl_policy(),
+            flights: self
+                .cache
+                .coalesce_enabled()
+                .then(|| Arc::new(Flights::new())),
+            cache_epoch: AtomicU64::new(0),
             fake_ip: self.fake_ip,
             route_hook: self.route_hook,
             observability_sink: self.observability_sink,
@@ -3688,6 +3866,562 @@ mod tests {
         resolver.resolve(&query_for("Example.COM.")).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(cache_len(&resolver), 1);
+    }
+
+    // --- In-flight coalescing. ----------------------------------------------
+
+    use crate::observability::CacheEvent;
+    use tokio::sync::Semaphore;
+
+    /// A fake backend that counts calls and holds each one until the test
+    /// releases a permit, so a test controls exactly when the upstream query
+    /// of a leader finishes. With `hang_first`, the first call never finishes
+    /// (a leader that is later cancelled).
+    struct GatedBackend {
+        result: Result<Message>,
+        calls: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+        hang_first: bool,
+    }
+
+    #[async_trait]
+    impl UpstreamBackend for GatedBackend {
+        async fn resolve(&self, query: &Message) -> Result<Message> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.hang_first && call == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            self.result.clone().map(|mut answer| {
+                answer.header.id = query.header.id;
+                answer
+            })
+        }
+    }
+
+    /// Both event streams of a sink, in arrival order per stream.
+    #[derive(Default)]
+    struct EventLog {
+        observed: Mutex<Vec<ObserveEvent>>,
+        cache: Mutex<Vec<CacheEvent>>,
+    }
+
+    impl ObservabilitySink for EventLog {
+        fn record(&self, event: &ObserveEvent) {
+            self.observed.lock().expect("poisoned").push(event.clone());
+        }
+
+        fn record_cache(&self, event: &CacheEvent) {
+            self.cache.lock().expect("poisoned").push(event.clone());
+        }
+    }
+
+    struct Gated {
+        resolver: Resolver,
+        calls: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+        log: Arc<EventLog>,
+    }
+
+    fn gated_resolver(
+        config: CacheConfig,
+        result: Result<Message>,
+        hang_first: bool,
+        permits: usize,
+    ) -> Gated {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(permits));
+        let log = Arc::new(EventLog::default());
+        let resolver = Resolver::builder(
+            SplitDnsPolicy::builder()
+                .default_group(UpstreamGroupId::new("g"))
+                .build(),
+        )
+        .clock(FakeClock::new())
+        .cache(config)
+        .observability_sink(log.clone())
+        .backend(
+            UpstreamGroupId::new("g"),
+            GatedBackend {
+                result,
+                calls: calls.clone(),
+                gate: gate.clone(),
+                hang_first,
+            },
+        )
+        .build();
+        Gated {
+            resolver,
+            calls,
+            gate,
+            log,
+        }
+    }
+
+    fn query_with_id(name: &str, id: u16) -> Message {
+        let mut query = query_for(name);
+        query.header.id = id;
+        query
+    }
+
+    /// Resolves `queries` concurrently on the current thread; once every one
+    /// has been polled and is parked, releases `permits` upstream permits.
+    /// Returns the results in query order.
+    async fn resolve_together(
+        gated: &Gated,
+        queries: &[Message],
+        permits: usize,
+    ) -> Vec<Result<Message>> {
+        let mut futures: Vec<_> = queries
+            .iter()
+            .map(|query| Box::pin(gated.resolver.resolve(query)))
+            .collect();
+        let mut results: Vec<Option<Result<Message>>> = queries.iter().map(|_| None).collect();
+        // First round: every query runs until it parks, in order. The first
+        // is the leader, the rest are followers (or, when bypassing, parked
+        // in their own upstream call).
+        for (future, result) in futures.iter_mut().zip(results.iter_mut()) {
+            tokio::select! {
+                biased;
+                done = future.as_mut() => *result = Some(done),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        gated.gate.add_permits(permits);
+        for (future, result) in futures.iter_mut().zip(results.iter_mut()) {
+            if result.is_none() {
+                *result = Some(future.await);
+            }
+        }
+        results.into_iter().map(|r| r.expect("resolved")).collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_upstream_call() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let queries: Vec<_> = (10..18)
+            .map(|id| query_with_id("example.com", id))
+            .collect();
+        let results = resolve_together(&gated, &queries, 1).await;
+
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1, "one upstream call");
+        for (query, result) in queries.iter().zip(results) {
+            let answer = result.unwrap();
+            assert_eq!(answer.header.id, query.header.id, "own message id");
+            assert_eq!(answer.questions, query.questions);
+            assert_eq!(answer.answers.len(), 1);
+            assert!(!answer.header.authoritative);
+        }
+        assert_eq!(cache_len(&gated.resolver), 1, "the answer was stored");
+        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        // A later arrival hits the cache: the leader stored before unregistering.
+        gated
+            .resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn different_questions_do_not_coalesce() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let queries = [query_for("a.example.com"), query_for("b.example.com")];
+        let results = resolve_together(&gated, &queries, 2).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn coalescing_works_without_a_store_and_can_be_turned_off() {
+        let queries: Vec<_> = (0..4).map(|id| query_with_id("example.com", id)).collect();
+
+        let gated = gated_resolver(
+            CacheConfig::disabled(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let results = resolve_together(&gated, &queries, 1).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_len(&gated.resolver), 0);
+
+        let gated = gated_resolver(
+            CacheConfig::new().coalesce(false),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let results = resolve_together(&gated, &queries, 4).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            gated.calls.load(Ordering::SeqCst),
+            4,
+            "every miss goes upstream"
+        );
+        assert!(gated.log.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_reaches_every_waiter_and_is_not_cached() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Err(Error::Transport("boom".to_owned())),
+            false,
+            0,
+        );
+        let queries: Vec<_> = (0..5).map(|id| query_with_id("example.com", id)).collect();
+        let results = resolve_together(&gated, &queries, 1).await;
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+        for result in results {
+            assert!(matches!(result, Err(Error::Transport(text)) if text == "boom"));
+        }
+        assert_eq!(cache_len(&gated.resolver), 0);
+        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_cacheable_still_fans_out() {
+        let mut servfail = a_answer("example.com", 300);
+        servfail.header.rcode = Rcode::ServFail;
+        servfail.header.authoritative = true;
+        let gated = gated_resolver(CacheConfig::new(), Ok(servfail), false, 0);
+        let queries: Vec<_> = (0..3).map(|id| query_with_id("example.com", id)).collect();
+        let results = resolve_together(&gated, &queries, 1).await;
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+        for (query, result) in queries.iter().zip(results) {
+            let answer = result.unwrap();
+            assert_eq!(answer.header.rcode, Rcode::ServFail);
+            assert_eq!(answer.header.id, query.header.id);
+            assert_eq!(ttls(&answer), vec![300], "TTL kept as received");
+        }
+        assert_eq!(cache_len(&gated.resolver), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_leader_hands_over_to_a_waiting_query() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            true,
+            1,
+        );
+        let leader_query = query_with_id("example.com", 1);
+        let waiter_query = query_with_id("example.com", 2);
+        let mut leader = Box::pin(gated.resolver.resolve(&leader_query));
+        let mut waiter = Box::pin(gated.resolver.resolve(&waiter_query));
+        // The leader parks in its (hanging) upstream call, the waiter behind it.
+        tokio::select! {
+            biased;
+            _ = leader.as_mut() => panic!("the first upstream call never completes"),
+            _ = waiter.as_mut() => panic!("the waiter must wait for the leader"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 1);
+
+        drop(leader);
+        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+        let answer = waiter.await.unwrap();
+        assert_eq!(answer.header.id, 2);
+        assert_eq!(answer.answers.len(), 1);
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 2, "the waiter led");
+        assert_eq!(cache_len(&gated.resolver), 1);
+        assert_eq!(gated.resolver.flights.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_leader_re_checks_the_cache_before_going_upstream() {
+        let (resolver, calls, clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        let query = query_for("example.com");
+        // Hold the flight as if a first leader were working on it.
+        let key = KeyBuf::new(0, RecordType::A, Class::In, true, false, &n("example.com")).unwrap();
+        let flights = resolver.flights.as_ref().unwrap();
+        let hash = flights.hash(key.as_bytes());
+        let Join::Lead(first_leader) = flights.join_or_lead(hash, key.as_bytes()) else {
+            panic!("the flight is free");
+        };
+
+        let mut waiter = Box::pin(resolver.resolve(&query));
+        tokio::select! {
+            biased;
+            _ = waiter.as_mut() => panic!("the waiter must wait for the registered leader"),
+            () = tokio::task::yield_now() => {}
+        }
+        // The first leader's answer lands in the store, then the leader is
+        // cancelled without publishing.
+        let store = resolver.cache.as_ref().unwrap();
+        let now = clock.now();
+        let entry = cacheable_answer(&a_answer("example.com", 300), now, &resolver.ttl_policy)
+            .expect("cacheable");
+        assert!(store.insert(
+            store.hash(key.as_bytes()),
+            key.as_bytes(),
+            Arc::new(entry),
+            now
+        ));
+        drop(first_leader);
+
+        let answer = waiter.await.unwrap();
+        assert_eq!(answer.answers.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "answered from the cache");
+    }
+
+    #[tokio::test]
+    async fn a_purge_epoch_change_stops_a_stale_insert_but_not_the_answer() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let queries = [
+            query_with_id("example.com", 1),
+            query_with_id("example.com", 2),
+        ];
+        let mut futures: Vec<_> = queries
+            .iter()
+            .map(|query| Box::pin(gated.resolver.resolve(query)))
+            .collect();
+        for future in &mut futures {
+            tokio::select! {
+                biased;
+                _ = future.as_mut() => panic!("blocked on the gate"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        // A purge lands while the upstream query is in flight.
+        gated.resolver.cache_epoch.fetch_add(1, Ordering::SeqCst);
+        gated.gate.add_permits(1);
+        for future in futures {
+            assert_eq!(
+                future.await.unwrap().answers.len(),
+                1,
+                "waiters still answered"
+            );
+        }
+        assert_eq!(
+            cache_len(&gated.resolver),
+            0,
+            "the stale answer was not stored"
+        );
+
+        // After the purge, a fresh answer is stored again.
+        gated.gate.add_permits(1);
+        gated
+            .resolver
+            .resolve(&query_for("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(cache_len(&gated.resolver), 1);
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_follower_emits_no_upstream_events_and_one_coalesced_event() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let queries = [
+            query_with_id("example.com", 1),
+            query_with_id("example.com", 2),
+        ];
+        resolve_together(&gated, &queries, 1).await;
+
+        let observed = gated.log.observed.lock().unwrap().clone();
+        let group = UpstreamGroupId::new("g");
+        let of = |id: u64| -> Vec<ObserveEvent> {
+            observed
+                .iter()
+                .filter(|event| event_id(event) == id)
+                .cloned()
+                .collect()
+        };
+        let leader = of(1);
+        assert!(matches!(leader[0], ObserveEvent::QueryReceived { .. }));
+        assert!(matches!(leader[1], ObserveEvent::StaticRoute { .. }));
+        assert!(matches!(leader[2], ObserveEvent::CacheMiss { .. }));
+        assert!(matches!(leader[3], ObserveEvent::UpstreamAttempt { .. }));
+        assert!(matches!(leader[4], ObserveEvent::UpstreamOutcome { .. }));
+        assert!(matches!(leader[5], ObserveEvent::Completed { .. }));
+
+        let follower = of(2);
+        assert_eq!(follower.len(), 4, "{follower:?}");
+        assert!(matches!(follower[0], ObserveEvent::QueryReceived { .. }));
+        assert!(matches!(follower[1], ObserveEvent::StaticRoute { .. }));
+        assert!(matches!(follower[2], ObserveEvent::CacheMiss { .. }));
+        assert!(matches!(follower[3], ObserveEvent::Completed { .. }));
+        assert_eq!(
+            *gated.log.cache.lock().unwrap(),
+            vec![CacheEvent::Coalesced {
+                correlation_id: 2,
+                group,
+            }]
+        );
+    }
+
+    fn event_id(event: &ObserveEvent) -> u64 {
+        match event {
+            ObserveEvent::QueryReceived { correlation_id, .. }
+            | ObserveEvent::FakeIpTerminal { correlation_id }
+            | ObserveEvent::StaticRoute { correlation_id, .. }
+            | ObserveEvent::HookDecision { correlation_id, .. }
+            | ObserveEvent::CacheHit { correlation_id, .. }
+            | ObserveEvent::CacheMiss { correlation_id, .. }
+            | ObserveEvent::UpstreamAttempt { correlation_id, .. }
+            | ObserveEvent::UpstreamOutcome { correlation_id, .. }
+            | ObserveEvent::Completed { correlation_id, .. }
+            | ObserveEvent::Failed { correlation_id, .. }
+            | ObserveEvent::Cancelled { correlation_id } => *correlation_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_of_a_failed_leader_emits_failed() {
+        let gated = gated_resolver(CacheConfig::new(), Err(Error::Timeout), false, 0);
+        let queries = [
+            query_with_id("example.com", 1),
+            query_with_id("example.com", 2),
+        ];
+        resolve_together(&gated, &queries, 1).await;
+        let observed = gated.log.observed.lock().unwrap().clone();
+        let follower: Vec<_> = observed.iter().filter(|e| event_id(e) == 2).collect();
+        assert!(matches!(
+            follower.last(),
+            Some(ObserveEvent::Failed {
+                failure: ObserveFailure::Timeout,
+                ..
+            })
+        ));
+        assert!(
+            !follower
+                .iter()
+                .any(|e| matches!(e, ObserveEvent::UpstreamAttempt { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_break_coalescing() {
+        struct PanicsOnCache;
+        impl ObservabilitySink for PanicsOnCache {
+            fn record(&self, _: &ObserveEvent) {}
+            fn record_cache(&self, _: &CacheEvent) {
+                panic!("cache observer failure must be isolated");
+            }
+        }
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let mut resolver = gated.resolver;
+        resolver.observability_sink = Some(Arc::new(PanicsOnCache));
+        let gated = Gated { resolver, ..gated };
+        let queries = [
+            query_with_id("example.com", 1),
+            query_with_id("example.com", 2),
+        ];
+        let results = resolve_together(&gated, &queries, 1).await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn query_with_option(name: &str, id: u16, code: u16) -> Message {
+        let mut query = query_with_id(name, id);
+        let mut edns = Edns::new(1232);
+        edns.push_option(EdnsOption::new(code, vec![0, 1, 0, 0]).unwrap());
+        query.set_edns(Some(edns));
+        query
+    }
+
+    #[tokio::test]
+    async fn ecs_and_unknown_option_queries_bypass_the_cache_and_coalescing() {
+        for code in [8_u16, 65_001] {
+            let gated = gated_resolver(
+                CacheConfig::new(),
+                Ok(a_answer("example.com", 300)),
+                false,
+                0,
+            );
+            let queries: Vec<_> = (0..3)
+                .map(|id| query_with_option("example.com", id, code))
+                .collect();
+            let results = resolve_together(&gated, &queries, 3).await;
+            assert!(results.iter().all(Result::is_ok), "option {code}");
+            assert_eq!(
+                gated.calls.load(Ordering::SeqCst),
+                3,
+                "option {code}: no coalescing"
+            );
+            assert_eq!(cache_len(&gated.resolver), 0, "option {code}: not stored");
+            assert!(gated.log.cache.lock().unwrap().is_empty());
+
+            // Nor is an earlier cached answer served to such a query.
+            gated.gate.add_permits(2);
+            gated
+                .resolver
+                .resolve(&query_for("example.com"))
+                .await
+                .unwrap();
+            gated
+                .resolver
+                .resolve(&query_with_option("example.com", 9, code))
+                .await
+                .unwrap();
+            assert_eq!(gated.calls.load(Ordering::SeqCst), 5, "option {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nsid_cookie_keepalive_and_padding_options_stay_cacheable() {
+        for code in [3_u16, 10, 11, 12] {
+            let gated = gated_resolver(
+                CacheConfig::new(),
+                Ok(a_answer("example.com", 300)),
+                false,
+                0,
+            );
+            let queries: Vec<_> = (0..3)
+                .map(|id| query_with_option("example.com", id, code))
+                .collect();
+            let results = resolve_together(&gated, &queries, 1).await;
+            assert!(results.iter().all(Result::is_ok), "option {code}");
+            assert_eq!(gated.calls.load(Ordering::SeqCst), 1, "option {code}");
+            assert_eq!(cache_len(&gated.resolver), 1, "option {code}");
+        }
+    }
+
+    #[test]
+    fn query_uses_cache_follows_the_edns_option_rule() {
+        assert!(query_uses_cache(&query_for("example.com")));
+        assert!(query_uses_cache(&edns_query_for("example.com", 1232, true)));
+        assert!(!query_uses_cache(&query_with_option("example.com", 1, 8)));
+        assert!(query_uses_cache(&query_with_option("example.com", 1, 10)));
+        let mut malformed = edns_query_for("example.com", 1232, true);
+        let opt = malformed.additionals[0].clone();
+        malformed.additionals.push(opt);
+        assert!(malformed.edns().is_err());
+        assert!(query_uses_cache(&malformed), "unchanged 1.1 behaviour");
     }
 
     #[test]

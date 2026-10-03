@@ -208,6 +208,31 @@ reused set stays; a ghost ring remembers only the hashes of dropped keys so a
 returning key enters the main queue directly. An expired entry is never
 promoted. `CacheConfig::disabled()` configures no store at all.
 
+A query uses the cache only with exactly one question, opcode QUERY, and no
+EDNS Client Subnet option or EDNS option other than NSID, COOKIE, TCP
+keepalive and Padding; any other query bypasses the cache and coalescing, so
+a client-specific answer is never shared.
+
+Concurrent misses for one cache key are coalesced (`CacheConfig::coalesce`,
+on by default). A private registry of flights, sharded by the same canonical
+key bytes and keyed hash as the store, holds one watch channel per key. The
+first miss registers a flight and leads: it re-checks the cache, runs the
+ordered failover loop, inserts a cacheable answer into the store, then
+unregisters the flight and publishes its outcome to the followers that
+joined, so a query arriving at any moment finds either the flight or the
+entry. A follower waits on the channel and answers from the published
+outcome (a cacheable answer rebuilt like a hit, an uncacheable answer such
+as `SERVFAIL` with only its transaction fields replaced, or the leader's
+error); it emits `CacheMiss`, then `CacheEvent::Coalesced` through the
+defaulted `ObservabilitySink::record_cache`, then its terminal event, and
+no upstream event. Nothing is spawned: a leader that is cancelled
+publishes an abandoned state from a drop guard and unregisters, and the
+first waiting follower to re-register becomes the new leader, so the scheme
+works on any executor. A purge epoch counter is checked under the shard lock
+when a leader inserts, so an answer fetched before an invalidation is
+returned and published but not stored. A flight shard lock covers only one
+map operation.
+
 Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
 answer — is aligned with the query's EDNS(0) state: without a query OPT
 record the answer has none; with one, an answer lacking a valid OPT record
@@ -266,6 +291,10 @@ cache hit/miss, upstream attempts/outcomes, timeouts, and terminal failures.
 
 The sink contract has strict isolation properties:
 
+- cache signals outside the ordered stream (currently a query that joined
+  another's in-flight upstream call) arrive as `observability::CacheEvent`
+  through `ObservabilitySink::record_cache`, a defaulted method that existing
+  sinks need not implement;
 - callbacks cannot alter a resolver decision or answer;
 - callbacks receive no resolver/backend handles or privileged OS authority;
 - resolver locks are released before callbacks run;

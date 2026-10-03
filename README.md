@@ -169,7 +169,8 @@ Current limits, stated plainly:
   (`CacheConfig::max_bytes`; an estimate of heap use, not an exact
   allocator figure) and has no background sweep: an expired entry is
   removed when its question is asked again or when an insert needs room.
-  Concurrent identical queries are not merged yet; each one goes upstream.
+  Concurrent identical misses are merged into one upstream query (see
+  "Cache semantics").
 
 ### 📊 Benchmarks
 
@@ -502,7 +503,17 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   `NODATA`, only with opcode QUERY, `TC=0`, and an EDNS extended RCODE of 0.
   `SERVFAIL`, `REFUSED`, other error codes, truncated answers, and answers
   with a TTL of 0 are returned but never stored. Queries with more or fewer
-  than one question, or another opcode, bypass the cache.
+  than one question, another opcode, or an EDNS Client Subnet option or any
+  EDNS option other than NSID, COOKIE, TCP keepalive and Padding, bypass the
+  cache and coalescing.
+- **Coalescing**: concurrent misses for the same cache identity share one
+  upstream query (`CacheConfig::coalesce(false)` turns this off). The first
+  query leads, stores its answer, then hands it to the others, which are
+  answered with their own id, question and RD bit, or receive its error. A
+  waiting query emits no upstream events; the sink gets
+  `CacheEvent::Coalesced` through `ObservabilitySink::record_cache`. If the
+  leading `resolve` future is dropped, a waiting query takes over; nothing
+  is spawned, so this works on any executor.
 - **Lifetimes**: by default stored TTLs are capped at 86 400 s (positive)
   and 3 600 s (negative); `CacheConfig::positive_ttl` and
   `CacheConfig::negative_ttl` set other bounds. A positive entry lives for
@@ -583,6 +594,12 @@ events for the important state transitions in the pipeline, including:
 - cache hit/miss;
 - upstream attempts/outcomes;
 - timeout and terminal error paths.
+
+Cache signals that are not part of this ordered stream, such as a query
+joining another query's in-flight upstream call, arrive as
+`observability::CacheEvent` through the defaulted
+`ObservabilitySink::record_cache` method; a sink that does not override it
+ignores them.
 
 The sink is non-authoritative. It cannot alter routing, answers, cache state,
 or retries; it receives no resolver/backend handles; resolver locks are

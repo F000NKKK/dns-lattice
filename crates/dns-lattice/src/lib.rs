@@ -320,7 +320,7 @@ pub mod upstream;
 
 #[cfg(test)]
 mod facade_path_tests {
-    use super::{cache, core, engine, fakeip, hooks, model, server, upstream};
+    use super::{cache, core, engine, fakeip, hooks, model, observability, server, upstream};
 
     #[test]
     fn canonical_module_paths_expose_the_public_surface() {
@@ -328,6 +328,9 @@ mod facade_path_tests {
         let _: fn() -> cache::CacheConfig = cache::CacheConfig::disabled;
         let _: fn(engine::ResolverBuilder, cache::CacheConfig) -> engine::ResolverBuilder =
             engine::ResolverBuilder::cache;
+        let _: fn(cache::CacheConfig, bool) -> cache::CacheConfig = cache::CacheConfig::coalesce;
+        let _: Option<observability::CacheEvent> = None;
+        let _: Option<&dyn observability::ObservabilitySink> = None;
         let _: model::Name = model::Name::root();
         let _: Option<model::DomainMatcher<()>> = Some(model::DomainMatcher::new());
         let _: fn(model::Name) -> model::DomainPattern = model::DomainPattern::suffix;

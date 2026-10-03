@@ -30,8 +30,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negative answer that lacks an SOA, the strict reading of RFC 2308).
   `CacheConfig::disabled()` keeps no answers. The defaults reproduce the
   behaviour listed under Changed.
+- `CacheConfig::coalesce` turns in-flight query coalescing on or off (on by
+  default; see Changed).
+- `observability::CacheEvent` (a `#[non_exhaustive]` enum) and the defaulted
+  `ObservabilitySink::record_cache` method deliver cache signals outside the
+  ordered `ObserveEvent` stream, so existing sinks compile and behave as
+  before. The first event is `CacheEvent::Coalesced`, emitted for a query
+  that joined another query's upstream call.
 
 ### Changed
+
+- Resolver query coalescing, default behaviour: concurrent cache misses for
+  the same cache identity now share one upstream query instead of sending
+  one each. The first query leads; the others wait for its result and are
+  answered from it (their own message id, question and RD bit, AA cleared),
+  or receive its error, including for answers that are not cacheable such as
+  `SERVFAIL`. A waiting query emits no `UpstreamAttempt` or
+  `UpstreamOutcome` event, only `CacheMiss`, `CacheEvent::Coalesced` and the
+  terminal event. If the leading `resolve` future is dropped, a waiting
+  query takes over and queries the upstream itself; nothing is spawned, so
+  this works on any executor. A leader stores its answer before handing it
+  over, and does not store an answer fetched before the cache was
+  invalidated. Without a store (`CacheConfig::disabled()`) queries are
+  still coalesced; `CacheConfig::coalesce(false)` restores one upstream
+  query per miss.
+- A query carrying an EDNS Client Subnet option, or any EDNS option other
+  than NSID, COOKIE, TCP keepalive and Padding, now bypasses the cache and
+  coalescing: it goes to the upstream group, is reported as a cache miss and
+  its answer is not stored, so a client-specific answer is never shared.
+  Previously such a query was answered from, and stored in, the cache.
+- The `tokio` dependency gains its `sync` feature (already part of tokio, no
+  new crate).
 
 - Resolver cache memory, default behaviour (no public API change beyond the
   Added entry above):

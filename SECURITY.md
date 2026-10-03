@@ -54,8 +54,13 @@ question's answer.
 (`positive_ttl`, `negative_ttl`, `negative_ttl_without_soa`);
 `CacheConfig::disabled()` keeps no answers. Size the bound for the host: the
 bound covers the cache only, not in-flight queries, connections or the
-inbound server's own buffers. Concurrent identical queries are not merged
-yet, so a burst of identical misses still sends one upstream query each.
+inbound server's own buffers. Concurrent identical misses are merged into
+one upstream query (`CacheConfig::coalesce`, on by default), so a burst of
+identical misses sends one query upstream rather than one each; this also
+narrows the window in which an off-path attacker can race one outstanding
+query. A query carrying an EDNS Client Subnet option or any EDNS option other
+than NSID, COOKIE, TCP keepalive and Padding bypasses the cache and
+coalescing, so a client-specific answer is never shared between clients.
 
 ## Scope
 

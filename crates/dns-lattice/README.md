@@ -156,7 +156,12 @@ events for query receipt, Fake IP, route and hook decisions, cache hit/miss, ups
 attempts and outcomes, timeouts, and terminal failures. Callbacks cannot change routing,
 cache state, retries, or answers, receive no resolver or backend handles, run after resolver
 locks are released, and have their panics isolated from resolver correctness. The crate
-requires no logging or tracing framework and owns no background telemetry queue.
+requires no logging or tracing framework and owns no background telemetry queue. Cache
+signals outside that ordered stream, such as a query joining another query's in-flight
+upstream call, arrive as `CacheEvent` through the defaulted `record_cache` method. Concurrent
+identical cache misses share one upstream query (`CacheConfig::coalesce`, on by default);
+queries carrying an EDNS Client Subnet or other non-basic EDNS option bypass the cache and
+that coalescing.
 
 Details: [ARCHITECTURE.md](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#resolver-data-flow)
 and [docs.rs](https://docs.rs/dns-lattice).
