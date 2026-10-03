@@ -148,6 +148,49 @@ impl KeyBuf {
     }
 }
 
+/// Offset of the question name inside a key.
+const KEY_NAME_OFFSET: usize = 9;
+
+/// The lowercased, uncompressed wire form of `name`, as laid out in a key, or
+/// `None` for a name that does not fit the wire limits.
+fn wire_name(name: &Name) -> Option<Vec<u8>> {
+    let mut wire = Vec::new();
+    for label in name.labels() {
+        let len = u8::try_from(label.len()).ok().filter(|len| *len <= 63)?;
+        wire.push(len);
+        wire.extend(label.iter().map(u8::to_ascii_lowercase));
+    }
+    wire.push(0);
+    (wire.len() <= 255).then_some(wire)
+}
+
+/// The name part of a key.
+fn key_name(key: &[u8]) -> Option<&[u8]> {
+    key.get(KEY_NAME_OFFSET..)
+}
+
+/// The record type code of a key.
+fn key_type(key: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes([*key.get(4)?, *key.get(5)?]))
+}
+
+/// Whether the wire name `name` is `zone` or lies below it. Only whole labels
+/// are compared: every candidate suffix starts at a label boundary.
+fn in_subtree(name: &[u8], zone: &[u8]) -> bool {
+    let mut at = 0;
+    while at < name.len() {
+        if &name[at..] == zone {
+            return true;
+        }
+        let label_len = usize::from(name[at]);
+        if label_len == 0 {
+            break;
+        }
+        at += 1 + label_len;
+    }
+    false
+}
+
 /// The wire value of a record type; `Other(n)` and the named variant of the
 /// same value share one key.
 fn type_code(rtype: RecordType) -> u16 {
@@ -278,7 +321,30 @@ impl List {
     }
 }
 
+/// Event counters of one shard, updated under its lock. They survive a
+/// flush: they describe the shard's history, not its content.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    inserts: u64,
+    evictions: u64,
+    expirations: u64,
+    oversized: u64,
+}
+
+/// A point-in-time total over every shard of a [`Store`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoreStats {
+    pub(crate) entries: u64,
+    pub(crate) bytes: u64,
+    pub(crate) capacity_bytes: u64,
+    pub(crate) inserts: u64,
+    pub(crate) evictions: u64,
+    pub(crate) expirations: u64,
+    pub(crate) oversized_rejected: u64,
+}
+
 struct Shard {
+    counters: Counters,
     budget: usize,
     small_target: usize,
     ghost_cap: usize,
@@ -298,6 +364,7 @@ struct Shard {
 impl Shard {
     fn new(budget: usize) -> Self {
         Shard {
+            counters: Counters::default(),
             budget,
             small_target: budget / (100 / SMALL_PERCENT),
             ghost_cap: budget / GHOST_DIVISOR,
@@ -415,6 +482,7 @@ impl Shard {
         }
         if slot.expires <= now {
             let removed = self.remove_slot(index);
+            self.counters.expirations += 1;
             if removed.freq > 0 {
                 self.push_ghost(removed.hash);
             }
@@ -434,6 +502,7 @@ impl Shard {
             reused = *old.key == *key && (old.freq > 0 || old.queue == Queue::Main);
         }
         if cost > self.budget / OVERSIZE_DIVISOR {
+            self.counters.oversized += 1;
             return false;
         }
         let remembered = self.ghost.remove(&hash).is_some();
@@ -473,9 +542,39 @@ impl Shard {
         let expires = self.slot(index).expires;
         self.expiry.insert((expires, index));
         self.push_back(index, queue);
+        self.counters.inserts += 1;
 
         self.make_room(now);
         true
+    }
+
+    /// Drops every entry and ghost hash, keeping the counters. Returns the
+    /// number of entries removed.
+    fn clear(&mut self) -> usize {
+        let removed = self.map.len();
+        let budget = self.budget;
+        let counters = self.counters;
+        *self = Shard::new(budget);
+        self.counters = counters;
+        removed
+    }
+
+    /// Removes every entry whose key satisfies `matches`; returns how many.
+    fn remove_matching(&mut self, matches: &impl Fn(&[u8]) -> bool) -> usize {
+        let doomed: Vec<u32> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let slot = slot.as_ref()?;
+                matches(&slot.key).then(|| u32::try_from(index).unwrap_or(NIL))
+            })
+            .filter(|index| *index != NIL)
+            .collect();
+        for index in &doomed {
+            self.remove_slot(*index);
+        }
+        doomed.len()
     }
 
     /// Evicts until the shard is back within its budget.
@@ -485,6 +584,7 @@ impl Shard {
                 && expires <= now
             {
                 self.remove_slot(index);
+                self.counters.expirations += 1;
                 continue;
             }
             if !self.evict_one() {
@@ -507,6 +607,7 @@ impl Shard {
                 self.push_back(index, Queue::Main);
             } else {
                 let removed = self.remove_slot(index);
+                self.counters.evictions += 1;
                 self.push_ghost(removed.hash);
             }
         } else {
@@ -518,6 +619,7 @@ impl Shard {
                 self.push_back(index, Queue::Main);
             } else {
                 self.remove_slot(index);
+                self.counters.evictions += 1;
             }
         }
         true
@@ -612,6 +714,57 @@ impl Store {
     ) -> bool {
         let mut shard = lock(self.shard(hash));
         allowed() && shard.insert(hash, key, entry, now)
+    }
+
+    /// Removes every entry and remembered hash; returns the entries removed.
+    /// Each shard is emptied under its own lock, one after another.
+    pub(crate) fn clear(&self) -> usize {
+        self.shards.iter().map(|shard| lock(shard).clear()).sum()
+    }
+
+    /// Removes the entries for exactly `name`, for every group, class and
+    /// query shape, restricted to `rtype` when given. Returns the count.
+    pub(crate) fn purge(&self, name: &Name, rtype: Option<RecordType>) -> usize {
+        let Some(wire) = wire_name(name) else {
+            return 0;
+        };
+        let rtype = rtype.map(type_code);
+        self.remove_where(|key| {
+            key_name(key) == Some(wire.as_slice())
+                && rtype.is_none_or(|code| key_type(key) == Some(code))
+        })
+    }
+
+    /// Removes the entries for `zone` and every name below it, at label
+    /// boundaries only. Returns the count.
+    pub(crate) fn purge_subtree(&self, zone: &Name) -> usize {
+        let Some(wire) = wire_name(zone) else {
+            return 0;
+        };
+        self.remove_where(|key| key_name(key).is_some_and(|name| in_subtree(name, &wire)))
+    }
+
+    fn remove_where(&self, matches: impl Fn(&[u8]) -> bool) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| lock(shard).remove_matching(&matches))
+            .sum()
+    }
+
+    /// The totals over every shard.
+    pub(crate) fn stats(&self) -> StoreStats {
+        let mut stats = StoreStats::default();
+        for shard in &self.shards {
+            let shard = lock(shard);
+            stats.entries += shard.map.len() as u64;
+            stats.bytes += shard.total_bytes() as u64;
+            stats.capacity_bytes += shard.budget as u64;
+            stats.inserts += shard.counters.inserts;
+            stats.evictions += shard.counters.evictions;
+            stats.expirations += shard.counters.expirations;
+            stats.oversized_rejected += shard.counters.oversized;
+        }
+        stats
     }
 
     /// Number of entries.
@@ -1086,5 +1239,116 @@ mod tests {
         let small = entry_cost(10, &entry(base, 10, 0));
         assert!(entry_cost(100, &entry(base, 10, 0)) == small + 90);
         assert!(entry_cost(10, &entry(base, 10, 1_000)) >= small + 1_000);
+    }
+
+    fn name(text: &str) -> Name {
+        Name::from_ascii(text).unwrap()
+    }
+
+    /// Stores an entry under the real key of (`group`, `rtype`, `class`,
+    /// `text`).
+    fn put_named(store: &Store, group: u32, rtype: RecordType, class: Class, text: &str) {
+        let now = Instant::now();
+        let key = KeyBuf::new(group, rtype, class, true, false, &name(text)).unwrap();
+        let hash = store.hash(key.as_bytes());
+        assert!(store.insert(hash, key.as_bytes(), entry(now, 300, 0), now));
+    }
+
+    #[test]
+    fn subtree_matching_compares_whole_labels_only() {
+        let wire = |text: &str| wire_name(&name(text)).unwrap();
+        let zone = wire("ample.com");
+        assert!(in_subtree(&wire("ample.com"), &zone));
+        assert!(in_subtree(&wire("www.ample.com"), &zone));
+        assert!(in_subtree(&wire("a.b.c.ample.com"), &zone));
+        assert!(!in_subtree(&wire("example.com"), &zone));
+        assert!(!in_subtree(&wire("com"), &zone));
+        assert!(!in_subtree(&wire("ample.com.evil.org"), &zone));
+        assert!(in_subtree(
+            &wire("anything.example"),
+            &wire_name(&Name::root()).unwrap()
+        ));
+        assert!(in_subtree(&[0], &[0]));
+        assert_eq!(wire("WwW.Example.COM."), wire("www.example.com"));
+    }
+
+    #[test]
+    fn purge_covers_every_group_class_and_type_of_a_name() {
+        let store = Store::new(1024 * 1024, Some(4));
+        for group in 0..3 {
+            put_named(&store, group, RecordType::A, Class::In, "example.com");
+        }
+        put_named(&store, 0, RecordType::Aaaa, Class::In, "example.com");
+        put_named(&store, 0, RecordType::A, Class::Ch, "example.com");
+        put_named(&store, 0, RecordType::A, Class::In, "www.example.com");
+        assert_eq!(store.len(), 6);
+
+        assert_eq!(store.purge(&name("example.com"), Some(RecordType::Aaaa)), 1);
+        assert_eq!(store.purge(&name("EXAMPLE.com"), None), 4);
+        assert_eq!(store.len(), 1, "only the subdomain is left");
+        assert_eq!(store.purge_subtree(&name("example.com")), 1);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.bytes(), 0, "every index was cleaned up");
+    }
+
+    #[test]
+    fn a_purged_shard_stays_consistent_for_later_inserts() {
+        let store = Store::new(64 * 1024, Some(1));
+        let now = Instant::now();
+        for i in 0..50 {
+            assert!(put(&store, i, 300, now));
+        }
+        assert_eq!(store.purge_subtree(&name("example.com")), 0, "no match");
+        assert_eq!(store.clear(), 50);
+        assert_eq!(store.bytes(), 0);
+        for i in 0..2_000 {
+            assert!(put(&store, i, 300, now));
+            assert!(store.bytes() <= 64 * 1024);
+        }
+        assert!(fetch(&store, 1_999, now));
+    }
+
+    #[test]
+    fn stats_track_inserts_evictions_expirations_and_oversized() {
+        let base = Instant::now();
+        let budget = 64 * 1024;
+        let store = Store::new(budget, Some(1));
+        for i in 0..1_000 {
+            put(&store, i, 300, base);
+        }
+        let stats = store.stats();
+        assert_eq!(stats.inserts, 1_000);
+        assert_eq!(stats.entries, store.len() as u64);
+        assert_eq!(stats.bytes, store.bytes() as u64);
+        assert_eq!(stats.capacity_bytes, budget as u64);
+        assert_eq!(stats.entries + stats.evictions, 1_000);
+        assert_eq!((stats.expirations, stats.oversized_rejected), (0, 0));
+
+        // A lookup after the lifetime removes the entry and counts it.
+        let later = base + Duration::from_secs(301);
+        let survivor = (0..1_000).find(|i| fetch(&store, *i, base)).unwrap();
+        assert!(!fetch(&store, survivor, later));
+        assert_eq!(store.stats().expirations, 1);
+
+        // An oversized entry is counted and not inserted.
+        let huge = Arc::new(CachedAnswer {
+            message: message(20_000),
+            inserted: base,
+            expires: base + Duration::from_secs(300),
+        });
+        let k = key(5_000);
+        assert!(!store.insert(store.hash(&k), &k, huge, base));
+        assert_eq!(store.stats().oversized_rejected, 1);
+
+        // A flush empties the content but not the history.
+        let before = store.stats();
+        let removed = store.clear();
+        let after = store.stats();
+        assert_eq!(removed as u64, before.entries);
+        assert_eq!((after.entries, after.bytes), (0, 0));
+        assert_eq!(
+            (after.inserts, after.evictions, after.expirations),
+            (before.inserts, before.evictions, before.expirations)
+        );
     }
 }

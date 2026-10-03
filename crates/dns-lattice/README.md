@@ -163,6 +163,13 @@ identical cache misses share one upstream query (`CacheConfig::coalesce`, on by 
 queries carrying an EDNS Client Subnet or other non-basic EDNS option bypass the cache and
 that coalescing.
 
+**Cache control.** `Resolver::clear_cache`, `purge(name, rtype)` and `purge_subtree(zone)`
+flush cached answers (for example after a network or VPN change) and return the number of
+entries removed; a flush also stops in-flight queries from storing the answer they were
+fetching. `Resolver::cache_stats()` returns a `CacheStats` snapshot (entries, estimated
+bytes, hits, misses, coalesced queries, inserts, evictions, expirations and oversized
+rejections).
+
 Details: [ARCHITECTURE.md](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md#resolver-data-flow)
 and [docs.rs](https://docs.rs/dns-lattice).
 

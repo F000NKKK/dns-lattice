@@ -329,6 +329,12 @@ mod facade_path_tests {
         let _: fn(engine::ResolverBuilder, cache::CacheConfig) -> engine::ResolverBuilder =
             engine::ResolverBuilder::cache;
         let _: fn(cache::CacheConfig, bool) -> cache::CacheConfig = cache::CacheConfig::coalesce;
+        let _: Option<cache::CacheStats> = None;
+        let _: fn(&engine::Resolver) -> usize = engine::Resolver::clear_cache;
+        let _: fn(&engine::Resolver, &model::Name, Option<model::RecordType>) -> usize =
+            engine::Resolver::purge;
+        let _: fn(&engine::Resolver, &model::Name) -> usize = engine::Resolver::purge_subtree;
+        let _: fn(&engine::Resolver) -> cache::CacheStats = engine::Resolver::cache_stats;
         let _: Option<observability::CacheEvent> = None;
         let _: Option<&dyn observability::ObservabilitySink> = None;
         let _: model::Name = model::Name::root();

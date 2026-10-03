@@ -532,6 +532,18 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
 - **Hits**: TTLs count down by the whole seconds since the answer was
   stored. A hit carries the current query's id, question, and RD bit, sets
   AA=0, and keeps every record in its original order.
+- **Flushing**: `Resolver::clear_cache` removes everything,
+  `Resolver::purge(name, rtype)` removes one name (every group, class and
+  query shape; one record type, or all with `None`), and
+  `Resolver::purge_subtree(zone)` removes a zone and everything below it,
+  matching whole labels only (`ample.com` does not match `example.com`). Each
+  returns the number of entries removed. A flush also stops queries already
+  waiting on an upstream call from storing their answer; they are still
+  answered. Use it after a network or VPN change.
+- **Statistics**: `Resolver::cache_stats()` returns a `CacheStats` snapshot
+  with `entries`, `bytes` (an estimate), `capacity_bytes`, `hits`, `misses`,
+  `coalesced`, `inserts`, `evictions`, `expirations` and `oversized_rejected`.
+  The counters are monotonic and survive a flush.
 - **EDNS(0)**: the OPT record is removed before an answer is stored, so a
   hit never replays another client's OPT record. A hit for a query with an
   OPT record gets a fresh one (1232 bytes, version 0, the query's DO bit,

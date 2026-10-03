@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordered `ObserveEvent` stream, so existing sinks compile and behave as
   before. The first event is `CacheEvent::Coalesced`, emitted for a query
   that joined another query's upstream call.
+- `Resolver::clear_cache`, `Resolver::purge` and `Resolver::purge_subtree`
+  flush the answer cache and return the number of entries removed. `purge`
+  removes one name (every upstream group, class and query shape; one record
+  type, or all with `None`); `purge_subtree` removes a zone and everything
+  below it, matching whole labels only. A flush also stops queries already
+  waiting on an upstream call from storing their answer (they are still
+  answered), so an answer fetched before a flush never outlives it.
+- `Resolver::cache_stats` returns a `dns_lattice::cache::CacheStats`
+  snapshot: `entries`, `bytes` (an estimate), `capacity_bytes`, `hits`,
+  `misses`, `coalesced`, `inserts`, `evictions`, `expirations` and
+  `oversized_rejected`. The counters are monotonic and survive a flush.
 
 ### Changed
 

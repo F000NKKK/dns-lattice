@@ -28,10 +28,10 @@ use dns_lattice_model::{
     UpstreamGroupId,
 };
 
-use crate::cache::CacheConfig;
 use crate::cache::TtlPolicy;
 use crate::cache::flight::{Flights, Join, Outcome, Wait};
 use crate::cache::store::{CachedAnswer, KeyBuf, Store};
+use crate::cache::{CacheConfig, CacheStats};
 use crate::fakeip::{FakeIpPolicy, FakeIpPool};
 use crate::hooks::{RouteDecision, RouteHook, RouteRequest};
 use crate::observability::{
@@ -128,10 +128,21 @@ pub struct Resolver {
     /// Bumped whenever cached content is invalidated; a leader stores its
     /// answer only if the epoch is unchanged since its upstream call began.
     cache_epoch: AtomicU64,
+    /// Lookup outcome counters behind [`Resolver::cache_stats`].
+    counters: QueryCounters,
     fake_ip: Option<FakeIpResolverConfig>,
     route_hook: Option<Box<dyn RouteHook>>,
     observability_sink: Option<Arc<dyn ObservabilitySink>>,
     next_correlation_id: AtomicU64,
+}
+
+/// Cache lookup outcomes counted by the resolver itself (the store counts
+/// its own inserts, evictions and expirations).
+#[derive(Default)]
+struct QueryCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    coalesced: AtomicU64,
 }
 
 /// Explicit Fake IP answer synthesis owned by a [`Resolver`].
@@ -355,6 +366,7 @@ impl Resolver {
         {
             let mut answer = cache_hit_response(query, &cached, now);
             align_edns(query, &mut answer);
+            self.counters.hits.fetch_add(1, Ordering::Relaxed);
             self.emit(ObserveEvent::CacheHit {
                 correlation_id,
                 group: group.clone(),
@@ -365,6 +377,7 @@ impl Resolver {
             });
             return Ok(answer);
         }
+        self.counters.misses.fetch_add(1, Ordering::Relaxed);
         self.emit(ObserveEvent::CacheMiss {
             correlation_id,
             group: group.clone(),
@@ -383,6 +396,7 @@ impl Resolver {
                         Join::Follow(follower) => {
                             if !announced {
                                 announced = true;
+                                self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
                                 self.emit_cache(CacheEvent::Coalesced {
                                     correlation_id,
                                     group: group.clone(),
@@ -449,6 +463,76 @@ impl Resolver {
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Removes every cached answer and returns how many were removed.
+    ///
+    /// Use it when the upstream data is known to have changed wholesale (a
+    /// network switch, a VPN toggle, a policy reload). Queries already waiting
+    /// on an upstream call still receive that call's result, but the result
+    /// is not stored: an answer fetched before the flush never outlives it.
+    /// The lifetime counters of [`Resolver::cache_stats`] are not reset.
+    ///
+    /// Takes one shard lock at a time, never across an await, and runs no
+    /// callback. With the store disabled it returns 0.
+    pub fn clear_cache(&self) -> usize {
+        // Bump first, then lock: an insert that already passed its epoch
+        // check holds a shard lock, so the flush below waits for it and
+        // removes the entry; any later insert sees the new epoch.
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cache.as_ref().map_or(0, Store::clear)
+    }
+
+    /// Removes the cached answers for exactly `name` and returns how many
+    /// were removed.
+    ///
+    /// Every upstream group, class and query shape (RD and DO bits) is
+    /// covered, and so is every answer kind (positive and negative). With
+    /// `rtype` set only that record type is removed; with `None` every type
+    /// is. The name is compared case-insensitively. Answers for names below
+    /// `name` are kept; see [`Resolver::purge_subtree`].
+    ///
+    /// Like [`Resolver::clear_cache`], it also stops in-flight queries from
+    /// storing the answer they were fetching (for any name: a purge
+    /// invalidates every upstream call that began before it).
+    pub fn purge(&self, name: &Name, rtype: Option<RecordType>) -> usize {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cache
+            .as_ref()
+            .map_or(0, |store| store.purge(name, rtype))
+    }
+
+    /// Removes the cached answers for `zone` and every name below it, and
+    /// returns how many were removed.
+    ///
+    /// Matching respects label boundaries: purging `ample.com` removes
+    /// `ample.com` and `www.ample.com` but not `example.com`. Purging the
+    /// root name removes everything, like [`Resolver::clear_cache`] (except
+    /// that remembered eviction hashes are kept). The group, class, type and
+    /// query shape of an answer do not matter. In-flight queries are handled
+    /// as in [`Resolver::purge`].
+    pub fn purge_subtree(&self, zone: &Name) -> usize {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.cache
+            .as_ref()
+            .map_or(0, |store| store.purge_subtree(zone))
+    }
+
+    /// A snapshot of the cache counters and size. See [`CacheStats`].
+    pub fn cache_stats(&self) -> CacheStats {
+        let store = self.cache.as_ref().map(Store::stats).unwrap_or_default();
+        CacheStats {
+            entries: store.entries,
+            bytes: store.bytes,
+            capacity_bytes: store.capacity_bytes,
+            hits: self.counters.hits.load(Ordering::Relaxed),
+            misses: self.counters.misses.load(Ordering::Relaxed),
+            coalesced: self.counters.coalesced.load(Ordering::Relaxed),
+            inserts: store.inserts,
+            evictions: store.evictions,
+            expirations: store.expirations,
+            oversized_rejected: store.oversized_rejected,
         }
     }
 
@@ -1100,6 +1184,7 @@ impl ResolverBuilder {
                 .coalesce_enabled()
                 .then(|| Arc::new(Flights::new())),
             cache_epoch: AtomicU64::new(0),
+            counters: QueryCounters::default(),
             fake_ip: self.fake_ip,
             route_hook: self.route_hook,
             observability_sink: self.observability_sink,
@@ -4440,5 +4525,317 @@ mod tests {
             parse_reverse_name(&n(&reverse)),
             Some(std::net::IpAddr::V6("::1".parse().unwrap()))
         );
+    }
+
+    // --- Flush, purge and statistics. ---------------------------------------
+
+    /// Resolves each name once so the store holds one entry per name.
+    async fn warm(resolver: &Resolver, names: &[&str]) {
+        for name in names {
+            resolver.resolve(&query_for(name)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_cache_removes_everything_and_the_next_query_goes_upstream() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        warm(&resolver, &["a.example.com", "b.example.com", "c.net"]).await;
+        assert_eq!(cache_len(&resolver), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        assert_eq!(resolver.clear_cache(), 3);
+        assert_eq!(cache_len(&resolver), 0);
+        assert_eq!(resolver.clear_cache(), 0, "nothing left to remove");
+        assert_eq!(resolver.cache_stats().entries(), 0);
+        assert_eq!(resolver.cache_stats().bytes(), 0);
+
+        warm(&resolver, &["a.example.com"]).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "refetched after the flush");
+        assert_eq!(cache_len(&resolver), 1);
+        assert!(resolver.cache.as_ref().unwrap().all_unlocked());
+    }
+
+    #[tokio::test]
+    async fn flushes_on_a_disabled_store_remove_nothing_and_do_not_panic() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::disabled(), a_answer("example.com", 300));
+        warm(&resolver, &["example.com"]).await;
+        assert_eq!(resolver.clear_cache(), 0);
+        assert_eq!(resolver.purge(&n("example.com"), None), 0);
+        assert_eq!(resolver.purge_subtree(&n("example.com")), 0);
+        let stats = resolver.cache_stats();
+        assert_eq!(
+            (stats.entries(), stats.bytes(), stats.capacity_bytes()),
+            (0, 0, 0)
+        );
+        assert_eq!((stats.hits(), stats.misses()), (0, 1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_removes_one_name_across_types_classes_and_shapes() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        let mut no_rd = query_for("example.com");
+        no_rd.header.recursion_desired = false;
+        let queries = [
+            query_for("example.com"),
+            no_rd,
+            edns_query_for("EXAMPLE.com", 1232, true),
+            query_for_type("example.com", RecordType::Aaaa, Class::In, 1),
+            query_for_type("example.com", RecordType::A, Class::Ch, 1),
+            query_for("www.example.com"),
+            query_for("example.org"),
+        ];
+        for query in &queries {
+            resolver.resolve(query).await.unwrap();
+        }
+        let total = cache_len(&resolver);
+        assert_eq!(total, 7);
+
+        // One type only: the A entries of every shape and class... A in IN
+        // with RD, without RD, with DO, and A in CH.
+        assert_eq!(resolver.purge(&n("Example.Com."), Some(RecordType::A)), 4);
+        assert_eq!(cache_len(&resolver), 3);
+        // The AAAA entry, the subdomain and the other zone survive.
+        let before = calls.load(Ordering::SeqCst);
+        resolver
+            .resolve(&query_for_type(
+                "example.com",
+                RecordType::Aaaa,
+                Class::In,
+                1,
+            ))
+            .await
+            .unwrap();
+        resolver
+            .resolve(&query_for("www.example.com"))
+            .await
+            .unwrap();
+        resolver.resolve(&query_for("example.org")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), before, "still cached");
+
+        // Every type of the name.
+        assert_eq!(resolver.purge(&n("example.com"), None), 1);
+        assert_eq!(cache_len(&resolver), 2);
+        assert_eq!(resolver.purge(&n("example.com"), None), 0, "already gone");
+        assert_eq!(resolver.purge(&n("absent.example"), None), 0);
+    }
+
+    #[tokio::test]
+    async fn purge_covers_every_upstream_group() {
+        let group_g = UpstreamGroupId::new("g");
+        let group_h = UpstreamGroupId::new("h");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = |calls: &Arc<AtomicUsize>| CountingBackend {
+            answer: a_answer("example.com", 300),
+            calls: calls.clone(),
+        };
+        let resolver = Resolver::builder(SplitDnsPolicy::builder().build())
+            .clock(FakeClock::new())
+            .route_hook(SequencedHook {
+                decisions: Mutex::new(vec![
+                    RouteDecision::Use(group_g.clone()),
+                    RouteDecision::Use(group_h.clone()),
+                    RouteDecision::Use(group_g),
+                ]),
+            })
+            .backend(UpstreamGroupId::new("g"), backend(&calls))
+            .backend(group_h, backend(&calls))
+            .build();
+        for _ in 0..2 {
+            resolver.resolve(&query_for("example.com")).await.unwrap();
+        }
+        assert_eq!(cache_len(&resolver), 2, "one entry per group");
+
+        assert_eq!(resolver.purge(&n("example.com"), None), 2);
+        assert_eq!(cache_len(&resolver), 0);
+        resolver.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn purge_subtree_respects_label_boundaries() {
+        let (resolver, _calls, _clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        let names = [
+            "ample.com",
+            "www.ample.com",
+            "deep.www.ample.com",
+            "example.com",
+            "www.example.com",
+            "ample.com.evil.org",
+            "com",
+        ];
+        warm(&resolver, &names).await;
+        assert_eq!(cache_len(&resolver), names.len());
+
+        assert_eq!(resolver.purge_subtree(&n("AMPLE.com")), 3);
+        assert_eq!(cache_len(&resolver), 4);
+        // `example.com` and `www.example.com` were not touched by `ample.com`.
+        assert_eq!(resolver.purge_subtree(&n("example.com")), 2);
+        assert_eq!(resolver.purge_subtree(&n("com")), 1, "the apex itself");
+        assert_eq!(resolver.purge_subtree(&n("ample.com")), 0);
+        assert_eq!(cache_len(&resolver), 1);
+        assert_eq!(resolver.purge_subtree(&n("org")), 1);
+        assert_eq!(cache_len(&resolver), 0);
+    }
+
+    #[tokio::test]
+    async fn purging_the_root_removes_everything() {
+        let (resolver, _calls, _clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        warm(&resolver, &["a.example.com", "b.net", "c.org"]).await;
+        assert_eq!(resolver.purge_subtree(&Name::root()), 3);
+        assert_eq!(cache_len(&resolver), 0);
+    }
+
+    #[tokio::test]
+    async fn a_flush_stops_in_flight_queries_from_storing_but_they_are_answered() {
+        for flush in 0..3 {
+            let gated = gated_resolver(
+                CacheConfig::new(),
+                Ok(a_answer("example.com", 300)),
+                false,
+                0,
+            );
+            let queries = [
+                query_with_id("example.com", 1),
+                query_with_id("example.com", 2),
+            ];
+            let mut futures: Vec<_> = queries
+                .iter()
+                .map(|query| Box::pin(gated.resolver.resolve(query)))
+                .collect();
+            for future in &mut futures {
+                tokio::select! {
+                    biased;
+                    _ = future.as_mut() => panic!("blocked on the gate"),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+            match flush {
+                0 => {
+                    gated.resolver.clear_cache();
+                }
+                1 => {
+                    gated.resolver.purge(&n("example.com"), None);
+                }
+                _ => {
+                    gated.resolver.purge_subtree(&n("com"));
+                }
+            }
+            gated.gate.add_permits(1);
+            for future in futures {
+                assert_eq!(future.await.unwrap().answers.len(), 1);
+            }
+            assert_eq!(cache_len(&gated.resolver), 0, "flush {flush}");
+            assert_eq!(gated.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_stats_count_hits_misses_inserts_and_expirations() {
+        let (resolver, _calls, clock) =
+            configured_resolver(CacheConfig::new().shards(1), a_answer("example.com", 300));
+        let capacity = resolver.cache_stats().capacity_bytes();
+        assert_eq!(capacity, 16 * 1024 * 1024);
+        assert_eq!(
+            resolver.cache_stats(),
+            CacheStats {
+                capacity_bytes: capacity,
+                ..CacheStats::default()
+            },
+            "a new resolver has empty counters"
+        );
+
+        warm(&resolver, &["example.com"]).await; // miss + insert
+        warm(&resolver, &["example.com"]).await; // hit
+        warm(&resolver, &["example.com"]).await; // hit
+        let stats = resolver.cache_stats();
+        assert_eq!((stats.hits(), stats.misses(), stats.inserts()), (2, 1, 1));
+        assert_eq!(stats.entries(), 1);
+        assert!(stats.bytes() > 0 && stats.bytes() <= capacity);
+        assert_eq!(stats.capacity_bytes(), capacity);
+        assert_eq!((stats.evictions(), stats.expirations()), (0, 0));
+
+        clock.advance(Duration::from_secs(300));
+        warm(&resolver, &["example.com"]).await; // expired: miss + insert
+        let stats = resolver.cache_stats();
+        assert_eq!((stats.hits(), stats.misses(), stats.inserts()), (2, 2, 2));
+        assert_eq!(stats.expirations(), 1);
+        assert_eq!(stats.entries(), 1);
+
+        // A flush empties the content but keeps the history.
+        assert_eq!(resolver.clear_cache(), 1);
+        let stats = resolver.cache_stats();
+        assert_eq!((stats.entries(), stats.bytes()), (0, 0));
+        assert_eq!((stats.hits(), stats.misses(), stats.inserts()), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_count_evictions_and_oversized_answers() {
+        let bound = 64 * 1024;
+        let (resolver, _calls, _clock) = configured_resolver(
+            CacheConfig::new().max_bytes(bound).shards(1),
+            a_answer("example.com", 300),
+        );
+        for i in 0..500 {
+            resolver
+                .resolve(&query_for(&format!("host{i}.example.com")))
+                .await
+                .unwrap();
+        }
+        let stats = resolver.cache_stats();
+        assert_eq!(stats.inserts(), 500);
+        assert!(stats.evictions() > 0);
+        assert_eq!(stats.inserts(), stats.entries() + stats.evictions());
+        assert!(stats.bytes() <= stats.capacity_bytes());
+        assert_eq!(stats.oversized_rejected(), 0);
+
+        // An answer far above an eighth of the bound is returned, not stored.
+        let mut big = a_answer("big.example.com", 300);
+        big.answers[0].rdata = RData::Txt(vec![vec![b'x'; 255]; 200]);
+        let (resolver, _calls, _clock) =
+            configured_resolver(CacheConfig::new().max_bytes(bound).shards(1), big);
+        resolver
+            .resolve(&query_for("big.example.com"))
+            .await
+            .unwrap();
+        let stats = resolver.cache_stats();
+        assert_eq!(stats.oversized_rejected(), 1);
+        assert_eq!((stats.entries(), stats.inserts()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_count_coalesced_followers() {
+        let gated = gated_resolver(
+            CacheConfig::new(),
+            Ok(a_answer("example.com", 300)),
+            false,
+            0,
+        );
+        let queries: Vec<_> = (0..4).map(|id| query_with_id("example.com", id)).collect();
+        resolve_together(&gated, &queries, 1).await;
+        let stats = gated.resolver.cache_stats();
+        assert_eq!(stats.coalesced(), 3);
+        assert_eq!(stats.misses(), 4);
+        assert_eq!((stats.hits(), stats.inserts()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn bypassing_queries_count_as_misses() {
+        let (resolver, calls, _clock) =
+            configured_resolver(CacheConfig::new(), a_answer("example.com", 300));
+        for _ in 0..2 {
+            resolver
+                .resolve(&query_with_option("example.com", 1, 8))
+                .await
+                .unwrap();
+        }
+        let stats = resolver.cache_stats();
+        assert_eq!((stats.hits(), stats.misses(), stats.entries()), (0, 2, 0));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -61,6 +61,9 @@ narrows the window in which an off-path attacker can race one outstanding
 query. A query carrying an EDNS Client Subnet option or any EDNS option other
 than NSID, COOKIE, TCP keepalive and Padding bypasses the cache and
 coalescing, so a client-specific answer is never shared between clients.
+`Resolver::clear_cache`, `purge` and `purge_subtree` drop suspect or outdated
+answers on demand, and `Resolver::cache_stats` reports the cache's size and
+eviction counters so an operator can watch its pressure.
 
 ## Scope
 

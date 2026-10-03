@@ -233,6 +233,19 @@ when a leader inserts, so an answer fetched before an invalidation is
 returned and published but not stored. A flight shard lock covers only one
 map operation.
 
+`Resolver::clear_cache`, `purge` and `purge_subtree` first bump the purge
+epoch and then lock the shards one at a time, so an insert that already passed
+its epoch check holds a shard lock and is removed by the sweep, and any later
+insert is refused. `purge` and `purge_subtree` scan the slots of every shard
+and compare the name part of each stored key (the key layout puts the group,
+type, class and shape first, so one purge covers all of them); subtree
+matching only tests suffixes that begin at a label boundary. A flush resets
+the shard but keeps its counters. `Resolver::cache_stats` sums per-shard
+counters kept under the shard locks (inserts, evictions, expirations,
+oversized rejections, entries, bytes) with three relaxed atomics for lookup
+outcomes (hits, misses, coalesced); it takes no lock longer than one shard
+and does not stop queries.
+
 Every answer the resolver returns — cache hit, Fake IP, or fresh upstream
 answer — is aligned with the query's EDNS(0) state: without a query OPT
 record the answer has none; with one, an answer lacking a valid OPT record

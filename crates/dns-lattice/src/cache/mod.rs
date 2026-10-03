@@ -11,6 +11,11 @@
 //! Concurrent misses for the same question share one upstream query; see
 //! [`CacheConfig::coalesce`].
 //!
+//! The cache can be flushed with [`crate::engine::Resolver::clear_cache`],
+//! [`crate::engine::Resolver::purge`] and
+//! [`crate::engine::Resolver::purge_subtree`] and observed through
+//! [`crate::engine::Resolver::cache_stats`] ([`CacheStats`]).
+//!
 //! Configure it through [`crate::engine::ResolverBuilder::cache`]:
 //!
 //! ```
@@ -266,6 +271,91 @@ impl CacheConfig {
             negative: self.negative,
             negative_without_soa: self.negative_without_soa,
         }
+    }
+}
+
+/// A point-in-time snapshot of a [`crate::engine::Resolver`]'s cache
+/// counters, from [`crate::engine::Resolver::cache_stats`].
+///
+/// The counters are monotonic over the resolver's lifetime (they are not
+/// reset by [`crate::engine::Resolver::clear_cache`]); `entries` and `bytes`
+/// describe the current content. The snapshot is read shard by shard without
+/// stopping concurrent queries, so under load the values are individually
+/// consistent but not an atomic cut across all of them.
+///
+/// With the store disabled ([`CacheConfig::disabled`]) every figure but
+/// `misses` and `coalesced` stays 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub(crate) entries: u64,
+    pub(crate) bytes: u64,
+    pub(crate) capacity_bytes: u64,
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) coalesced: u64,
+    pub(crate) inserts: u64,
+    pub(crate) evictions: u64,
+    pub(crate) expirations: u64,
+    pub(crate) oversized_rejected: u64,
+}
+
+impl CacheStats {
+    /// Number of answers currently stored.
+    pub fn entries(&self) -> u64 {
+        self.entries
+    }
+
+    /// Estimated bytes in use: the stored answers plus the remembered hashes
+    /// of recently evicted keys. Like [`CacheConfig::max_bytes`], this is a
+    /// structural estimate, not an allocator-exact figure.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The configured memory bound as split over the shards (so it can be a
+    /// few bytes below [`CacheConfig::max_bytes`]); 0 when the store is
+    /// disabled.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    /// Queries answered from the store.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Queries not answered from the store at lookup, including queries that
+    /// bypass the cache, and every query when the store is disabled. A
+    /// coalesced follower counts here too: it missed, then shared a result.
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Queries that joined another query's in-flight upstream call.
+    pub fn coalesced(&self) -> u64 {
+        self.coalesced
+    }
+
+    /// Answers stored. A refreshed key counts again.
+    pub fn inserts(&self) -> u64 {
+        self.inserts
+    }
+
+    /// Entries removed to stay within the memory bound. Expiry, purges and
+    /// flushes are not evictions.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Entries removed because their lifetime ended.
+    pub fn expirations(&self) -> u64 {
+        self.expirations
+    }
+
+    /// Answers not stored because one alone was too large for its shard
+    /// (more than an eighth of the shard's share of the bound).
+    pub fn oversized_rejected(&self) -> u64 {
+        self.oversized_rejected
     }
 }
 
