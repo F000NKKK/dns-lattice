@@ -178,6 +178,11 @@ impl PoolConfig {
 
     /// Sets the largest number of connections the pool keeps open to the
     /// upstream. The default is 4; the value is clamped to `1..=16`.
+    ///
+    /// The limit applies to connections that take new queries. A connection
+    /// that reached its [`max_lifetime`](Self::max_lifetime) is replaced
+    /// while it finishes its in-flight queries, so old and new connections
+    /// may briefly overlap.
     #[must_use]
     pub fn max_connections(mut self, n: usize) -> Self {
         self.max_connections = n.clamp(1, MAX_CONNECTIONS_LIMIT);
@@ -415,8 +420,10 @@ pub(crate) trait Connector: Send + Sync + 'static {
     type Conn: Send + Sync + 'static;
 
     /// Opens a new connection. It runs in a task owned by the pool and must
-    /// bound itself with the transport's own connect timeout; the pool only
-    /// stops waiting for it when the pool is dropped.
+    /// bound itself with the transport's own connect timeout (a transport
+    /// must pass its `connect_timeout` here): a connect that never completes
+    /// would keep every caller waiting until its own deadline, and the pool
+    /// only stops the connect when the pool is dropped.
     fn connect(&self) -> impl Future<Output = Result<Self::Conn>> + Send;
 
     /// Whether the connection is still usable. It is called while the pool's
@@ -683,6 +690,9 @@ impl<K: Connector> Shared<K> {
                             Counters::bump(&this.counters.open);
                             Counters::bump(&this.counters.opened);
                             Self::ensure_janitor_locked(this, &mut st);
+                            // A new connection can be due before the instant
+                            // a running janitor sleeps until.
+                            this.wake.notify_one();
                             Ok(())
                         }
                         Err(err) => {
@@ -769,22 +779,31 @@ async fn run_janitor<K: Connector>(shared: Weak<Shared<K>>, wake: Arc<Notify>) {
             strong.sweep_locked(&mut st, Instant::now(), &mut closing);
             let next = strong.next_deadline_locked(&st);
             st.janitor_deadline = next;
-            if next.is_none() {
+            if st.entries.is_empty() {
                 // Nothing left to watch; the next connect starts a new
                 // janitor. Dropping the handle here only flags this task,
                 // which returns right below.
                 st.janitor = None;
+                st.janitor_deadline = None;
+                strong.close_all(closing);
+                return;
             }
             next
         };
         strong.close_all(closing);
         drop(strong);
-        let Some(deadline) = deadline else {
-            return;
-        };
-        tokio::select! {
-            () = sleep_until(deadline) => {}
-            () = wake.notified() => {}
+        // Connections exist but none has a deadline yet (for example every
+        // connection is busy and there is no maximum lifetime): stay alive and
+        // sleep until a lease ends or a connection opens, so the connection
+        // that becomes idle is still closed at its idle timeout.
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = sleep_until(deadline) => {}
+                    () = wake.notified() => {}
+                }
+            }
+            None => wake.notified().await,
         }
     }
 }
@@ -919,6 +938,11 @@ impl<K: Connector> Pool<K> {
     /// connection opened until the first [`Pool::acquire`].
     pub(crate) fn new(config: PoolConfig, connector: Arc<K>, drain_grace: Duration) -> Self {
         let admission = Arc::new(Semaphore::new(config.capacity()));
+        // A grace longer than the lifetime would let several draining
+        // generations pile up, so cap it.
+        let drain_grace = config
+            .max_lifetime_value()
+            .map_or(drain_grace, |lifetime| drain_grace.min(lifetime));
         Pool {
             shared: Arc::new(Shared {
                 config,
@@ -1218,7 +1242,18 @@ impl<T> PendingTable<T> {
     pub(crate) fn take(&mut self, id: u16) -> Taken<T> {
         match self.slots.remove(&id) {
             Some(Slot::Pending(value)) => Taken::Pending(value),
-            Some(Slot::Orphan(_)) => Taken::Orphaned,
+            Some(Slot::Orphan(number)) => {
+                // Drop the now-meaningless expiry entry so the queue stays
+                // bounded by the slots in use.
+                if let Some(pos) = self
+                    .tombstones
+                    .iter()
+                    .position(|&(i, n, _)| i == id && n == number)
+                {
+                    self.tombstones.remove(pos);
+                }
+                Taken::Orphaned
+            }
             None => Taken::Unknown,
         }
     }
@@ -1889,6 +1924,101 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn without_a_lifetime_a_connection_that_turns_idle_after_a_busy_wakeup_is_closed() {
+        let fake = Fake::new();
+        let pool = pool_with(
+            config(1, 8)
+                .max_lifetime(None)
+                .idle_timeout(Duration::from_secs(20)),
+            &fake,
+        );
+        let busy = pool.acquire(deadline()).await.unwrap();
+        // The janitor wakes at the first idle deadline while the connection
+        // is busy and finds nothing to schedule.
+        tokio::time::advance(Duration::from_secs(25)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 1);
+        drop(busy);
+        tokio::time::advance(Duration::from_secs(19)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 0);
+        assert_eq!(pool.stats().closed_idle(), 1);
+        assert!(fake.probe(0).closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_defers_the_idle_close_without_a_lifetime() {
+        let fake = Fake::new();
+        let pool = pool_with(
+            config(1, 8)
+                .max_lifetime(None)
+                .idle_timeout(Duration::from_secs(20)),
+            &fake,
+        );
+        let busy = pool.acquire(deadline()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 1, "in flight, not idle");
+        drop(busy);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        settle().await;
+        pool.acquire(deadline()).await.unwrap().complete();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 1);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 0);
+        assert_eq!(pool.stats().closed_idle(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_idle_connection_is_not_held_open_by_a_busy_one() {
+        let fake = Fake::new();
+        // Threshold is 1, so the second lease triggers a second connection.
+        let pool = pool_with(
+            config(2, 4)
+                .max_lifetime(None)
+                .idle_timeout(Duration::from_secs(20)),
+            &fake,
+        );
+        let l1 = pool.acquire(deadline()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let l2 = pool.acquire(deadline()).await.unwrap(); // scale-up starts
+        drop(l2);
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 2);
+        // The second connection went idle at t=10 and is due at t=30 while
+        // the first stays busy.
+        tokio::time::advance(Duration::from_secs(21)).await;
+        settle().await;
+        assert_eq!(pool.stats().connections_open(), 1);
+        assert_eq!(pool.stats().closed_idle(), 1);
+        drop(l1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_grace_is_capped_by_the_lifetime() {
+        let fake = Fake::new();
+        // Grace 5 s, lifetime 2 s: the hard close comes 2 s after draining.
+        let pool = pool_with(
+            config(1, 8).max_lifetime(Some(Duration::from_secs(2))),
+            &fake,
+        );
+        let held = pool.acquire(deadline()).await.unwrap();
+        tokio::time::advance(Duration::from_millis(2100)).await;
+        settle().await;
+        assert!(!fake.probe(0).closed.load(Ordering::SeqCst));
+        tokio::time::advance(Duration::from_millis(2000)).await;
+        settle().await;
+        assert!(fake.probe(0).closed.load(Ordering::SeqCst));
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_old_connection_drains_and_a_new_one_takes_over() {
         let fake = Fake::new();
         let pool = pool_with(
@@ -2066,6 +2196,10 @@ mod tests {
             t.take(b),
             Taken::Orphaned,
             "late answer to a cancelled query"
+        );
+        assert!(
+            t.tombstones.is_empty(),
+            "a consumed tombstone leaves the queue"
         );
         assert_eq!(t.take(b), Taken::Unknown, "the tombstone is consumed");
         assert!(t.is_empty());
