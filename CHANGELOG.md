@@ -131,7 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The TLS configuration, server name and ALPN are fixed at construction, so
   backends never share connections. One call has a single `timeout` covering
   the wait for capacity, the request, the body and a retry, which is not
-  longer than before. A query whose reused connection fails before the
+  longer than before. Pooled sockets have `TCP_NODELAY` set (without it a
+  single HTTP/2 connection stalled small frames behind Nagle's algorithm and
+  ran at half the throughput with ~40 ms tail latency). While a client has no
+  connection (first query, after idle close, after `max_lifetime`), one call
+  starts the connection and calls arriving meanwhile wait until that call's
+  response headers arrive, bounded by their own `timeout`. A query whose reused connection fails before the
   answer is sent once more (only for opcode QUERY and only while time is left);
   timeouts, TLS errors, HTTP status errors and undecodable answers are never
   retried. Consequences to plan for: the backend keeps sockets and Tokio tasks

@@ -133,6 +133,16 @@ pub struct DohBackendConfig {
 /// to one query affects only that query. The resend may be served by another
 /// idle connection of the pool (HTTP/1.1).
 ///
+/// Pooled sockets have `TCP_NODELAY` set. The client cannot tell HTTP/1.1
+/// from HTTP/2 before the first TLS handshake has negotiated ALPN, so while a
+/// client has no connection (at the first query, after the connections went
+/// idle, and when the client is replaced at the maximum lifetime) one call
+/// starts the connection and the calls that arrive meanwhile wait for it.
+/// They are released when that call's response headers arrive, not when its
+/// connection opens: if that first query is slow or never answered, the
+/// waiting calls stay parked until it completes or until their own `timeout`
+/// passes.
+///
 /// The TLS configuration, SNI host and ALPN are fixed when the backend is
 /// created: every connection of a backend goes to the one configured
 /// endpoint and two backends never share a connection. With reuse enabled
@@ -657,6 +667,27 @@ impl hyper::rt::Write for CountedIo {
     }
 }
 
+/// The HTTPS connector of a pooled client: HTTP/1.1 and HTTP/2 over TLS, with
+/// `TCP_NODELAY` set on every socket.
+///
+/// A pooled connection carries many small request and response frames, and
+/// over HTTP/2 all queries share one connection; without `TCP_NODELAY` Nagle's
+/// algorithm and delayed ACKs hold a frame back until the previous one is
+/// acknowledged, which adds stalls of tens of milliseconds.
+fn pooled_https_connector(tls_config: &Arc<ClientConfig>) -> HttpsConnector<HttpConnector> {
+    let mut http = HttpConnector::new();
+    // The TLS layer is what enforces `https`; the plain connector must accept
+    // the `https` scheme it is asked to open a socket for.
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    HttpsConnectorBuilder::new()
+        .with_tls_config((**tls_config).clone())
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http)
+}
+
 /// The HTTPS connector of one client generation, wrapped so the connections
 /// it establishes are counted. It changes nothing about how connections are
 /// made: the TLS configuration, SNI and ALPN are those of the inner
@@ -771,12 +802,7 @@ impl DohPool {
         counters: &Arc<DohCounters>,
     ) -> Arc<Generation> {
         let state = Arc::new(GenState::new());
-        let https = HttpsConnectorBuilder::new()
-            .with_tls_config((**tls_config).clone())
-            .https_only()
-            .enable_http1()
-            .enable_http2()
-            .build();
+        let https = pooled_https_connector(tls_config);
         let connector = CountingConnector {
             inner: https,
             counters: Arc::clone(counters),
@@ -2059,6 +2085,57 @@ mod tests {
         assert_eq!(stats.queued(), 0, "100 queries fit the default capacity");
         assert!(stats.reused_queries() >= 10, "{stats:?}");
         assert_eq!(stats.unsolicited(), 0);
+    }
+
+    /// Opens one connection through `connector` and reports whether the
+    /// client side of its TCP socket has `TCP_NODELAY` set.
+    async fn client_socket_nodelay(mut connector: CountingConnector, server: &TestServer) -> bool {
+        let uri = Uri::from_str(&format!(
+            "https://localhost:{}/dns-query",
+            server.addr.port()
+        ))
+        .unwrap();
+        std::future::poll_fn(|cx| connector.poll_ready(cx))
+            .await
+            .unwrap();
+        let connected = connector.call(uri).await.unwrap();
+        match &connected.io {
+            MaybeHttpsStream::Https(tls) => {
+                tls.inner().get_ref().0.inner().inner().nodelay().unwrap()
+            }
+            MaybeHttpsStream::Http(_) => panic!("expected a TLS connection"),
+        }
+    }
+
+    fn counting(inner: HttpsConnector<HttpConnector>) -> CountingConnector {
+        CountingConnector {
+            inner,
+            counters: Arc::new(DohCounters::default()),
+            generation: Arc::new(GenState::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_connections_set_tcp_nodelay_over_http1_and_http2() {
+        for proto in [Proto::H1, Proto::H2] {
+            let server = TestServer::start(proto, echo()).await;
+            let pooled = counting(pooled_https_connector(&server.client));
+            assert!(
+                client_socket_nodelay(pooled, &server).await,
+                "the pooled connector must set TCP_NODELAY"
+            );
+
+            // The probe is sensitive: a default connector leaves Nagle on.
+            let default = counting(
+                HttpsConnectorBuilder::new()
+                    .with_tls_config((*server.client).clone())
+                    .https_only()
+                    .enable_http1()
+                    .enable_http2()
+                    .build(),
+            );
+            assert!(!client_socket_nodelay(default, &server).await);
+        }
     }
 
     #[tokio::test]
