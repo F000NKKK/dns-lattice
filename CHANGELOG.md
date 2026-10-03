@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inbound server sends to an EDNS(0) client and advertises in its OPT
   record. The default is 1232 bytes; smaller values are raised to 512, and
   setting 512 restores the 1.1 UDP answer size.
+- `UdpBackend::with_edns_udp_payload_size` makes the UDP upstream backend
+  advertise EDNS(0): a query that carries no OPT record is sent with one
+  (the given payload size raised to at least 512, DO clear, no options), so
+  the upstream may answer with more than 512 bytes over UDP. It is off by
+  default. A query that already has an OPT record is sent unchanged; an
+  upstream `FORMERR` or `NOTIMP` without an OPT record makes the backend
+  retry once without it, within the same timeout; the OPT record is removed
+  from the returned answer; an answer with a nonzero extended RCODE becomes
+  `Error::Transport` (so the resolver fails over); a truncated answer still
+  falls back to TCP with the original query.
 - `dns_lattice::cache::CacheConfig` and `ResolverBuilder::cache` configure
   the resolver's answer cache: `max_bytes` (the memory bound; `0` disables
   the store), `shards`, `positive_ttl`, `negative_ttl` (inclusive TTL clamps,

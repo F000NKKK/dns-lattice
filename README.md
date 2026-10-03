@@ -153,10 +153,13 @@ Current limits, stated plainly:
 - every upstream query opens a fresh socket or connection (UDP socket, TCP
   or TLS connection, DoH client, QUIC connection); there is no connection
   pooling yet;
-- `UdpBackend` adds no EDNS0/OPT record of its own: it forwards the query
-  unchanged, so a query without one gets UDP answers of at most 512 bytes
-  (larger ones fall back to TCP), while a query that carries one can get
-  answers up to the size it advertises;
+- by default `UdpBackend` adds no EDNS0/OPT record of its own: it forwards
+  the query unchanged, so a query without one gets UDP answers of at most
+  512 bytes (larger ones fall back to TCP), while a query that carries one
+  can get answers up to the size it advertises.
+  `UdpBackend::with_edns_udp_payload_size` opts in to adding an OPT record
+  to queries that have none (retrying once without it after `FORMERR` or
+  `NOTIMP`, and removing it from the answer);
 - the inbound server answers UDP EDNS(0) clients with at most
   min(client payload size raised to 512, 1232 bytes)
   (`ServerBuilder::edns_udp_payload_size`
@@ -688,7 +691,7 @@ docs.rs page (version 0.26.3).
 | **DNSSEC validation** | ❌ | ✅ `dnssec-*` features |
 | **System resolver config** (`/etc/resolv.conf`, Windows) | ❌ By design; the host configures everything | ✅ `system-config` (default) |
 | **Upstream connection reuse** | ❌ New connection per query | ✅ Name-server pool |
-| **EDNS0 on UDP** | ➖ The inbound server answers EDNS clients with up to 1232 bytes (configurable), with `FORMERR`/`BADVERS` handled locally; `UdpBackend` forwards the client's OPT record and adds none | Not compared |
+| **EDNS0 on UDP** | ➖ The inbound server answers EDNS clients with up to 1232 bytes (configurable), with `FORMERR`/`BADVERS` handled locally; `UdpBackend` forwards the client's OPT record and, unless `with_edns_udp_payload_size` opts in, adds none | Not compared |
 | **Throughput and latency** | Not yet benchmarked | Not yet benchmarked |
 
 ## 🛠️ API Overview
@@ -772,7 +775,9 @@ payload size and the server maximum (1232 bytes by default,
 `ServerBuilder::edns_udp_payload_size`). For a larger answer it sends an empty,
 truncated response (keeping the OPT record for an EDNS0 client) and the client
 is expected to retry over TCP; also listen on TCP (`tcp_addr`) at the same
-address. `UdpBackend` performs that TCP retry itself.
+address. `UdpBackend` performs that TCP retry itself; to avoid it for most
+upstream answers, call `UdpBackend::with_edns_udp_payload_size` so queries
+without an OPT record advertise a larger UDP payload to the upstream.
 </details>
 
 <details>

@@ -9,13 +9,16 @@
 //! timeout(s)), and one dedicated config struct per transport rather than a
 //! shared enum.
 //!
-//! [`UdpBackend`] does not support EDNS0/OPT: it adds no OPT record of its
-//! own and falls back to a TCP query to the same server whenever a UDP
-//! response arrives with the `TC` (truncated) bit set, rather than
-//! negotiating a larger UDP payload size. It sends the query it is given
+//! By default [`UdpBackend`] adds no EDNS0/OPT record of its own and falls
+//! back to a TCP query to the same server whenever a UDP response arrives
+//! with the `TC` (truncated) bit set. It sends the query it is given
 //! unchanged, so a forwarded client query keeps the client's OPT record and
 //! the upstream may answer with more than 512 bytes; the backend receives
 //! any UDP DNS payload up to 65535 bytes.
+//! [`UdpBackend::with_edns_udp_payload_size`] opts in to advertising a UDP
+//! payload size on queries that carry no OPT record, with a one-shot retry
+//! without it when the upstream answers `FORMERR`/`NOTIMP`, and with the OPT
+//! record stripped from the returned answer.
 //!
 //! # Response validation
 //!
@@ -70,7 +73,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dns_lattice_core::{Error, Result};
-use dns_lattice_model::Message;
+use dns_lattice_model::{Edns, Message, Rcode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -223,22 +226,95 @@ pub struct UdpBackendConfig {
     pub bind_addr: Option<SocketAddr>,
 }
 
-/// Baseline UDP upstream backend (RFC 1035 §4.2.1). No EDNS0/OPT support
-/// and falls back to a TCP query to the same server when a
-/// response arrives with the `TC` (truncated) bit set.
+/// Baseline UDP upstream backend (RFC 1035 §4.2.1). By default it adds no
+/// EDNS0/OPT record of its own (see
+/// [`with_edns_udp_payload_size`](Self::with_edns_udp_payload_size) to opt
+/// in) and falls back to a TCP query to the same server when a response
+/// arrives with the `TC` (truncated) bit set.
 ///
 /// A response of any size up to 65535 bytes is accepted, so an answer
 /// larger than 512 bytes to a query that carries an OPT record is returned
 /// intact rather than cut off.
 pub struct UdpBackend {
     config: UdpBackendConfig,
+    /// The UDP payload size to advertise in an OPT record added to a query
+    /// that has none, or `None` (the default) to add no OPT record.
+    edns_udp_payload_size: Option<u16>,
 }
 
 impl UdpBackend {
-    /// Builds a UDP backend from `config`.
+    /// Builds a UDP backend from `config`. It adds no OPT record of its own.
     pub fn new(config: UdpBackendConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            edns_udp_payload_size: None,
+        }
     }
+
+    /// Makes the backend advertise EDNS(0) (RFC 6891) to the upstream: a
+    /// query that carries no OPT record is sent with one that advertises a UDP
+    /// payload size of `size` (raised to at least 512, RFC 6891 §6.2.5), no
+    /// options and the DO bit clear, so the upstream may answer over UDP with
+    /// more than 512 bytes instead of truncating.
+    ///
+    /// The advertisement is transparent to the caller:
+    ///
+    /// - a query that already carries an OPT record, valid or not, is sent
+    ///   unchanged, so the client's own advertisement wins;
+    /// - if the upstream answers `FORMERR` or `NOTIMP` without an OPT record
+    ///   (RFC 6891 §7: it does not implement EDNS), the original query is
+    ///   sent once more without an OPT record on the same socket, within the
+    ///   same timeout;
+    /// - the OPT record is removed from the returned answer, so a client that
+    ///   did not use EDNS never sees one;
+    /// - an answer whose OPT record carries a nonzero extended RCODE returns
+    ///   [`Error::Transport`], because that code cannot be shown to a client
+    ///   without EDNS; the resolver treats it as retryable and fails over;
+    /// - a truncated (`TC=1`) answer still falls back to TCP, with the
+    ///   original query, which carries no OPT record.
+    ///
+    /// Without this call the backend sends the query unchanged. TCP, DoT, DoH
+    /// and DoQ backends never add an OPT record.
+    #[must_use]
+    pub fn with_edns_udp_payload_size(mut self, size: u16) -> Self {
+        self.edns_udp_payload_size = Some(size.max(512));
+        self
+    }
+}
+
+/// Sends `sent` on `socket` and waits until `deadline` for an answer to
+/// `sent`.
+///
+/// A datagram that does not decode, or is not an answer to this query (wrong
+/// id, QR=0, or a different question), is dropped and the wait continues, so
+/// an off-path spoofed reply cannot displace the real one, cannot end the
+/// query early, and cannot extend the wait past the deadline either.
+async fn udp_exchange(
+    socket: &UdpSocket,
+    sent: &Message,
+    send_budget: Duration,
+    deadline: Instant,
+) -> Result<Message> {
+    let payload = sent.encode()?;
+    send_udp(socket, &payload, send_budget).await?;
+    // Heap-allocated: a 64 KiB array would bloat this future's size.
+    let mut buf = vec![0u8; UDP_RECV_BUFFER_LEN];
+    loop {
+        let len = recv_udp(socket, &mut buf, deadline).await?;
+        let Ok(response) = Message::decode(&buf[..len]) else {
+            continue;
+        };
+        if validate_response(sent, &response, IdCheck::Match).is_ok() {
+            return Ok(response);
+        }
+    }
+}
+
+/// Whether `response` is the answer RFC 6891 §7 says a server without EDNS
+/// sends: `FORMERR` or `NOTIMP` and no OPT record.
+fn rejects_edns(response: &Message) -> bool {
+    matches!(response.header.rcode, Rcode::FormErr | Rcode::NotImp)
+        && matches!(response.edns(), Ok(None))
 }
 
 #[async_trait]
@@ -252,26 +328,46 @@ impl UpstreamBackend for UdpBackend {
         let socket = bind_udp(bind_addr, self.config.timeout).await?;
         connect_udp(&socket, self.config.server, self.config.timeout).await?;
 
-        let payload = query.encode()?;
-        send_udp(&socket, &payload, self.config.timeout).await?;
-
-        // One deadline bounds the whole receive phase: a datagram that does
-        // not decode, or is not an answer to this query (wrong id, QR=0, or
-        // a different question), is dropped and the backend keeps waiting,
-        // so an off-path spoofed reply cannot displace the real one, cannot
-        // end the query early, and cannot extend the wait past the
-        // configured timeout either.
-        let deadline = Instant::now() + self.config.timeout;
-        // Heap-allocated: a 64 KiB array would bloat this future's size.
-        let mut buf = vec![0u8; UDP_RECV_BUFFER_LEN];
-        let response = loop {
-            let len = recv_udp(&socket, &mut buf, deadline).await?;
-            let Ok(response) = Message::decode(&buf[..len]) else {
-                continue;
-            };
-            if validate_response(query, &response, IdCheck::Match).is_ok() {
-                break response;
+        // With the opt-in configured, a query without an OPT record is sent
+        // with one; a query that has any OPT record (even a malformed one)
+        // is forwarded unchanged.
+        let with_opt = match (self.edns_udp_payload_size, query.edns()) {
+            (Some(size), Ok(None)) => {
+                let mut copy = query.clone();
+                copy.set_edns(Some(Edns::new(size)));
+                Some(copy)
             }
+            _ => None,
+        };
+
+        // One deadline bounds the whole receive phase, including the
+        // FORMERR/NOTIMP retry.
+        let deadline = Instant::now() + self.config.timeout;
+        let response = match &with_opt {
+            Some(sent) => {
+                let first = udp_exchange(&socket, sent, self.config.timeout, deadline).await?;
+                if rejects_edns(&first) {
+                    // The upstream does not implement EDNS: retry once with
+                    // the original, OPT-less query (RFC 6891 §7).
+                    udp_exchange(&socket, query, self.config.timeout, deadline).await?
+                } else {
+                    // The advertisement was accepted, so the answer's OPT
+                    // record is ours to strip.
+                    let mut answer = first;
+                    if let Ok(Some(edns)) = answer.edns()
+                        && edns.extended_rcode() != 0
+                        && !answer.header.truncated
+                    {
+                        return Err(Error::Transport(format!(
+                            "upstream answered with extended RCODE {} that a query without EDNS cannot carry",
+                            edns.extended_rcode()
+                        )));
+                    }
+                    answer.set_edns(None);
+                    answer
+                }
+            }
+            None => udp_exchange(&socket, query, self.config.timeout, deadline).await?,
         };
 
         if response.header.truncated {
@@ -916,6 +1012,259 @@ mod tests {
             .expect_err("a mismatching datagram is never returned");
         assert_eq!(err, Error::Timeout);
         responder.await.unwrap();
+    }
+
+    /// Receives one datagram on `server` and returns the decoded query with
+    /// the sender.
+    async fn recv_query(server: &UdpSocket) -> (Message, SocketAddr) {
+        let mut buf = vec![0u8; 65_535];
+        let (len, from) = server.recv_from(&mut buf).await.unwrap();
+        (Message::decode(&buf[..len]).unwrap(), from)
+    }
+
+    fn edns_backend(server: SocketAddr, size: u16) -> UdpBackend {
+        UdpBackend::new(UdpBackendConfig {
+            server,
+            timeout: Duration::from_secs(2),
+            bind_addr: None,
+        })
+        .with_edns_udp_payload_size(size)
+    }
+
+    #[tokio::test]
+    async fn udp_backend_without_the_opt_in_sends_no_opt() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let response = answer_for("example.com", query.header.id);
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+            query.edns().unwrap()
+        });
+
+        let backend = UdpBackend::new(UdpBackendConfig {
+            server: server_addr,
+            timeout: Duration::from_secs(2),
+            bind_addr: None,
+        });
+        backend.resolve(&query_for("example.com")).await.unwrap();
+        assert_eq!(responder.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn udp_backend_adds_an_opt_and_strips_it_from_the_answer() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let mut response = answer_for("example.com", query.header.id);
+            let mut upstream_opt = Edns::new(4096);
+            upstream_opt.set_dnssec_ok(true);
+            response.set_edns(Some(upstream_opt));
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+            query.edns().unwrap()
+        });
+
+        // Sizes below 512 are raised to 512.
+        let answer = edns_backend(server_addr, 100)
+            .resolve(&query_for("example.com"))
+            .await
+            .expect("the answer is returned");
+        let sent = responder.await.unwrap().expect("the query carried an OPT");
+        assert_eq!(sent, Edns::new(512));
+        assert_eq!(answer.edns().unwrap(), None);
+        assert!(answer.additionals.is_empty());
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let response = answer_for("example.com", query.header.id);
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+            query.edns().unwrap()
+        });
+        edns_backend(server_addr, 1400)
+            .resolve(&query_for("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(responder.await.unwrap(), Some(Edns::new(1400)));
+    }
+
+    #[tokio::test]
+    async fn udp_backend_forwards_a_client_opt_unchanged() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let mut response = answer_for("example.com", query.header.id);
+            response.additionals = query.additionals.clone();
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+            query
+        });
+
+        let mut client_opt = Edns::new(4096);
+        client_opt.set_dnssec_ok(true);
+        let mut query = query_for("example.com");
+        query.set_edns(Some(client_opt.clone()));
+
+        let answer = edns_backend(server_addr, 1232)
+            .resolve(&query)
+            .await
+            .unwrap();
+        let received = responder.await.unwrap();
+        assert_eq!(received.additionals, query.additionals);
+        assert_eq!(received.edns().unwrap(), Some(client_opt.clone()));
+        // The client's own OPT is not ours to strip.
+        assert_eq!(answer.edns().unwrap(), Some(client_opt));
+    }
+
+    #[tokio::test]
+    async fn udp_backend_retries_once_without_the_opt_after_formerr_or_notimp() {
+        for rcode in [Rcode::FormErr, Rcode::NotImp] {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                // A non-EDNS upstream rejects the OPT and answers a plain
+                // query.
+                let (first, from) = recv_query(&server).await;
+                let mut rejection = answer_for("example.com", first.header.id);
+                rejection.header.rcode = rcode;
+                server
+                    .send_to(&rejection.encode().unwrap(), from)
+                    .await
+                    .unwrap();
+                seen.push(first.edns().unwrap().is_some());
+                let (second, from) = recv_query(&server).await;
+                let response = answer_for("example.com", second.header.id);
+                server
+                    .send_to(&response.encode().unwrap(), from)
+                    .await
+                    .unwrap();
+                seen.push(second.edns().unwrap().is_some());
+                seen
+            });
+
+            let answer = edns_backend(server_addr, 1232)
+                .resolve(&query_for("example.com"))
+                .await
+                .expect("the OPT-less retry is answered");
+            assert_eq!(answer.header.rcode, Rcode::NoError, "{rcode:?}");
+            assert_eq!(answer.edns().unwrap(), None);
+            // Exactly two queries: with the OPT, then without.
+            assert_eq!(responder.await.unwrap(), vec![true, false], "{rcode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_backend_formerr_with_an_opt_is_returned_without_a_retry() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let mut response = answer_for("example.com", query.header.id);
+            response.header.rcode = Rcode::FormErr;
+            response.set_edns(Some(Edns::new(1232)));
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+            // No second query may arrive.
+            tokio::time::timeout(Duration::from_millis(200), recv_query(&server))
+                .await
+                .is_err()
+        });
+
+        let answer = edns_backend(server_addr, 1232)
+            .resolve(&query_for("example.com"))
+            .await
+            .unwrap();
+        assert_eq!(answer.header.rcode, Rcode::FormErr);
+        assert_eq!(answer.edns().unwrap(), None);
+        assert!(
+            responder.await.unwrap(),
+            "no retry for an EDNS-aware FORMERR"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_backend_turns_an_upstream_extended_rcode_into_a_transport_error() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&server).await;
+            let mut response = answer_for("example.com", query.header.id);
+            let mut opt = Edns::new(1232);
+            opt.set_extended_rcode(1);
+            response.set_edns(Some(opt));
+            server
+                .send_to(&response.encode().unwrap(), from)
+                .await
+                .unwrap();
+        });
+
+        let err = edns_backend(server_addr, 1232)
+            .resolve(&query_for("example.com"))
+            .await
+            .expect_err("an extended RCODE cannot be shown to a non-EDNS client");
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_backend_falls_back_to_tcp_without_the_opt_when_truncated() {
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp_server.local_addr().unwrap();
+        let tcp_listener = TcpListener::bind(addr).await.unwrap();
+
+        let udp_responder = tokio::spawn(async move {
+            let (query, from) = recv_query(&udp_server).await;
+            let mut truncated = answer_for("example.com", query.header.id);
+            truncated.header.truncated = true;
+            truncated.set_edns(Some(Edns::new(1232)));
+            udp_server
+                .send_to(&truncated.encode().unwrap(), from)
+                .await
+                .unwrap();
+            query.edns().unwrap().is_some()
+        });
+        let tcp_responder = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let mut payload = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            stream.read_exact(&mut payload).await.unwrap();
+            let query = Message::decode(&payload).unwrap();
+            let bytes = answer_for("example.com", query.header.id).encode().unwrap();
+            let framed_len: u16 = bytes.len().try_into().unwrap();
+            stream.write_all(&framed_len.to_be_bytes()).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            query.edns().unwrap()
+        });
+
+        let answer = edns_backend(addr, 1232)
+            .resolve(&query_for("example.com"))
+            .await
+            .unwrap();
+        assert!(!answer.header.truncated);
+        assert!(udp_responder.await.unwrap(), "the UDP query carried an OPT");
+        assert_eq!(
+            tcp_responder.await.unwrap(),
+            None,
+            "the TCP query is the original"
+        );
     }
 
     /// Accepts one TCP connection, reads one framed query, and answers it

@@ -171,6 +171,8 @@ DoH and DoQ, where a server may answer with id 0 (the response is returned with 
 caller's id).
 
 - **UDP** (default): `UdpBackend` / `udp_addr`; falls back to TCP when a response has `TC=1`.
+  `UdpBackend::with_edns_udp_payload_size` (off by default) adds an OPT record to queries that have
+  none, retries once without it after `FORMERR`/`NOTIMP`, and strips it from the answer.
 - **TCP** (default): `TcpBackend` / `tcp_addr`, RFC 1035 framing.
 - **DoT** (`dot`): `DotBackend` / `dot_addr`, over `rustls`/`tokio-rustls`.
 - **DoH** HTTP/1.1 + HTTP/2 (`doh`): `DohBackend` / `doh_addr`, over `hyper`/`hyper-rustls`.

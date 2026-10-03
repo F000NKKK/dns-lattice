@@ -346,6 +346,20 @@ non-EDNS client and to min(client payload size raised to 512, server
 maximum) for an EDNS client; a larger answer is sent with empty sections and
 `TC=1`, keeping its OPT record. Stream transports are never truncated.
 
+On the upstream side `UdpBackend` adds no OPT record by default.
+`UdpBackend::with_edns_udp_payload_size` opts in: a query without any OPT
+record is sent with one advertising the configured payload size (at least
+512, DO clear, no options), while a query that has an OPT record, valid or
+not, is forwarded unchanged. If the upstream answers `FORMERR` or `NOTIMP`
+without an OPT record (RFC 6891 §7), the original query is resent once
+within the same deadline. The OPT record is removed from the returned
+answer, so the cache and the client see the same message as without the
+opt-in; an answer whose OPT record carries a nonzero extended RCODE becomes
+`Error::Transport` (retryable, so the resolver fails over), because the
+code cannot be shown to a client without EDNS. A truncated answer still
+falls back to TCP with the original query. TCP, DoT, DoH and DoQ backends
+never add an OPT record.
+
 ## Concurrency and ownership
 
 - Resolver operations are asynchronous and may run concurrently.
