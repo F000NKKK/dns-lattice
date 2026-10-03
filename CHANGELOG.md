@@ -112,9 +112,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pool_stats` snapshot accessors choose the connection-reuse policy of a
   backend and read its counters. `PoolConfig::disabled()` restores the
   earlier behaviour of one connection per query.
+- `DohBackend::with_pool` and `DohBackend::pool_stats` choose the
+  connection-reuse policy of a DNS-over-HTTPS backend and read its counters.
+  The connection counters are exact; `closed_idle`, `closed_error` and
+  `unsolicited` stay 0 (hyper does not report why it closed a connection) and
+  `closed_lifetime` counts connections that closed after the backend replaced
+  its client at `max_lifetime`.
 
 ### Changed
 
+- `DohBackend` (HTTP/1.1 and HTTP/2) now keeps one HTTP client per backend
+  instead of building one per query. Over HTTP/2 all queries are multiplexed
+  over a single connection; over HTTP/1.1 each in-flight query uses its own
+  idle or new connection, up to `max_connections x max_in_flight` at once.
+  Admission to that bound is in arrival order. Idle connections close after
+  `idle_timeout`, and the client is replaced after `max_lifetime` (the old one
+  finishes its in-flight queries). HTTP/2 connections send keep-alive pings.
+  The TLS configuration, server name and ALPN are fixed at construction, so
+  backends never share connections. One call has a single `timeout` covering
+  the wait for capacity, the request, the body and a retry, which is not
+  longer than before. A query whose reused connection fails before the
+  answer is sent once more (only for opcode QUERY and only while time is left);
+  timeouts, TLS errors, HTTP status errors and undecodable answers are never
+  retried. Consequences to plan for: the backend keeps sockets and Tokio tasks
+  while alive and belongs to one Tokio runtime (use `PoolConfig::disabled()`
+  for a backend shared across short-lived runtimes), and dropping it closes
+  its connections. `PoolConfig::disabled()` restores the 1.1 behaviour of a
+  new client and connection per query. `Doh3Backend` and `DoqBackend` are
+  unchanged and still use one connection per query.
+- `dns-lattice` with the `doh` feature depends directly on `tower-service`
+  (already part of the dependency tree through hyper-util).
 - `TcpBackend` and `DotBackend` now reuse connections by default and pipeline
   queries (RFC 7766 section 6.2.1.1, RFC 7858 section 3.3). Each backend
   owns a small pool (by default up to 4 connections with 64 queries in

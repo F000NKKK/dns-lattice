@@ -116,8 +116,8 @@ impl Clock for FakeClock {
 /// serve-stale has a
 /// [`client_timeout`](crate::cache::ServeStale::client_timeout) (a query on
 /// an expired answer hands its refresh to a background task). A registered
-/// [`crate::upstream::TcpBackend`] or DoT backend keeps pooled connections
-/// and spawns two tasks per connection on the runtime that first used it, so
+/// [`crate::upstream::TcpBackend`], DoT or DoH backend keeps pooled
+/// connections and spawns tasks for them on the runtime that first used it, so
 /// the resolver then has to stay on one Tokio runtime (see
 /// [`PoolConfig::disabled`](crate::upstream::PoolConfig::disabled)). There is
 /// no explicit `shutdown` method — dropping the resolver aborts every refresh

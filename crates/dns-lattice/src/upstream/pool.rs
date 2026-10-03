@@ -120,6 +120,11 @@ const MAX_TABLE_CAPACITY: usize = u16::MAX as usize;
     feature = "dot",
     doc = "The DoT backend takes it through [`DotBackend::with_pool`](super::DotBackend::with_pool)."
 )]
+#[cfg_attr(feature = "doh", doc = "")]
+#[cfg_attr(
+    feature = "doh",
+    doc = "The DoH backend takes it through [`DohBackend::with_pool`](super::DohBackend::with_pool)."
+)]
 ///
 /// # Example
 ///

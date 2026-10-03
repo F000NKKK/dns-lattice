@@ -63,11 +63,14 @@
 //! # Connection reuse
 //!
 //! [`TcpBackend`] and the DoT backend keep a bounded pool of connections to
-//! their upstream and pipeline the queries of all callers over them; see
-//! [`PoolConfig`], [`PoolStats`] and each backend's `with_pool` and
-//! `pool_stats`. Reuse is on by default and [`PoolConfig::disabled`] turns it
-//! off. [`UdpBackend`] (including its TCP fallback for truncated answers) and
-//! the DoH and DoQ backends still use a socket or connection per query.
+//! their upstream and pipeline the queries of all callers over them; the DoH
+//! backend (HTTP/1.1 and HTTP/2) keeps one HTTP client, multiplexing the
+//! queries over one HTTP/2 connection or spreading them over HTTP/1.1
+//! connections. See [`PoolConfig`], [`PoolStats`] and each backend's
+//! `with_pool` and `pool_stats`. Reuse is on by default and
+//! [`PoolConfig::disabled`] turns it off. [`UdpBackend`] (including its TCP
+//! fallback for truncated answers), the DoH3 backend and the DoQ backend
+//! still use a socket or connection per query.
 //!
 //! # Runtime requirement
 //!
@@ -78,7 +81,8 @@
 //! registered) from inside a `tokio` runtime context.
 //!
 //! A backend with connection reuse enabled also starts Tokio tasks (a reader
-//! and a writer per connection) the first time it needs a connection. Such a
+//! and a writer per connection; for DoH, hyper's connection tasks) the first
+//! time it needs a connection. Such a
 //! backend must stay on the one runtime for its whole life; a program that
 //! builds a runtime for each call must switch reuse off with
 //! [`PoolConfig::disabled`]. A pool whose runtime has shut down notices that

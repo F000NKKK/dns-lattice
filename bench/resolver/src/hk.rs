@@ -19,8 +19,8 @@
 //! - the default 8,192-entry answer cache.
 //!
 //! hickory pools and multiplexes its connections, as dns-lattice now does on
-//! TCP and DoT; dns-lattice still opens a connection per query on DoH, DoH3
-//! and DoQ. The responder's connection counters show it.
+//! TCP, DoT and DoH over HTTP/2; dns-lattice still opens a connection per
+//! query on DoH3 and DoQ. The responder's connection counters show it.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;

@@ -214,7 +214,7 @@ async fn the_stats_port_reports_the_counters() {
 // ----------------------------------------------------- connection models ---
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dns_lattice_pools_tcp_and_dot_while_doh_still_opens_a_connection_per_query() {
+async fn dns_lattice_pools_tcp_dot_and_doh2_and_the_pool_can_be_disabled() {
     const QUERIES: u64 = 5;
     for proto in [Proto::Tcp, Proto::Dot, Proto::Doh2] {
         let env = start(ResponderConfig::default()).await;
@@ -224,31 +224,21 @@ async fn dns_lattice_pools_tcp_and_dot_while_doh_still_opens_a_connection_per_qu
         }
         let seen = env.responder.counters().snapshot(proto);
         assert_eq!(seen.queries, QUERIES, "dl {proto}");
-        if proto == Proto::Doh2 {
-            // DoH has no connection reuse yet.
-            assert_eq!(
-                seen.connections, QUERIES,
-                "dl {proto}: one connection per query"
-            );
-        } else {
-            assert_eq!(seen.connections, 1, "dl {proto}: one pooled connection");
-        }
+        assert_eq!(seen.connections, 1, "dl {proto}: one pooled connection");
 
-        if proto != Proto::Doh2 {
-            // With the pool switched off the earlier model is still there.
-            let env = start(ResponderConfig::default()).await;
-            let dl = DlContestant::with_pool(&env.connect(proto, TIMEOUT), PoolConfig::disabled())
-                .unwrap();
-            for index in 0..QUERIES {
-                assert_eq!(one(&dl, Mix::A, &format!("0-{index}")).await, Outcome::Ok);
-            }
-            let seen = env.responder.counters().snapshot(proto);
-            assert_eq!(seen.queries, QUERIES, "dl {proto} unpooled");
-            assert_eq!(
-                seen.connections, QUERIES,
-                "dl {proto} unpooled: one connection per query"
-            );
+        // With the pool switched off the earlier model is still there.
+        let env = start(ResponderConfig::default()).await;
+        let dl =
+            DlContestant::with_pool(&env.connect(proto, TIMEOUT), PoolConfig::disabled()).unwrap();
+        for index in 0..QUERIES {
+            assert_eq!(one(&dl, Mix::A, &format!("0-{index}")).await, Outcome::Ok);
         }
+        let seen = env.responder.counters().snapshot(proto);
+        assert_eq!(seen.queries, QUERIES, "dl {proto} unpooled");
+        assert_eq!(
+            seen.connections, QUERIES,
+            "dl {proto} unpooled: one connection per query"
+        );
 
         let env = start(ResponderConfig::default()).await;
         let hk = HkContestant::new(&env.connect(proto, TIMEOUT)).unwrap();

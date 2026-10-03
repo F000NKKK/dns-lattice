@@ -42,6 +42,9 @@ hyper-util = { version = "0.1.21", default-features = false, features = ["client
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "webpki-roots", "aws-lc-rs"] }
 http = "1.5.0"
 http-body-util = "0.1.5"
+# `Service` trait of the counting connector wrapped around `hyper-rustls`'s
+# connector (already a dependency of `hyper-util` and `hyper-rustls`).
+tower-service = "0.3.3"
 bytes = "1.12.1"
 base64 = "0.23.1"
 h3 = "0.0.8"
