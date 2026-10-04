@@ -12,9 +12,9 @@
 //!   requires; DoH and DoH3 set their own);
 //! - the default answer cache.
 //!
-//! dns-lattice reuses connections on TCP, DoT and DoH over HTTP/2 by default
-//! (a small pool; [`DlContestant::with_pool`] can switch it off), and still
-//! opens a connection per query on DoH3 and DoQ.
+//! dns-lattice reuses connections on TCP, DoT, DoH over HTTP/2 and DoQ by
+//! default (a small pool; [`DlContestant::with_pool`] can switch it off), and
+//! still opens a connection per query on DoH3.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -156,7 +156,8 @@ impl DlContestant {
                         tls_config: Arc::new(config),
                         connect_timeout: connect.timeout,
                         read_timeout: connect.timeout,
-                    }),
+                    })
+                    .with_pool(pool),
                 )
             }
         }

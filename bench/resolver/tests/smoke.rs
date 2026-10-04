@@ -214,9 +214,9 @@ async fn the_stats_port_reports_the_counters() {
 // ----------------------------------------------------- connection models ---
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dns_lattice_pools_tcp_dot_and_doh2_and_the_pool_can_be_disabled() {
+async fn dns_lattice_pools_tcp_dot_doh2_and_doq_and_the_pool_can_be_disabled() {
     const QUERIES: u64 = 5;
-    for proto in [Proto::Tcp, Proto::Dot, Proto::Doh2] {
+    for proto in [Proto::Tcp, Proto::Dot, Proto::Doh2, Proto::Doq] {
         let env = start(ResponderConfig::default()).await;
         let dl = DlContestant::new(&env.connect(proto, TIMEOUT)).unwrap();
         for index in 0..QUERIES {

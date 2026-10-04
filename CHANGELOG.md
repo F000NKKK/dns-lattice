@@ -118,8 +118,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unsolicited` stay 0 (hyper does not report why it closed a connection) and
   `closed_lifetime` counts connections that closed after the backend replaced
   its client at `max_lifetime`.
+- `DoqBackend::with_pool` and `DoqBackend::pool_stats` choose the
+  connection-reuse policy of a DNS-over-QUIC backend and read its counters
+  (`unsolicited` is always 0, because a QUIC stream carries only the answer to
+  its own query).
 
 ### Changed
+
+- `DoqBackend` now keeps a bounded pool of QUIC connections on one shared UDP
+  socket and opens one bidirectional stream per query (RFC 9250 section
+  4.2), instead of binding a socket and handshaking a connection for every
+  query. By default it uses up to 4 connections with 64 concurrent streams
+  each (keep `max_in_flight` below the server's own stream limit, commonly
+  100; a query that finds the limit reached waits for a stream and ends with
+  `Error::Timeout` at its deadline). Idle connections close after the idle
+  timeout and every connection is replaced after `max_lifetime`; a replaced
+  connection finishes its streams first. Liveness is checked before a
+  connection is used. A connection that resets or stops one query's stream
+  fails only that query. Dropping the `resolve` future resets the stream
+  with `DOQ_REQUEST_CANCELLED` and leaves the connection in use. A new
+  connection resumes the TLS session through the shared `ClientConfig`;
+  0-RTT stays off. A query whose reused connection was closed is sent once
+  more on a fresh connection (only for opcode QUERY and only while its time
+  budget lasts); timeouts, TLS errors, answers that do not match the question
+  and undecodable answers are never retried. Consequences to plan for: the
+  backend keeps a UDP socket and Tokio tasks while alive and belongs to one
+  Tokio runtime (use `PoolConfig::disabled()` for a backend shared across
+  short-lived runtimes), dropping it closes its connections, and an upstream
+  sees one connection carrying the queries of many clients.
+  `PoolConfig::disabled()` restores the 1.1 behaviour of an endpoint and a
+  connection per query. The time budget of one call is not longer than
+  before: connect timeout plus two read timeouts.
 
 - `DohBackend` (HTTP/1.1 and HTTP/2) now keeps one HTTP client per backend
   instead of building one per query. Over HTTP/2 all queries are multiplexed
@@ -143,8 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while alive and belongs to one Tokio runtime (use `PoolConfig::disabled()`
   for a backend shared across short-lived runtimes), and dropping it closes
   its connections. `PoolConfig::disabled()` restores the 1.1 behaviour of a
-  new client and connection per query. `Doh3Backend` and `DoqBackend` are
-  unchanged and still use one connection per query.
+  new client and connection per query. `Doh3Backend` is unchanged and still
+  uses one connection per query.
 - `dns-lattice` with the `doh` feature depends directly on `tower-service`
   (already part of the dependency tree through hyper-util).
 - `TcpBackend` and `DotBackend` now reuse connections by default and pipeline

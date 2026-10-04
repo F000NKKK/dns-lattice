@@ -210,9 +210,9 @@ caller's id).
 - **DoH3** HTTP/3 (`doh`): `Doh3Backend` / `doh3_addr`, over `h3`/`quinn`, ALPN `h3`, TLS 1.3.
 - **DoQ** (`doq`): `DoqBackend` / `doq_addr`, over `quinn`, ALPN `doq`, TLS 1.3.
 
-Names are given as backend type / `ServerBuilder` listener method. The TCP, DoT and DoH
-(HTTP/1.1 and HTTP/2) clients reuse connections by default (`PoolConfig`); the UDP, DoH3 and
-DoQ clients open a fresh socket or connection per query. The host provides TLS/QUIC server configuration
+Names are given as backend type / `ServerBuilder` listener method. The TCP, DoT, DoH
+(HTTP/1.1 and HTTP/2) and DoQ clients reuse connections by default (`PoolConfig`); the UDP and
+DoH3 clients open a fresh socket or connection per query. The host provides TLS/QUIC server configuration
 and certificate material for the listeners. The inbound UDP listener answers an EDNS(0) client
 with up to min(its advertised payload size, 1232 bytes) — `ServerBuilder::edns_udp_payload_size`
 changes the maximum, never below 512 — and a plain client with up to 512 bytes; larger answers

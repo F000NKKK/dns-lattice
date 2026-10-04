@@ -47,9 +47,9 @@
 //!   deliberately includes the `h3`/`h3-quinn`/`quinn` dependency footprint.
 //! - `doq` (`#[cfg(feature = "doq")]`): `DoqBackend`/`DoqBackendConfig`,
 //!   DNS-over-QUIC (RFC 9250) over `quinn` (TLS 1.3 embedded in QUIC via
-//!   `rustls`). Opens a fresh QUIC connection per query in this stage (no
-//!   pooling/reuse), reusing the same length-prefixed framing helper as
-//!   [`TcpBackend`]/`dot::DotBackend` on one bidirectional stream.
+//!   `rustls`). Reuses QUIC connections by default (one bidirectional stream
+//!   per query), with the same length-prefixed framing helper as
+//!   [`TcpBackend`]/`dot::DotBackend`.
 //!
 //! `doq` remains independent of `doh`, so an application that needs only
 //! DNS-over-QUIC can avoid the HTTP dependencies.
@@ -66,10 +66,11 @@
 //! their upstream and pipeline the queries of all callers over them; the DoH
 //! backend (HTTP/1.1 and HTTP/2) keeps one HTTP client, multiplexing the
 //! queries over one HTTP/2 connection or spreading them over HTTP/1.1
-//! connections. See [`PoolConfig`], [`PoolStats`] and each backend's
-//! `with_pool` and `pool_stats`. Reuse is on by default and
-//! [`PoolConfig::disabled`] turns it off. [`UdpBackend`] (including its TCP
-//! fallback for truncated answers), the DoH3 backend and the DoQ backend
+//! connections; the DoQ backend keeps a bounded pool of QUIC connections on
+//! one shared endpoint and opens one stream per query. See [`PoolConfig`],
+//! [`PoolStats`] and each backend's `with_pool` and `pool_stats`. Reuse is on
+//! by default and [`PoolConfig::disabled`] turns it off. [`UdpBackend`]
+//! (including its TCP fallback for truncated answers) and the DoH3 backend
 //! still use a socket or connection per query.
 //!
 //! # Runtime requirement
@@ -115,6 +116,11 @@ pub use dot::{DotBackend, DotBackendConfig};
 mod doh;
 #[cfg(feature = "doh")]
 pub use doh::{Doh3Backend, Doh3BackendConfig, DohBackend, DohBackendConfig, DohMethod};
+
+/// Shared QUIC client plumbing: the endpoint-per-backend helper the DoQ
+/// backend uses (and the other QUIC transport will).
+#[cfg(feature = "doq")]
+mod quic;
 
 #[cfg(feature = "doq")]
 mod doq;
