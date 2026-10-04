@@ -151,12 +151,12 @@ public resolvers.
 
 Current limits, stated plainly:
 
-- `TcpBackend`, `DotBackend`, `DohBackend` (HTTP/1.1 and HTTP/2) and
-  `DoqBackend` reuse connections by default (`PoolConfig`;
+- `TcpBackend`, `DotBackend`, `DohBackend` (HTTP/1.1 and HTTP/2),
+  `Doh3Backend` and `DoqBackend` reuse connections by default (`PoolConfig`;
   `PoolConfig::disabled()` restores one connection per query), and so must
   stay on one Tokio runtime; DoH over HTTP/2 multiplexes all queries over one
-  connection and DoQ opens one stream per query on a shared QUIC connection.
-  The UDP and DoH3 backends still open a fresh socket or QUIC connection per
+  connection, while DoH3 and DoQ pool QUIC connections and send each query as
+  its own request or stream. The UDP backend still opens a fresh socket per
   query;
 - by default `UdpBackend` adds no EDNS0/OPT record of its own: it forwards
   the query unchanged, so a query without one gets UDP answers of at most
@@ -765,7 +765,7 @@ docs.rs page (version 0.26.3).
 | **Per-query routing hook** | ✅ `RouteHook` | ➖ Not described in its docs |
 | **DNSSEC validation** | ❌ | ✅ `dnssec-*` features |
 | **System resolver config** (`/etc/resolv.conf`, Windows) | ❌ By design; the host configures everything | ✅ `system-config` (default) |
-| **Upstream connection reuse** | ⚠️ Pooled for TCP, DoT, DoH (HTTP/1.1, HTTP/2) and DoQ; new connection per query for DoH3 | ✅ Name-server pool |
+| **Upstream connection reuse** | ⚠️ Pooled for TCP, DoT, DoH (HTTP/1.1, HTTP/2), DoH3 and DoQ | ✅ Name-server pool |
 | **EDNS0 on UDP** | ➖ The inbound server answers EDNS clients with up to 1232 bytes (configurable), with `FORMERR`/`BADVERS` handled locally; `UdpBackend` forwards the client's OPT record and, unless `with_edns_udp_payload_size` opts in, adds none | Not compared |
 | **Throughput and latency** | Not yet benchmarked | Not yet benchmarked |
 

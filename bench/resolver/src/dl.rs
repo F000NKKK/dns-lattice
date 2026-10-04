@@ -12,9 +12,8 @@
 //!   requires; DoH and DoH3 set their own);
 //! - the default answer cache.
 //!
-//! dns-lattice reuses connections on TCP, DoT, DoH over HTTP/2 and DoQ by
-//! default (a small pool; [`DlContestant::with_pool`] can switch it off), and
-//! still opens a connection per query on DoH3.
+//! dns-lattice reuses connections on TCP, DoT, DoH over HTTP/2, DoH3 and DoQ
+//! by default (a small pool; [`DlContestant::with_pool`] can switch it off).
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -75,8 +74,7 @@ impl DlContestant {
     }
 
     /// Builds the contestant for `connect` with an explicit connection-reuse
-    /// policy for the TCP and DoT backends (the other transports have none
-    /// yet and ignore it).
+    /// policy for every pooled transport (UDP has none and ignores it).
     ///
     /// # Errors
     ///
@@ -143,7 +141,8 @@ impl DlContestant {
                     method: DohMethod::Post,
                     tls_config: tls,
                     timeout: connect.timeout,
-                }),
+                })
+                .with_pool(pool),
             ),
             Proto::Doq => {
                 let mut config = (*tls).clone();

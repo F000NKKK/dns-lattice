@@ -54,17 +54,16 @@ use tokio::runtime::Id as RuntimeId;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::pool::{Connector, Pool, PoolHooks};
-use super::quic::{NO_ERROR, QuicClient, connection_error_to_lattice_error, unspecified_like};
+use super::quic::{
+    NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN, connection_error_to_lattice_error,
+    unspecified_like,
+};
 use super::{
     IdCheck, PoolConfig, PoolStats, UpstreamBackend, framed_query, read_framed, validate_response,
 };
 
 /// The ALPN protocol identifier for DNS-over-QUIC (RFC 9250 §4.1.1).
 const DOQ_ALPN: &[u8] = b"doq";
-
-/// How much longer than the pool's idle timeout the QUIC transport waits before
-/// it closes a silent connection itself.
-const TRANSPORT_IDLE_MARGIN: Duration = Duration::from_secs(2);
 
 /// DOQ_REQUEST_CANCELLED (RFC 9250 §4.3): the client abandoned the query.
 const REQUEST_CANCELLED: u32 = 3;
@@ -193,7 +192,7 @@ impl DoqBackend {
             let read = self.config.read_timeout;
             let client = QuicClient::new(
                 self.config.server,
-                &self.config.server_name,
+                &self.config.server_name.to_str(),
                 &self.config.tls_config,
                 Some(
                     pool.idle_timeout_value()

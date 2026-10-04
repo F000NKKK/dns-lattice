@@ -66,12 +66,13 @@
 //! their upstream and pipeline the queries of all callers over them; the DoH
 //! backend (HTTP/1.1 and HTTP/2) keeps one HTTP client, multiplexing the
 //! queries over one HTTP/2 connection or spreading them over HTTP/1.1
-//! connections; the DoQ backend keeps a bounded pool of QUIC connections on
-//! one shared endpoint and opens one stream per query. See [`PoolConfig`],
+//! connections; the DoQ and DoH3 backends keep a bounded pool of QUIC
+//! connections on one shared endpoint and open one stream (one HTTP/3
+//! request) per query. See [`PoolConfig`],
 //! [`PoolStats`] and each backend's `with_pool` and `pool_stats`. Reuse is on
 //! by default and [`PoolConfig::disabled`] turns it off. [`UdpBackend`]
-//! (including its TCP fallback for truncated answers) and the DoH3 backend
-//! still use a socket or connection per query.
+//! (including its TCP fallback for truncated answers) still uses a socket or
+//! connection per query.
 //!
 //! # Runtime requirement
 //!
@@ -117,9 +118,9 @@ mod doh;
 #[cfg(feature = "doh")]
 pub use doh::{Doh3Backend, Doh3BackendConfig, DohBackend, DohBackendConfig, DohMethod};
 
-/// Shared QUIC client plumbing: the endpoint-per-backend helper the DoQ
-/// backend uses (and the other QUIC transport will).
-#[cfg(feature = "doq")]
+/// Shared QUIC client plumbing: the endpoint-per-backend helper the DoQ and
+/// DoH3 backends use.
+#[cfg(any(feature = "doq", feature = "doh"))]
 mod quic;
 
 #[cfg(feature = "doq")]

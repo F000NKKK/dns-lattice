@@ -125,12 +125,10 @@ pools and multiplexes connections of its own: one per concurrent worker with
 multiplexes every query over a single connection. On DoQ it keeps a pool of
 QUIC connections (by default up to 4, with 64 streams in flight on each) and
 opens one stream per query, whereas hickory opens a connection per concurrent
-worker. On DoH over HTTP/3 dns-lattice still opens a new connection (and a
-new QUIC handshake, resumed when the server issues a ticket) for every query;
-that transport moves to pooling in a later change. The responder counters in
-each result show the connection counts, so the TCP, DoT, DoH2 and DoQ rows
-compare two pooling designs and the DoH3 rows still compare two connection
-models, not only two codecs and runtimes. hickory's pooled connections
+worker. On DoH over HTTP/3 it keeps the same kind of pool of QUIC connections
+and sends each query as its own request on them. The responder counters in
+each result show the connection counts, so every pooled-transport row compares two
+pooling designs, not only two codecs and runtimes. hickory's pooled connections
 also have a bounded request queue (32 slots); a burst of more than 32
 simultaneous requests onto one already-established connection fails with
 a "channel is full" error that the client binary reports under its own

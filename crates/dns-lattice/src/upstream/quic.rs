@@ -20,13 +20,17 @@ use dns_lattice_core::{Error, Result};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, ConnectionError, Endpoint, IdleTimeout, TransportConfig};
 use rustls::ClientConfig as RustlsClientConfig;
-use rustls_pki_types::ServerName;
 use tokio::runtime::{Handle, Id as RuntimeId};
 use tokio::time::timeout;
 
 /// The application error code of a graceful close (RFC 9250 §4.3, DOQ_NO_ERROR
 /// and, for HTTP/3, H3_NO_ERROR).
 pub(crate) const NO_ERROR: u32 = 0;
+
+/// How much longer than a pool's idle timeout the QUIC transport waits before
+/// it closes a silent connection itself, so the pool's graceful close wins the
+/// race and is counted as an idle close.
+pub(crate) const TRANSPORT_IDLE_MARGIN: Duration = Duration::from_secs(2);
 
 /// Builds the `quinn` client configuration for `tls_config`, optionally with a
 /// QUIC idle timeout. Without one the `quinn` default applies.
@@ -101,14 +105,14 @@ impl QuicClient {
     /// is reported by that first connect.
     pub(crate) fn new(
         server: SocketAddr,
-        server_name: &ServerName<'static>,
+        server_name: &str,
         tls_config: &Arc<RustlsClientConfig>,
         idle_timeout: Option<Duration>,
         connect_timeout: Duration,
     ) -> Self {
         QuicClient {
             server,
-            server_name: server_name.to_str().into_owned(),
+            server_name: server_name.to_owned(),
             config: client_config(tls_config, idle_timeout),
             connect_timeout,
             bound: Mutex::new(None),

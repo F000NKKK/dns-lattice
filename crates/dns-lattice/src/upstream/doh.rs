@@ -13,8 +13,9 @@
 //! multiplexed as concurrent streams of a single connection; over HTTP/1.1
 //! each in-flight query needs a connection of its own and idle connections
 //! are kept for later queries. Reuse is bounded by a [`PoolConfig`]; see
-//! [`DohBackend::with_pool`]. [`Doh3Backend`] still opens a QUIC connection
-//! per query.
+//! [`DohBackend::with_pool`]. [`Doh3Backend`] keeps a bounded pool of
+//! HTTP/3 connections on one QUIC endpoint and sends each query as its own
+//! request (a QUIC stream) on them; see [`Doh3Backend::with_pool`].
 
 use std::future::Future;
 use std::io;
@@ -44,11 +45,13 @@ use tokio::sync::{Notify, Semaphore, TryAcquireError};
 use tokio::time::{Instant, timeout, timeout_at};
 use tower_service::Service;
 
-#[cfg(feature = "doh")]
+use h3::error::{Code as H3Code, StreamError as H3StreamError};
 use quinn::crypto::rustls::QuicClientConfig;
-#[cfg(feature = "doh")]
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
+use tokio::runtime::Id as RuntimeId;
 
+use super::pool::{AbortOnDrop, Connector, Pool, PoolHooks};
+use super::quic::{NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN};
 use super::{IdCheck, PoolConfig, PoolStats, UpstreamBackend, validate_response};
 
 /// The DoH request's HTTP method (RFC 8484 §4.1). Both wire formats carry
@@ -189,14 +192,115 @@ pub struct Doh3BackendConfig {
 /// status, a peer closing the negotiated connection, and other non-TLS QUIC
 /// or HTTP/3 failures are [`Error::Transport`]; expiry of `timeout` is
 /// [`Error::Timeout`].
+///
+/// # Connection reuse
+///
+/// By default the backend keeps a small pool of HTTP/3 connections to the
+/// upstream, all on one shared UDP socket, and sends every query as its own
+/// request, so a query does not pay a QUIC and TLS handshake and the requests
+/// of all callers are multiplexed over the connections' streams. A
+/// [`PoolConfig`] passed to [`with_pool`](Self::with_pool) sets the bounds:
+/// `max_connections` connections, `max_in_flight` concurrent requests per
+/// connection (keep it below the server's own stream limit, which is commonly
+/// 100; a query that finds the limit reached waits for a stream and fails with
+/// [`Error::Timeout`] at its deadline), the idle timeout and the maximum
+/// connection lifetime. [`pool_stats`](Self::pool_stats) reports what the pool
+/// did and [`PoolConfig::disabled`] restores one endpoint and one connection
+/// per query.
+///
+/// One `timeout` bounds a whole call, including the wait for capacity, the
+/// connection setup, the response body and a retry. The handshake of every new
+/// connection verifies the server certificate against the URI host again, and
+/// a replacement connection resumes the TLS session from the ticket stored in
+/// the `tls_config` (the same session store is used for every connection;
+/// early data (0-RTT) stays off). A pool never shares a connection with another
+/// backend, even to the same address.
+///
+/// A query is sent again, once, on a fresh connection when the connection it
+/// used had already answered a query and was then closed (by the peer, by an
+/// idle timeout, by a reset or by `GOAWAY`), the query's opcode is `QUERY` and
+/// the call's `timeout` has not passed. A query is not sent again after a
+/// timeout, a TLS error, a non-2xx status, an answer that does not match the
+/// question, a reset of its own request stream, or a failure of a connection
+/// that had not answered anything; those fail only that query and a healthy
+/// connection stays in use. The error classes are the ones the backend always
+/// returned. Dropping the `resolve` future, or its `timeout` expiring, cancels
+/// the request (its stream is reset and the server told to stop sending) and
+/// frees its slot; the connection is unaffected. The cancellation carries
+/// `H3_REQUEST_CANCELLED` (RFC 9114 §4.1.1); only when the call was already
+/// waiting for the answer does the QUIC layer end the answer's direction with
+/// error code 0 instead.
+///
+/// With reuse enabled the backend starts Tokio tasks (the QUIC endpoint and
+/// connection drivers) and keeps a UDP socket open between queries, so it must
+/// be used from one Tokio runtime for its whole life (a pattern that builds a
+/// runtime per call must use [`PoolConfig::disabled`]); a backend whose
+/// runtime was shut down binds a new endpoint on the runtime that calls it
+/// next. Dropping the backend closes its connections. One connection then
+/// carries the queries of many clients, which the upstream can correlate more
+/// easily than one connection per query.
 pub struct Doh3Backend {
     config: Doh3BackendConfig,
+    /// `config.tls_config` with the ALPN fixed to `h3`, built once. It shares
+    /// the caller's TLS session store.
+    tls_config: Arc<ClientConfig>,
+    pool: Option<Doh3Pool>,
 }
 
 impl Doh3Backend {
-    /// Builds an HTTP/3 DoH backend from `config`.
+    /// Builds an HTTP/3 DoH backend from `config` with connection reuse on
+    /// ([`PoolConfig::new`]).
     pub fn new(config: Doh3BackendConfig) -> Self {
-        Self { config }
+        let mut tls_config = (*config.tls_config).clone();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        Self {
+            config,
+            tls_config: Arc::new(tls_config),
+            pool: None,
+        }
+        .with_pool(PoolConfig::new())
+    }
+
+    /// Replaces the connection-reuse policy. [`PoolConfig::disabled`] makes
+    /// every query bind its own endpoint and open its own connection, as
+    /// before connection reuse existed.
+    ///
+    /// `max_connections` bounds the connections, `max_in_flight` the
+    /// concurrent requests on each, `idle_timeout` closes idle connections and
+    /// `max_lifetime` rotates them (a connection past its lifetime takes no new
+    /// queries and is closed once its requests finished).
+    #[must_use]
+    pub fn with_pool(mut self, pool: PoolConfig) -> Self {
+        self.pool = pool.is_enabled().then(|| {
+            let timeout = self.config.timeout;
+            let client = QuicClient::new(
+                self.config.server,
+                self.config.uri.host().unwrap_or_default(),
+                &self.tls_config,
+                Some(
+                    pool.idle_timeout_value()
+                        .saturating_add(TRANSPORT_IDLE_MARGIN),
+                ),
+                timeout,
+            );
+            Doh3Pool {
+                pool: Pool::new(pool, Arc::new(Doh3Connector { client, timeout }), timeout),
+                uri: self.config.uri.clone(),
+                method: self.config.method,
+                timeout,
+            }
+        });
+        self
+    }
+
+    /// A snapshot of the connection pool's counters. All zeros when reuse is
+    /// disabled. `unsolicited` is always 0 (an HTTP/3 response belongs to its
+    /// own request stream).
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool
+            .as_ref()
+            .map_or_else(PoolStats::default, Doh3Pool::stats)
     }
 }
 
@@ -334,14 +438,26 @@ impl UpstreamBackend for DohBackend {
 #[async_trait]
 impl UpstreamBackend for Doh3Backend {
     async fn resolve(&self, query: &Message) -> Result<Message> {
+        if self.config.uri.host().is_none() {
+            return Err(Error::Transport("DoH HTTP/3 URI has no host".to_string()));
+        }
+        match &self.pool {
+            Some(pool) => pool.query(query).await,
+            None => self.resolve_unpooled(query).await,
+        }
+    }
+}
+
+impl Doh3Backend {
+    /// The per-query path of a backend with reuse disabled: one endpoint, one
+    /// connection and one request for every call.
+    async fn resolve_unpooled(&self, query: &Message) -> Result<Message> {
         let host = self
             .config
             .uri
             .host()
             .ok_or_else(|| Error::Transport("DoH HTTP/3 URI has no host".to_string()))?;
-        let mut tls_config = (*self.config.tls_config).clone();
-        tls_config.alpn_protocols = vec![b"h3".to_vec()];
-        let client_config = QuicClientConfig::try_from(Arc::new(tls_config))
+        let client_config = QuicClientConfig::try_from(Arc::clone(&self.tls_config))
             .map_err(|err| Error::Tls(err.to_string()))?;
         let mut quinn_config = QuinnClientConfig::new(Arc::new(client_config));
         quinn_config.transport_config(Arc::new(quinn::TransportConfig::default()));
@@ -418,6 +534,326 @@ impl UpstreamBackend for Doh3Backend {
         endpoint.close(0u32.into(), b"request complete");
         driver_task.abort();
         decode_validated(query, &body)
+    }
+}
+
+/// The application error code a pooled HTTP/3 connection is closed with:
+/// `H3_NO_ERROR` (RFC 9114 §8.1).
+const H3_NO_ERROR: u32 = 0x100;
+
+/// The largest DNS message a response body may carry.
+const MAX_DNS_BODY: usize = 65_535;
+
+/// Opens the HTTP/3 connections of one [`Doh3Backend`] pool.
+struct Doh3Connector {
+    client: QuicClient,
+    /// Bounds the HTTP/3 setup that follows the QUIC handshake.
+    timeout: Duration,
+}
+
+/// One pooled HTTP/3 connection.
+struct Doh3Conn {
+    connection: quinn::Connection,
+    /// The cloneable request sender; cloned per query under the lock, which
+    /// is never held across an await.
+    sender: Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    /// The HTTP/3 driver task (control stream, `GOAWAY`); it ends when the
+    /// connection does.
+    driver: AbortOnDrop,
+    /// The runtime that opened it; a connection whose runtime is gone has lost
+    /// its driver tasks and can never carry another query.
+    runtime: Option<RuntimeId>,
+    /// The connection has answered at least one query.
+    answered: AtomicBool,
+}
+
+impl Connector for Doh3Connector {
+    type Conn = Doh3Conn;
+
+    async fn connect(&self, _hooks: PoolHooks) -> Result<Doh3Conn> {
+        let connection = self.client.connect().await?;
+        if connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol)
+            .as_deref()
+            != Some(b"h3")
+        {
+            connection.close(quinn::VarInt::from_u32(NO_ERROR), b"");
+            return Err(Error::Tls(
+                "HTTP/3 peer did not negotiate ALPN h3".to_string(),
+            ));
+        }
+        let (mut driver, sender) = timeout(
+            self.timeout,
+            h3::client::new(h3_quinn::Connection::new(connection.clone())),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|err| Error::Transport(err.to_string()))?;
+        let task = tokio::spawn(async move { driver.wait_idle().await });
+        Ok(Doh3Conn {
+            connection,
+            sender: Mutex::new(sender),
+            driver: AbortOnDrop::new(task.abort_handle()),
+            runtime: QuicClient::current_runtime(),
+            answered: AtomicBool::new(false),
+        })
+    }
+
+    fn is_alive(&self, conn: &Doh3Conn) -> bool {
+        conn.connection.close_reason().is_none()
+            && !conn.driver.is_finished()
+            && QuicClient::current_runtime()
+                .is_none_or(|now| conn.runtime.is_none_or(|opened| opened == now))
+    }
+
+    fn close(&self, conn: &Doh3Conn) {
+        conn.connection
+            .close(quinn::VarInt::from_u32(H3_NO_ERROR), &[]);
+    }
+}
+
+/// A failed attempt and the facts the retry rule needs.
+struct H3Failure {
+    error: Error,
+    /// The failure closed the connection (or the HTTP/3 layer reported a
+    /// connection-level error), as opposed to failing one request.
+    closed: bool,
+    /// The connection had already answered a query when the failure was
+    /// noticed.
+    answered: bool,
+}
+
+impl H3Failure {
+    /// A failure that says nothing about a stale pooled connection.
+    fn local(error: Error) -> Self {
+        H3Failure {
+            error,
+            closed: false,
+            answered: false,
+        }
+    }
+}
+
+/// Whether a failed attempt is sent once more on a fresh connection: the
+/// connection was closed after it had answered a query (so a stale pooled
+/// connection is plausible), the opcode is `QUERY`, this attempt was not
+/// itself the retry, the error is not a timeout or a TLS error, and the
+/// call's deadline has not passed.
+fn retry_allowed(
+    failed: &H3Failure,
+    is_query: bool,
+    fresh: bool,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
+    failed.closed
+        && failed.answered
+        && is_query
+        && !fresh
+        && !matches!(failed.error, Error::Timeout | Error::Tls(_))
+        && now < deadline
+}
+
+/// A failure inside one request exchange.
+struct Exchange {
+    error: Error,
+    connection_level: bool,
+}
+
+impl Exchange {
+    fn local(error: Error) -> Self {
+        Exchange {
+            error,
+            connection_level: false,
+        }
+    }
+
+    fn from_stream(err: H3StreamError) -> Self {
+        Exchange {
+            // A connection error, or a `GOAWAY` (the server will not take
+            // more requests on this connection), says the connection is
+            // unusable; a reset or a refusal of one stream does not.
+            connection_level: matches!(
+                err,
+                H3StreamError::ConnectionError { .. } | H3StreamError::RemoteClosing { .. }
+            ),
+            error: Error::Transport(err.to_string()),
+        }
+    }
+}
+
+type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+/// Cancels a request unless it was read to its end, so a cancelled, timed out
+/// or failed query frees its stream: the request is reset and the response
+/// side told to stop, both with `H3_REQUEST_CANCELLED` (RFC 9114 §4.1.1).
+///
+/// `h3-quinn` cannot stop the response side while a read of it is in flight
+/// (the QUIC stream is inside the pending read and asking it to stop panics),
+/// which is exactly the state of a call dropped while it waits for the answer.
+/// In that case only the request side is reset here and dropping the stream
+/// makes the QUIC layer stop the response side with error code 0.
+struct CancelOnDrop {
+    stream: H3RequestStream,
+    done: bool,
+    /// A read of the response may be in flight (set around each read).
+    reading: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.done {
+            self.stream.stop_stream(H3Code::H3_REQUEST_CANCELLED);
+            if !self.reading {
+                self.stream.stop_sending(H3Code::H3_REQUEST_CANCELLED);
+            }
+        }
+    }
+}
+
+/// The pooled client of one HTTP/3 DoH upstream.
+struct Doh3Pool {
+    pool: Pool<Doh3Connector>,
+    uri: Uri,
+    method: DohMethod,
+    /// Bounds a whole call: capacity wait, connection setup, the request and
+    /// the response, retry included.
+    timeout: Duration,
+}
+
+impl Doh3Pool {
+    /// The pool's counters, after retiring connections that have died.
+    fn stats(&self) -> PoolStats {
+        self.pool.sweep();
+        self.pool.stats()
+    }
+
+    /// Sends `query` on a pooled connection and returns the answer, with the
+    /// caller's message id restored.
+    async fn query(&self, query: &Message) -> Result<Message> {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(self.timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(60 * 60 * 24 * 365));
+        let is_query = matches!(query.header.opcode, Opcode::Query);
+        let mut fresh = false;
+        loop {
+            match self.attempt(query, deadline, fresh).await {
+                Ok(answer) => return Ok(answer),
+                Err(failed) => {
+                    if retry_allowed(&failed, is_query, fresh, Instant::now(), deadline) {
+                        self.pool.record_retry();
+                        fresh = true;
+                        continue;
+                    }
+                    return Err(failed.error);
+                }
+            }
+        }
+    }
+
+    async fn attempt(
+        &self,
+        query: &Message,
+        deadline: Instant,
+        fresh: bool,
+    ) -> std::result::Result<Message, H3Failure> {
+        let (parts, body) = build_doh_request(&self.uri, self.method, query)
+            .map_err(H3Failure::local)?
+            .into_parts();
+        let body = body.into_inner().unwrap_or_default();
+        let lease = if fresh {
+            self.pool.acquire_fresh(deadline).await
+        } else {
+            self.pool.acquire(deadline).await
+        }
+        .map_err(H3Failure::local)?;
+        let conn = Arc::clone(lease.conn());
+        let mut sender = conn
+            .sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // The failure of one request leaves the connection alone. Only a
+        // failure that closed the connection retires it, and only a
+        // connection that had answered before (so the failure may be a stale
+        // pooled connection) justifies sending a safe query again.
+        let failed = |error: Error, connection_level: bool| {
+            let closed = connection_level || conn.connection.close_reason().is_some();
+            if closed {
+                lease.mark_dead();
+            }
+            H3Failure {
+                error,
+                closed,
+                answered: conn.answered.load(Ordering::Relaxed),
+            }
+        };
+
+        // Dropping this future (the caller gave up, or the deadline passed)
+        // drops the guard, which cancels the request.
+        let exchanged = timeout_at(deadline, async {
+            let stream = sender
+                .send_request(Request::from_parts(parts, ()))
+                .await
+                .map_err(Exchange::from_stream)?;
+            let mut guard = CancelOnDrop {
+                stream,
+                done: false,
+                reading: false,
+            };
+            if !body.is_empty() {
+                guard
+                    .stream
+                    .send_data(body)
+                    .await
+                    .map_err(Exchange::from_stream)?;
+            }
+            guard.stream.finish().await.map_err(Exchange::from_stream)?;
+            guard.reading = true;
+            let response = guard.stream.recv_response().await;
+            guard.reading = false;
+            let response = response.map_err(Exchange::from_stream)?;
+            if !response.status().is_success() {
+                return Err(Exchange::local(Error::Transport(format!(
+                    "doh HTTP/3 server returned http status {}",
+                    response.status()
+                ))));
+            }
+            let mut data = Vec::new();
+            loop {
+                guard.reading = true;
+                let next = guard.stream.recv_data().await;
+                guard.reading = false;
+                let Some(mut chunk) = next.map_err(Exchange::from_stream)? else {
+                    break;
+                };
+                if data.len().saturating_add(chunk.remaining()) > MAX_DNS_BODY {
+                    return Err(Exchange::local(Error::Transport(
+                        "doh HTTP/3 response body is larger than a DNS message".to_string(),
+                    )));
+                }
+                data.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            // The response was read to its end: nothing is left to cancel.
+            guard.done = true;
+            decode_validated(query, &data).map_err(Exchange::local)
+        })
+        .await;
+        match exchanged {
+            Err(_) => {
+                lease.note_timeout();
+                Err(H3Failure::local(Error::Timeout))
+            }
+            Ok(Err(exchange)) => Err(failed(exchange.error, exchange.connection_level)),
+            Ok(Ok(answer)) => {
+                conn.answered.store(true, Ordering::Relaxed);
+                lease.complete();
+                Ok(answer)
+            }
+        }
     }
 }
 
@@ -2761,5 +3197,792 @@ mod tests {
             .unwrap();
         }
         assert_eq!(server.accepts(), 2, "the second runtime reconnected");
+    }
+
+    // ----- pooled HTTP/3: a scripted loopback server -----
+
+    /// What the scripted HTTP/3 server does with one request.
+    enum H3Action {
+        /// Answers with the echo of the query after a delay. A write that the
+        /// client has cancelled by then is recorded.
+        Echo(Duration),
+        /// Answers with this message.
+        Reply(Message),
+        /// Answers with this HTTP status and no body.
+        Status(u16),
+        /// Closes the connection without answering.
+        Close,
+        /// Answers, then closes the connection once the client has had time to
+        /// read the answer.
+        EchoThenClose,
+        /// Resets the request stream, leaving the connection open.
+        ResetStream,
+        /// Sends the status line, then more data after a delay (a write the
+        /// client has stopped by then is recorded).
+        StatusThenStall(u16),
+    }
+
+    #[derive(Default)]
+    struct H3Counters {
+        /// Connections whose handshake completed.
+        accepted: AtomicUsize,
+        /// Connections that ended.
+        closed: AtomicUsize,
+        /// Requests received.
+        requests: AtomicUsize,
+        /// Requests being served right now.
+        active: AtomicUsize,
+        /// The most requests served at once.
+        max_active: AtomicUsize,
+        /// Requests the client cancelled before they were answered.
+        cancelled: AtomicUsize,
+        /// The code of the last such cancellation.
+        cancel_code: AtomicUsize,
+    }
+
+    impl H3Counters {
+        fn get(counter: &AtomicUsize) -> usize {
+            counter.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Scripted by `(connection index, request index on it, query)`.
+    type H3Script = Arc<dyn Fn(usize, usize, &Message) -> H3Action + Send + Sync>;
+
+    struct H3Server {
+        addr: std::net::SocketAddr,
+        counters: Arc<H3Counters>,
+        client: Arc<ClientConfig>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for H3Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+    async fn respond(
+        stream: &mut ServerStream,
+        status: u16,
+        body: Vec<u8>,
+    ) -> std::result::Result<(), H3StreamError> {
+        stream
+            .send_response(
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/dns-message")
+                    .body(())
+                    .unwrap(),
+            )
+            .await?;
+        if !body.is_empty() {
+            stream.send_data(Bytes::from(body)).await?;
+        }
+        stream.finish().await
+    }
+
+    async fn serve_h3_request(
+        resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
+        connection: quinn::Connection,
+        (conn_index, request_index): (usize, usize),
+        script: H3Script,
+        counters: Arc<H3Counters>,
+    ) {
+        let Ok((request, mut stream)) = resolver.resolve_request().await else {
+            return;
+        };
+        let wire = if request.method() == hyper::Method::GET {
+            let encoded = request
+                .uri()
+                .query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("dns=")))
+                .expect("a GET request carries the dns parameter");
+            URL_SAFE_NO_PAD.decode(encoded).unwrap()
+        } else {
+            let mut body = Vec::new();
+            while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+            }
+            body
+        };
+        let query = Message::decode(&wire).unwrap();
+        counters.requests.fetch_add(1, Ordering::SeqCst);
+        let active = counters.active.fetch_add(1, Ordering::SeqCst) + 1;
+        counters.max_active.fetch_max(active, Ordering::SeqCst);
+        let outcome = match script(conn_index, request_index, &query) {
+            H3Action::Echo(delay) => {
+                tokio::time::sleep(delay).await;
+                respond(&mut stream, 200, reply_to(&query).encode().unwrap()).await
+            }
+            H3Action::Reply(message) => respond(&mut stream, 200, message.encode().unwrap()).await,
+            H3Action::Status(status) => respond(&mut stream, status, Vec::new()).await,
+            H3Action::Close => {
+                connection.close(7u32.into(), b"scripted close");
+                Ok(())
+            }
+            H3Action::EchoThenClose => {
+                let sent = respond(&mut stream, 200, reply_to(&query).encode().unwrap()).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                connection.close(H3_NO_ERROR.into(), b"done");
+                sent
+            }
+            H3Action::ResetStream => {
+                stream.stop_stream(H3Code::H3_INTERNAL_ERROR);
+                Ok(())
+            }
+            H3Action::StatusThenStall(status) => {
+                let sent = stream
+                    .send_response(http::Response::builder().status(status).body(()).unwrap())
+                    .await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                match sent {
+                    Ok(()) => stream.send_data(Bytes::from_static(b"late body")).await,
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        if let Err(H3StreamError::RemoteTerminate { code, .. }) = outcome {
+            counters
+                .cancel_code
+                .store(usize::try_from(code.value()).unwrap(), Ordering::SeqCst);
+            counters.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+        counters.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    async fn serve_h3_connection(
+        connection: quinn::Connection,
+        index: usize,
+        script: H3Script,
+        counters: Arc<H3Counters>,
+    ) {
+        let raw = connection.clone();
+        let Ok(mut h3_connection) =
+            h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection)).await
+        else {
+            return;
+        };
+        let mut next = 0;
+        while let Ok(Some(resolver)) = h3_connection.accept().await {
+            let request = next;
+            next += 1;
+            tokio::spawn(serve_h3_request(
+                resolver,
+                raw.clone(),
+                (index, request),
+                Arc::clone(&script),
+                Arc::clone(&counters),
+            ));
+        }
+        counters.closed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn serve_h3(
+        script: impl Fn(usize, usize, &Message) -> H3Action + Send + Sync + 'static,
+    ) -> H3Server {
+        let (server_config, client_config) = http3_fixture();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let script: H3Script = Arc::new(script);
+        let counters = Arc::new(H3Counters::default());
+        let shared = Arc::clone(&counters);
+        let task = tokio::spawn(async move {
+            let mut next = 0;
+            while let Some(incoming) = endpoint.accept().await {
+                let index = next;
+                next += 1;
+                let (script, counters) = (Arc::clone(&script), Arc::clone(&shared));
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    counters.accepted.fetch_add(1, Ordering::SeqCst);
+                    serve_h3_connection(connection, index, script, counters).await;
+                });
+            }
+        });
+        H3Server {
+            addr,
+            counters,
+            client: Arc::new(client_config),
+            task,
+        }
+    }
+
+    fn h3_echo() -> H3Server {
+        serve_h3(|_, _, _| H3Action::Echo(Duration::ZERO))
+    }
+
+    impl H3Server {
+        fn backend(&self, method: DohMethod, timeout: Duration, pool: PoolConfig) -> Doh3Backend {
+            Doh3Backend::new(Doh3BackendConfig {
+                uri: Uri::from_str(&format!("https://localhost:{}/dns-query", self.addr.port()))
+                    .unwrap(),
+                server: self.addr,
+                method,
+                tls_config: self.client.clone(),
+                timeout,
+            })
+            .with_pool(pool)
+        }
+
+        fn pooled(&self) -> Doh3Backend {
+            self.backend(DohMethod::Post, Duration::from_secs(5), PoolConfig::new())
+        }
+
+        fn accepted(&self) -> usize {
+            H3Counters::get(&self.counters.accepted)
+        }
+    }
+
+    async fn ask3(backend: &Doh3Backend, name: &str) -> Result<Message> {
+        let query = query_for(name);
+        let answer = backend.resolve(&query).await?;
+        assert_eq!(answer.questions, query.questions, "answer to another query");
+        assert_eq!(answer.header.id, query.header.id);
+        Ok(answer)
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_sequential_queries_share_one_connection() {
+        let server = h3_echo();
+        let backend = server.pooled();
+        for i in 0..5 {
+            ask3(&backend, &format!("q{i}.example.com")).await.unwrap();
+        }
+        let stats = backend.pool_stats();
+        assert_eq!(server.accepted(), 1);
+        assert_eq!(stats.connections_opened(), 1);
+        assert_eq!(stats.connections_open(), 1);
+        assert_eq!(stats.queries(), 5);
+        assert_eq!(stats.reused_queries(), 4);
+        assert_eq!(stats.retries(), 0);
+        assert_eq!(stats.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_resolves_with_get() {
+        let server = h3_echo();
+        let backend = server.backend(DohMethod::Get, Duration::from_secs(5), PoolConfig::new());
+        for i in 0..3 {
+            ask3(&backend, &format!("g{i}.example.com")).await.unwrap();
+        }
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_doh3_pool_opens_one_connection_per_query() {
+        // Negative control for the reuse test above: the 1.1 behaviour.
+        let server = h3_echo();
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::disabled(),
+        );
+        for i in 0..3 {
+            ask3(&backend, &format!("d{i}.example.com")).await.unwrap();
+        }
+        assert_eq!(server.accepted(), 3);
+        assert_eq!(backend.pool_stats(), PoolStats::default());
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_multiplexes_concurrent_queries_within_the_connection_bound() {
+        let server = serve_h3(|_, _, _| H3Action::Echo(Duration::from_millis(30)));
+        let backend = Arc::new(server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().max_connections(2),
+        ));
+        let mut set = JoinSet::new();
+        for i in 0..40 {
+            let backend = backend.clone();
+            set.spawn(async move { ask3(&backend, &format!("h{i}.example.com")).await.unwrap() });
+        }
+        while let Some(done) = set.join_next().await {
+            done.unwrap();
+        }
+        let stats = backend.pool_stats();
+        assert!(server.accepted() <= 2, "{}", server.accepted());
+        assert!(stats.connections_opened() <= 2, "{stats:?}");
+        assert_eq!(stats.queries(), 40);
+        assert_eq!(stats.in_flight(), 0);
+        assert!(
+            H3Counters::get(&server.counters.max_active) > 2,
+            "requests ran side by side on streams"
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_max_in_flight_bounds_the_requests_and_queues_the_rest() {
+        let server = serve_h3(|_, _, _| H3Action::Echo(Duration::from_millis(30)));
+        let backend = Arc::new(server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().max_connections(1).max_in_flight(2),
+        ));
+        let mut set = JoinSet::new();
+        for i in 0..8 {
+            let backend = backend.clone();
+            set.spawn(async move { ask3(&backend, &format!("h{i}.example.com")).await.unwrap() });
+        }
+        while let Some(done) = set.join_next().await {
+            done.unwrap();
+        }
+        assert!(H3Counters::get(&server.counters.max_active) <= 2);
+        assert_eq!(server.accepted(), 1);
+        assert!(backend.pool_stats().queued() > 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_retries_once_when_a_reused_connection_closes_mid_flight() {
+        // The first connection answers one query, then closes on the second.
+        let server = serve_h3(|conn, nth, _| {
+            if conn == 0 && nth == 1 {
+                H3Action::Close
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        ask3(&backend, "two.example.com")
+            .await
+            .expect("the retry on a fresh connection answers");
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 1);
+        assert_eq!(stats.connections_opened(), 2);
+        assert_eq!(server.accepted(), 2);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_does_not_retry_a_fresh_connection_that_closes() {
+        let server = serve_h3(|_, _, _| H3Action::Close);
+        let backend = server.pooled();
+        let err = ask3(&backend, "one.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        assert_eq!(backend.pool_stats().retries(), 0);
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_never_retries_a_second_failure() {
+        let server = serve_h3(|conn, nth, _| {
+            if conn == 0 && nth == 0 {
+                H3Action::Echo(Duration::ZERO)
+            } else {
+                H3Action::Close
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        let err = ask3(&backend, "two.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        assert_eq!(backend.pool_stats().retries(), 1, "retried exactly once");
+        assert_eq!(server.accepted(), 2);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_never_resends_a_non_query_opcode() {
+        let server = serve_h3(|conn, nth, _| {
+            if conn == 0 && nth == 1 {
+                H3Action::Close
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        let mut notify = query_for("two.example.com");
+        notify.header.opcode = Opcode::Notify;
+        let err = backend.resolve(&notify).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        assert_eq!(backend.pool_stats().retries(), 0);
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_replaces_a_connection_the_peer_already_closed_without_a_retry() {
+        let server = serve_h3(|conn, _, _| {
+            if conn == 0 {
+                H3Action::EchoThenClose
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        wait_for("the client to notice the close", || {
+            backend.pool_stats().connections_open() == 0
+        })
+        .await;
+        ask3(&backend, "two.example.com").await.unwrap();
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 0, "liveness is checked before use");
+        assert_eq!(stats.connections_opened(), 2);
+        assert_eq!(stats.closed_error(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_does_not_retry_a_reset_stream_on_a_connection_that_answered() {
+        // Negative control for the retry rule: the connection had answered a
+        // query, but only one request was reset and the connection stayed
+        // open, so nothing is resent and the connection is kept.
+        let server = serve_h3(|_, nth, _| {
+            if nth == 1 {
+                H3Action::ResetStream
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        let err = ask3(&backend, "two.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        ask3(&backend, "three.example.com")
+            .await
+            .expect("the same connection still works");
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 0);
+        assert_eq!(stats.connections_opened(), 1);
+        assert_eq!(stats.closed_error(), 0);
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_does_not_retry_an_http_error_and_keeps_the_connection() {
+        let server = serve_h3(|_, nth, _| {
+            if nth == 1 {
+                H3Action::Status(503)
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        let err = ask3(&backend, "two.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        ask3(&backend, "three.example.com").await.unwrap();
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 0);
+        assert_eq!(stats.connections_opened(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_a_mismatched_answer_fails_only_its_query() {
+        let server = serve_h3(|_, _, query| {
+            if query.questions[0].name == Name::from_ascii("bad.example.com").unwrap() {
+                H3Action::Reply(answer_for("other.example.org", 0))
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        let err = ask3(&backend, "bad.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        ask3(&backend, "good.example.com").await.unwrap();
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 0);
+        assert_eq!(stats.connections_opened(), 1);
+        assert_eq!(stats.closed_error(), 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_a_dropped_call_cancels_its_request_and_keeps_the_connection() {
+        let server = serve_h3(|_, nth, _| {
+            if nth == 0 {
+                H3Action::Echo(Duration::from_millis(600))
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(150),
+            backend.resolve(&query_for("held.example.com")),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the held query was dropped");
+        assert_eq!(backend.pool_stats().in_flight(), 0);
+        wait_for("the server to see the cancellation", || {
+            H3Counters::get(&server.counters.cancelled) == 1
+        })
+        .await;
+        ask3(&backend, "next.example.com")
+            .await
+            .expect("the connection is still usable");
+        assert_eq!(backend.pool_stats().connections_opened(), 1);
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_a_timed_out_query_is_cancelled_and_not_retried() {
+        let server = serve_h3(|_, nth, _| {
+            if nth == 1 {
+                H3Action::Echo(Duration::from_millis(700))
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_millis(250),
+            PoolConfig::new(),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        let err = ask3(&backend, "two.example.com").await.unwrap_err();
+        assert_eq!(err, Error::Timeout);
+        let stats = backend.pool_stats();
+        assert_eq!(stats.retries(), 0);
+        assert_eq!(
+            stats.connections_open(),
+            1,
+            "one timeout keeps the connection"
+        );
+        wait_for("the server to see the cancellation", || {
+            H3Counters::get(&server.counters.cancelled) == 1
+        })
+        .await;
+        ask3(&backend, "three.example.com").await.unwrap();
+        assert_eq!(server.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_abandoning_a_failed_response_stops_it_with_h3_request_cancelled() {
+        // The server answers 503 and keeps the response open; the query fails
+        // at the status, so its request is abandoned while the response is
+        // still being sent, and the server sees the literal cancel code.
+        let server = serve_h3(|_, nth, _| {
+            if nth == 1 {
+                H3Action::StatusThenStall(503)
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        let err = ask3(&backend, "two.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        wait_for("the server to see the cancellation", || {
+            H3Counters::get(&server.counters.cancelled) == 1
+        })
+        .await;
+        assert_eq!(
+            H3Counters::get(&server.counters.cancel_code),
+            0x10c,
+            "H3_REQUEST_CANCELLED"
+        );
+        ask3(&backend, "three.example.com").await.unwrap();
+        let stats = backend.pool_stats();
+        assert_eq!((stats.retries(), stats.connections_opened()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_closes_an_idle_connection_after_the_idle_timeout() {
+        let server = h3_echo();
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().idle_timeout(Duration::from_secs(1)),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        assert_eq!(backend.pool_stats().connections_open(), 1);
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        let stats = backend.pool_stats();
+        assert_eq!(stats.connections_open(), 0);
+        assert_eq!(stats.closed_idle(), 1);
+        wait_for("the server to see the close", || {
+            H3Counters::get(&server.counters.closed) == 1
+        })
+        .await;
+        ask3(&backend, "two.example.com").await.unwrap();
+        let stats = backend.pool_stats();
+        assert_eq!(stats.connections_opened(), 2);
+        assert_eq!(stats.retries(), 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_rotates_a_connection_at_its_maximum_lifetime() {
+        let server = h3_echo();
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().max_lifetime(Some(Duration::from_secs(1))),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        ask3(&backend, "two.example.com")
+            .await
+            .expect("the replacement answers without a failed query");
+        let stats = backend.pool_stats();
+        assert_eq!(stats.connections_opened(), 2);
+        assert_eq!(stats.closed_lifetime(), 1);
+        assert_eq!(stats.retries(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pooled_doh3_backend_closes_its_connection() {
+        let server = h3_echo();
+        let backend = server.pooled();
+        ask3(&backend, "one.example.com").await.unwrap();
+        assert_eq!(H3Counters::get(&server.counters.closed), 0);
+        drop(backend);
+        wait_for("the server to see the close", || {
+            H3Counters::get(&server.counters.closed) == 1
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_backends_never_share_connections_or_tls_identity() {
+        let server = h3_echo();
+        let (first, second) = (server.pooled(), server.pooled());
+        ask3(&first, "one.example.com").await.unwrap();
+        ask3(&second, "two.example.com").await.unwrap();
+        assert_eq!(server.accepted(), 2, "each backend owns its connection");
+
+        let (_other_server, untrusting) = self_signed_fixture();
+        let strict = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_str(&format!(
+                "https://localhost:{}/dns-query",
+                server.addr.port()
+            ))
+            .unwrap(),
+            server: server.addr,
+            method: DohMethod::Post,
+            tls_config: Arc::new(untrusting),
+            timeout: Duration::from_secs(5),
+        });
+        let err = ask3(&strict, "three.example.com").await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        let stats = strict.pool_stats();
+        assert_eq!((stats.retries(), stats.connections_opened()), (0, 0));
+        ask3(&first, "four.example.com").await.unwrap();
+        assert_eq!(
+            server.accepted(),
+            2,
+            "the rejected handshake never completed"
+        );
+    }
+
+    #[test]
+    fn a_pooled_doh3_backend_rebinds_its_endpoint_on_a_new_runtime() {
+        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async { h3_echo() });
+        let backend = Arc::new(server.pooled());
+        for name in ["one.example.com", "two.example.com"] {
+            // Each runtime is dropped after its query, taking the endpoint's
+            // driver and the connection's tasks with it.
+            let backend = backend.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(ask3(&backend, name)).unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        assert_eq!(server.accepted(), 2, "the second runtime reconnected");
+    }
+
+    #[test]
+    fn the_h3_alpn_is_fixed_at_construction_and_the_callers_config_is_untouched() {
+        let (_server_config, client_config) = http3_fixture();
+        assert!(client_config.alpn_protocols.is_empty());
+        let tls = Arc::new(client_config);
+        let backend = Doh3Backend::new(Doh3BackendConfig {
+            uri: Uri::from_static("https://localhost:853/dns-query"),
+            server: "127.0.0.1:853".parse().unwrap(),
+            method: DohMethod::Post,
+            tls_config: tls.clone(),
+            timeout: Duration::from_secs(1),
+        });
+        assert_eq!(backend.tls_config.alpn_protocols, vec![b"h3".to_vec()]);
+        assert!(tls.alpn_protocols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doh3_without_a_uri_host_is_a_transport_error_pooled_or_not() {
+        let (_server_config, client_config) = http3_fixture();
+        for pool in [PoolConfig::new(), PoolConfig::disabled()] {
+            let backend = Doh3Backend::new(Doh3BackendConfig {
+                uri: Uri::from_static("/dns-query"),
+                server: "127.0.0.1:853".parse().unwrap(),
+                method: DohMethod::Post,
+                tls_config: Arc::new(client_config.clone()),
+                timeout: Duration::from_secs(1),
+            })
+            .with_pool(pool);
+            let err = backend
+                .resolve(&query_for("example.com"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_rule_needs_every_condition() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let closed = |error: Error| H3Failure {
+            error,
+            closed: true,
+            answered: true,
+        };
+        let base = closed(Error::Transport("connection closed".to_string()));
+        assert!(retry_allowed(&base, true, false, now, later), "baseline");
+
+        // Each guard, flipped on its own, forbids the retry.
+        let not_closed = H3Failure {
+            closed: false,
+            ..closed(Error::Transport("stream reset".to_string()))
+        };
+        assert!(
+            !retry_allowed(&not_closed, true, false, now, later),
+            "closed"
+        );
+        let not_answered = H3Failure {
+            answered: false,
+            ..closed(Error::Transport("connection closed".to_string()))
+        };
+        assert!(
+            !retry_allowed(&not_answered, true, false, now, later),
+            "reused"
+        );
+        assert!(
+            !retry_allowed(&base, false, false, now, later),
+            "QUERY only"
+        );
+        assert!(!retry_allowed(&base, true, true, now, later), "not twice");
+        assert!(!retry_allowed(&base, true, false, later, later), "deadline");
+        assert!(
+            !retry_allowed(&base, true, false, later + Duration::from_millis(1), later),
+            "past the deadline"
+        );
+        assert!(
+            !retry_allowed(&closed(Error::Timeout), true, false, now, later),
+            "never on a timeout"
+        );
+        assert!(
+            !retry_allowed(
+                &closed(Error::Tls("alert".to_string())),
+                true,
+                false,
+                now,
+                later
+            ),
+            "never on a TLS error"
+        );
     }
 }
