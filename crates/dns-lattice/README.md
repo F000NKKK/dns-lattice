@@ -158,7 +158,10 @@ cache state, retries, or answers, receive no resolver or backend handles, run af
 locks are released, and have their panics isolated from resolver correctness. The crate
 requires no logging or tracing framework and owns no background telemetry queue. Cache
 signals outside that ordered stream, such as a query joining another query's in-flight
-upstream call, arrive as `CacheEvent` through the defaulted `record_cache` method. Concurrent
+upstream call, arrive as `CacheEvent` through the defaulted `record_cache` method. Pooled
+upstream connections report `PoolEvent` (opened, closed with a reason, a query retried)
+through the defaulted `record_upstream_pool` method; attach the sink to the backend with
+`PoolConfig::observability_sink`. Concurrent
 identical cache misses share one upstream query (`CacheConfig::coalesce`, on by default);
 queries carrying an EDNS Client Subnet or other non-basic EDNS option bypass the cache and
 that coalescing.

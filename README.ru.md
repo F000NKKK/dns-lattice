@@ -661,6 +661,13 @@ DNS Lattice намеренно **не** определяет durable Fake IP per
 через метод `ObservabilitySink::record_cache` с реализацией по умолчанию;
 sink, который его не переопределяет, их игнорирует.
 
+События пула upstream-соединений (соединение открыто или закрыто с указанием
+причины, запрос отправлен повторно на новом соединении) приходят как
+`observability::PoolEvent` через метод `ObservabilitySink::record_upstream_pool`
+с реализацией по умолчанию. У backend нет доступа к sink резолвера, поэтому
+sink передаётся в `PoolConfig::observability_sink` самого backend; он
+вызывается вне блокировок пула, а его panic игнорируется.
+
 Sink non-authoritative. Он не может менять routing, answers, cache state или
 retries; не получает resolver/backend handles; resolver locks освобождаются до
 callbacks; panic callback изолирован от корректности resolver. DNS Lattice не

@@ -64,6 +64,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, watc
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
+use crate::observability::{ObservabilitySink, PoolCloseReason, PoolEvent};
+
 /// Default number of connections a pool opens at most.
 const DEFAULT_MAX_CONNECTIONS: usize = 4;
 /// Largest accepted `max_connections`.
@@ -114,7 +116,9 @@ const MAX_TABLE_CAPACITY: usize = u16::MAX as usize;
 /// Pass a configuration to [`TcpBackend::with_pool`](super::TcpBackend::with_pool)
 /// (and the matching `with_pool` of the other connection-reusing backends);
 /// [`TcpBackend::pool_stats`](super::TcpBackend::pool_stats) reports the
-/// resulting [`PoolStats`].
+/// resulting [`PoolStats`]. [`observability_sink`](Self::observability_sink)
+/// additionally delivers a [`PoolEvent`] when a connection opens or closes and
+/// when a query is resent.
 #[cfg_attr(feature = "dot", doc = "")]
 #[cfg_attr(
     feature = "dot",
@@ -141,13 +145,27 @@ const MAX_TABLE_CAPACITY: usize = u16::MAX as usize;
 /// assert!(config.is_enabled());
 /// assert!(!PoolConfig::disabled().is_enabled());
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PoolConfig {
     enabled: bool,
     max_connections: usize,
     max_in_flight: usize,
     idle_timeout: Duration,
     max_lifetime: Option<Duration>,
+    sink: Option<Arc<dyn ObservabilitySink>>,
+}
+
+impl std::fmt::Debug for PoolConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolConfig")
+            .field("enabled", &self.enabled)
+            .field("max_connections", &self.max_connections)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_lifetime", &self.max_lifetime)
+            .field("observability_sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 impl Default for PoolConfig {
@@ -167,6 +185,7 @@ impl PoolConfig {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_lifetime: Some(DEFAULT_MAX_LIFETIME),
+            sink: None,
         }
     }
 
@@ -235,6 +254,46 @@ impl PoolConfig {
     #[must_use]
     pub fn max_lifetime(mut self, d: Option<Duration>) -> Self {
         self.max_lifetime = d.map(|d| d.max(MIN_MAX_LIFETIME));
+        self
+    }
+
+    /// Attaches a sink that receives a [`PoolEvent`] when the pool opens or
+    /// closes a connection and when it resends a query on a fresh connection,
+    /// through [`ObservabilitySink::record_upstream_pool`]. No sink is
+    /// attached by default.
+    ///
+    /// A backend has no handle to the resolver's sink, so this is the only way
+    /// to observe the pool; pass the same `Arc` to the resolver to receive
+    /// both streams in one place. The sink is advisory: it is called outside
+    /// every pool lock, a panic in it is ignored, and it cannot change what
+    /// the pool does. It runs on the Tokio runtime and must not block. A
+    /// [`disabled`](Self::disabled) configuration has no pool and emits
+    /// nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use dns_lattice::observability::{ObservabilitySink, ObserveEvent, PoolEvent};
+    /// use dns_lattice::upstream::PoolConfig;
+    ///
+    /// struct Log;
+    ///
+    /// impl ObservabilitySink for Log {
+    ///     fn record(&self, _event: &ObserveEvent) {}
+    ///
+    ///     fn record_upstream_pool(&self, event: &PoolEvent) {
+    ///         println!("{event:?}");
+    ///     }
+    /// }
+    ///
+    /// let config = PoolConfig::new().observability_sink(Arc::new(Log));
+    /// assert!(config.is_enabled());
+    /// ```
+    #[must_use]
+    pub fn observability_sink(mut self, sink: Arc<dyn ObservabilitySink>) -> Self {
+        self.sink = Some(sink);
         self
     }
 
@@ -391,6 +450,68 @@ impl PoolHooks {
     }
 }
 
+/// Delivers a pool's events to the sink of its [`PoolConfig`].
+///
+/// Every method must be called with no pool lock held: the sink is user code.
+/// A panic in the sink is caught and ignored, as the resolver does for its own
+/// sink. Without a sink the event is not even built.
+#[derive(Clone, Default)]
+pub(crate) struct PoolObserver {
+    sink: Option<Arc<dyn ObservabilitySink>>,
+    transport: &'static str,
+    server: Arc<str>,
+}
+
+impl std::fmt::Debug for PoolObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolObserver")
+            .field("transport", &self.transport)
+            .field("server", &self.server)
+            .field("has_sink", &self.sink.is_some())
+            .finish()
+    }
+}
+
+impl PoolObserver {
+    /// An observer for the pool of the `transport` backend talking to
+    /// `server`, using the sink of `config` (if any).
+    pub(crate) fn new(config: &PoolConfig, transport: &'static str, server: &str) -> Self {
+        PoolObserver {
+            sink: config.sink.clone(),
+            transport,
+            server: Arc::from(server),
+        }
+    }
+
+    fn emit(&self, event: impl FnOnce(&'static str, String) -> PoolEvent) {
+        if let Some(sink) = &self.sink {
+            let event = event(self.transport, self.server.to_string());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sink.record_upstream_pool(&event);
+            }));
+        }
+    }
+
+    /// Reports a connection the pool established.
+    pub(crate) fn opened(&self) {
+        self.emit(|transport, server| PoolEvent::ConnectionOpened { transport, server });
+    }
+
+    /// Reports a connection that ended.
+    pub(crate) fn closed(&self, reason: PoolCloseReason) {
+        self.emit(|transport, server| PoolEvent::ConnectionClosed {
+            transport,
+            server,
+            reason,
+        });
+    }
+
+    /// Reports a query resent on a fresh connection.
+    pub(crate) fn retried(&self) {
+        self.emit(|transport, server| PoolEvent::QueryRetried { transport, server });
+    }
+}
+
 impl Counters {
     fn bump(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -477,6 +598,17 @@ pub(crate) trait Connector: Send + Sync + 'static {
     fn close(&self, conn: &Self::Conn) {
         let _ = conn;
     }
+
+    /// Whether a connection that is no longer alive was ended by the peer
+    /// (end of stream, reset, a close frame) rather than by a local or
+    /// protocol failure. Only used to tell [`PoolCloseReason::PeerClosed`]
+    /// from [`PoolCloseReason::Error`] in events; like
+    /// [`is_alive`](Self::is_alive) it runs under the pool's state lock and
+    /// must be cheap and synchronous. The default says no.
+    fn peer_closed(&self, conn: &Self::Conn) -> bool {
+        let _ = conn;
+        false
+    }
 }
 
 /// The outcome of the connect in progress: `None` until it finishes.
@@ -540,8 +672,13 @@ enum Pick {
     Exhausted,
 }
 
+/// Connections retired under the state lock, with the reason to report; they
+/// are closed and reported after the lock is released.
+type Closing<C> = Vec<(Arc<C>, PoolCloseReason)>;
+
 struct Shared<K: Connector> {
     config: PoolConfig,
+    observer: PoolObserver,
     drain_grace: Duration,
     connector: Arc<K>,
     admission: Arc<Semaphore>,
@@ -564,7 +701,7 @@ impl<K: Connector> Shared<K> {
         st: &mut State<K::Conn>,
         idx: usize,
         reason: CloseReason,
-        closing: &mut Vec<Arc<K::Conn>>,
+        closing: &mut Closing<K::Conn>,
     ) {
         let entry = st.entries.remove(idx);
         Counters::drop_one(&self.counters.open);
@@ -574,13 +711,21 @@ impl<K: Connector> Shared<K> {
             CloseReason::Error => &self.counters.closed_error,
         };
         Counters::bump(counter);
-        closing.push(entry.conn);
+        let reported = match reason {
+            CloseReason::Idle => PoolCloseReason::Idle,
+            CloseReason::Lifetime => PoolCloseReason::Lifetime,
+            CloseReason::Error if self.connector.peer_closed(&entry.conn) => {
+                PoolCloseReason::PeerClosed
+            }
+            CloseReason::Error => PoolCloseReason::Error,
+        };
+        closing.push((entry.conn, reported));
     }
 
     /// Retires every connection that is dead, idle, past its lifetime and
     /// idle, or draining past its grace period, and marks connections that
     /// just reached their lifetime as draining.
-    fn sweep_locked(&self, st: &mut State<K::Conn>, now: Instant, closing: &mut Vec<Arc<K::Conn>>) {
+    fn sweep_locked(&self, st: &mut State<K::Conn>, now: Instant, closing: &mut Closing<K::Conn>) {
         let lifetime = self.config.max_lifetime_value();
         let idle = self.config.idle_timeout_value();
         let mut i = 0;
@@ -634,9 +779,12 @@ impl<K: Connector> Shared<K> {
         next
     }
 
-    fn close_all(&self, closing: Vec<Arc<K::Conn>>) {
-        for conn in closing {
+    /// Closes the retired connections and reports each to the sink. Called
+    /// with no pool lock held.
+    fn close_all(&self, closing: Closing<K::Conn>) {
+        for (conn, reason) in closing {
             self.connector.close(&conn);
+            self.observer.closed(reason);
         }
     }
 
@@ -729,6 +877,7 @@ impl<K: Connector> Shared<K> {
     fn finish_connect(this: &Arc<Self>, epoch: u64, result: Result<K::Conn>) {
         let now = Instant::now();
         let mut stale = None;
+        let mut opened = false;
         let notify = {
             let mut st = lock(&this.state);
             match st.connecting.take() {
@@ -753,6 +902,7 @@ impl<K: Connector> Shared<K> {
                             // A new connection can be due before the instant
                             // a running janitor sleeps until.
                             this.wake.notify_one();
+                            opened = true;
                             Ok(())
                         }
                         Err(err) => {
@@ -774,6 +924,12 @@ impl<K: Connector> Shared<K> {
         if let Some(conn) = stale {
             this.connector.close(&conn);
         }
+        if opened {
+            // After the state lock is released and before the waiters are
+            // woken, so a caller that resumes sees the event already
+            // delivered.
+            this.observer.opened();
+        }
         if let Some((tx, outcome)) = notify {
             tx.send_replace(Some(outcome));
         }
@@ -785,6 +941,7 @@ impl<K: Connector> Drop for Shared<K> {
         let st = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         for entry in st.entries.drain(..) {
             self.connector.close(&entry.conn);
+            self.observer.closed(PoolCloseReason::Shutdown);
         }
     }
 }
@@ -856,6 +1013,8 @@ async fn run_janitor<K: Connector>(shared: Weak<Shared<K>>, wake: Arc<Notify>) {
                 // which returns right below.
                 st.janitor = None;
                 st.janitor_deadline = None;
+                // Release the state lock first: closing reports to the sink.
+                drop(st);
                 strong.close_all(closing);
                 return;
             }
@@ -1011,7 +1170,14 @@ impl<K: Connector> Pool<K> {
     /// keep serving its in-flight queries before it is closed regardless; a
     /// transport passes its read timeout. No task is started and no
     /// connection opened until the first [`Pool::acquire`].
-    pub(crate) fn new(config: PoolConfig, connector: Arc<K>, drain_grace: Duration) -> Self {
+    pub(crate) fn new(
+        config: PoolConfig,
+        connector: Arc<K>,
+        drain_grace: Duration,
+        transport: &'static str,
+        server: &str,
+    ) -> Self {
+        let observer = PoolObserver::new(&config, transport, server);
         let admission = Arc::new(Semaphore::new(config.capacity()));
         // A grace longer than the lifetime would let several draining
         // generations pile up, so cap it.
@@ -1021,6 +1187,7 @@ impl<K: Connector> Pool<K> {
         Pool {
             shared: Arc::new(Shared {
                 config,
+                observer,
                 drain_grace,
                 connector,
                 admission,
@@ -1044,9 +1211,10 @@ impl<K: Connector> Pool<K> {
         self.shared.counters.snapshot()
     }
 
-    /// Counts one query resent on a fresh connection.
+    /// Counts one query resent on a fresh connection and reports it.
     pub(crate) fn record_retry(&self) {
         Counters::bump(&self.shared.counters.retries);
+        self.shared.observer.retried();
     }
 
     /// Retires idle, rotated and dead connections now, without waiting for
@@ -1366,10 +1534,111 @@ impl<T> PendingTable<T> {
     }
 }
 
+/// A sink the backends' tests share: it records every pool event and can be
+/// told to panic or to run a check on each event.
+#[cfg(test)]
+pub(crate) mod recorder {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use crate::observability::{ObservabilitySink, ObserveEvent, PoolCloseReason, PoolEvent};
+
+    type Check = Box<dyn Fn() -> bool + Send + Sync>;
+
+    #[derive(Default)]
+    pub(crate) struct Recorder {
+        events: Mutex<Vec<PoolEvent>>,
+        panics: AtomicBool,
+        check: Mutex<Option<Check>>,
+        checked: Mutex<Vec<bool>>,
+    }
+
+    impl Recorder {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Recorder::default())
+        }
+
+        /// A recorder whose callback panics after recording.
+        pub(crate) fn panicking() -> Arc<Self> {
+            let recorder = Recorder::default();
+            recorder.panics.store(true, Ordering::SeqCst);
+            Arc::new(recorder)
+        }
+
+        /// Runs `check` inside every callback and keeps its results.
+        pub(crate) fn check_with(&self, check: impl Fn() -> bool + Send + Sync + 'static) {
+            *self.check.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(check));
+        }
+
+        pub(crate) fn events(&self) -> Vec<PoolEvent> {
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        pub(crate) fn checked(&self) -> Vec<bool> {
+            self.checked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        pub(crate) fn opened(&self) -> usize {
+            self.events()
+                .iter()
+                .filter(|e| matches!(e, PoolEvent::ConnectionOpened { .. }))
+                .count()
+        }
+
+        pub(crate) fn retried(&self) -> usize {
+            self.events()
+                .iter()
+                .filter(|e| matches!(e, PoolEvent::QueryRetried { .. }))
+                .count()
+        }
+
+        pub(crate) fn closed(&self) -> Vec<PoolCloseReason> {
+            self.events()
+                .iter()
+                .filter_map(|e| match e {
+                    PoolEvent::ConnectionClosed { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl ObservabilitySink for Recorder {
+        fn record(&self, _event: &ObserveEvent) {}
+
+        fn record_upstream_pool(&self, event: &PoolEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event.clone());
+            if let Some(check) = self
+                .check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                let ok = check();
+                self.checked
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(ok);
+            }
+            assert!(!self.panics.load(Ordering::SeqCst), "sink panic");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    use super::recorder::Recorder;
     use super::*;
 
     // ---- fake connector ---------------------------------------------------
@@ -1379,6 +1648,7 @@ mod tests {
     struct ConnProbe {
         alive_flag: AtomicBool,
         closed: AtomicBool,
+        peer_closed_flag: AtomicBool,
     }
 
     struct FakeConn {
@@ -1467,6 +1737,10 @@ mod tests {
         fn close(&self, conn: &FakeConn) {
             conn.probe.closed.store(true, Ordering::SeqCst);
         }
+
+        fn peer_closed(&self, conn: &FakeConn) -> bool {
+            conn.probe.peer_closed_flag.load(Ordering::SeqCst)
+        }
     }
 
     fn config(connections: usize, in_flight: usize) -> PoolConfig {
@@ -1476,7 +1750,13 @@ mod tests {
     }
 
     fn pool_with(config: PoolConfig, fake: &Arc<Fake>) -> Arc<Pool<Fake>> {
-        Arc::new(Pool::new(config, Arc::clone(fake), Duration::from_secs(5)))
+        Arc::new(Pool::new(
+            config,
+            Arc::clone(fake),
+            Duration::from_secs(5),
+            "tcp",
+            "192.0.2.1:53",
+        ))
     }
 
     fn deadline() -> Instant {
@@ -2285,6 +2565,218 @@ mod tests {
                 .num_alive_tasks(),
             0
         );
+    }
+
+    // ---- events -------------------------------------------------------------
+
+    fn observed(config: PoolConfig, fake: &Arc<Fake>) -> (Arc<Pool<Fake>>, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        (pool_with(config.observability_sink(sink), fake), recorder)
+    }
+
+    /// Makes the recorder check, inside every callback, that the pool's state
+    /// lock is free (a callback under the lock could not take it).
+    fn check_lock_free(pool: &Pool<Fake>, recorder: &Recorder) {
+        let weak = Arc::downgrade(&pool.shared);
+        recorder.check_with(move || {
+            weak.upgrade()
+                .is_none_or(|shared| shared.state.try_lock().is_ok())
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_opened_connection_is_reported_once_with_transport_and_server() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(1, 8), &fake);
+        assert!(
+            recorder.events().is_empty(),
+            "nothing before the first query"
+        );
+        pool.acquire(deadline()).await.unwrap().complete();
+        assert_eq!(
+            recorder.events(),
+            vec![PoolEvent::ConnectionOpened {
+                transport: "tcp",
+                server: "192.0.2.1:53".to_string(),
+            }]
+        );
+        // Negative control: reusing the connection opens nothing.
+        pool.acquire(deadline()).await.unwrap().complete();
+        pool.acquire(deadline()).await.unwrap().complete();
+        assert_eq!(recorder.opened(), 1);
+        assert!(recorder.closed().is_empty());
+        assert_eq!(recorder.retried(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_connect_is_not_reported_as_opened() {
+        let fake = Fake::new();
+        fake.fail.store(true, Ordering::SeqCst);
+        let (pool, recorder) = observed(config(1, 8), &fake);
+        assert!(pool.acquire(deadline()).await.is_err());
+        assert!(recorder.events().is_empty(), "{:?}", recorder.events());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_close_is_reported_as_idle() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(1, 8).idle_timeout(Duration::from_secs(20)), &fake);
+        pool.acquire(deadline()).await.unwrap().complete();
+        settle().await;
+        tokio::time::advance(Duration::from_secs(19)).await;
+        settle().await;
+        assert!(
+            recorder.closed().is_empty(),
+            "still inside the idle timeout"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Idle]);
+        assert_eq!(recorder.opened(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rotated_connection_is_reported_as_lifetime() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(
+            config(1, 8).max_lifetime(Some(Duration::from_secs(60))),
+            &fake,
+        );
+        let old = pool.acquire(deadline()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        settle().await;
+        assert!(recorder.closed().is_empty(), "still draining");
+        let next = pool.acquire(deadline()).await.unwrap();
+        drop(old);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Lifetime]);
+        assert_eq!(recorder.opened(), 2);
+        drop(next);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_connection_is_reported_as_error_or_peer_closed() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(1, 8), &fake);
+        let lease = pool.acquire(deadline()).await.unwrap();
+        lease.mark_dead();
+        lease.mark_dead(); // idempotent: reported once
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Error]);
+        drop(lease);
+
+        // The connector says the peer ended the next one.
+        let lease = pool.acquire(deadline()).await.unwrap();
+        fake.probe(1).peer_closed_flag.store(true, Ordering::SeqCst);
+        fake.probe(1).alive_flag.store(false, Ordering::SeqCst);
+        pool.sweep();
+        assert_eq!(
+            recorder.closed(),
+            vec![PoolCloseReason::Error, PoolCloseReason::PeerClosed]
+        );
+        drop(lease);
+
+        // Half-open detection is an error, not a peer close.
+        let lease = pool.acquire(deadline()).await.unwrap();
+        lease.note_timeout();
+        lease.note_timeout();
+        assert_eq!(recorder.closed().len(), 2);
+        assert!(lease.note_timeout());
+        assert_eq!(recorder.closed().len(), 3);
+        assert_eq!(recorder.closed()[2], PoolCloseReason::Error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_pool_reports_a_shutdown_for_every_open_connection() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(2, 1), &fake);
+        let a = pool.acquire(deadline()).await.unwrap();
+        let b = pool.acquire(deadline()).await.unwrap();
+        drop((a, b));
+        assert_eq!(recorder.opened(), 2);
+        assert!(recorder.closed().is_empty());
+        drop(pool);
+        settle().await;
+        assert_eq!(
+            recorder.closed(),
+            vec![PoolCloseReason::Shutdown, PoolCloseReason::Shutdown]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_is_reported_and_only_a_retry() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(1, 8), &fake);
+        assert_eq!(recorder.retried(), 0);
+        pool.record_retry();
+        assert_eq!(
+            recorder.events(),
+            vec![PoolEvent::QueryRetried {
+                transport: "tcp",
+                server: "192.0.2.1:53".to_string(),
+            }]
+        );
+        assert_eq!(pool.stats().retries(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sink_is_called_outside_the_state_lock() {
+        let fake = Fake::new();
+        let (pool, recorder) = observed(config(1, 8).idle_timeout(Duration::from_secs(20)), &fake);
+        check_lock_free(&pool, &recorder);
+        let lease = pool.acquire(deadline()).await.unwrap(); // opened
+        pool.record_retry(); // retried
+        lease.mark_dead(); // closed (error)
+        drop(lease);
+        pool.acquire(deadline()).await.unwrap().complete(); // opened
+        settle().await;
+        tokio::time::advance(Duration::from_secs(21)).await; // closed (idle)
+        settle().await;
+        let checked = recorder.checked();
+        assert_eq!(checked.len(), recorder.events().len());
+        assert!(checked.len() >= 5, "{:?}", recorder.events());
+        assert!(checked.iter().all(|free| *free), "{checked:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_sink_changes_nothing() {
+        let fake = Fake::new();
+        let recorder = Recorder::panicking();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        let pool = pool_with(config(1, 8).observability_sink(sink), &fake);
+        let lease = pool.acquire(deadline()).await.unwrap();
+        lease.complete();
+        pool.record_retry();
+        let again = pool.acquire(deadline()).await.unwrap();
+        again.mark_dead();
+        drop(again);
+        // Every event still reached the sink, and the pool kept working.
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(recorder.retried(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Error]);
+        let stats = pool.stats();
+        assert_eq!(stats.connections_opened(), 1);
+        assert_eq!(stats.closed_error(), 1);
+        assert_eq!(stats.in_flight(), 0);
+        pool.acquire(deadline()).await.unwrap().complete();
+        assert_eq!(recorder.opened(), 2);
+        assert_eq!(permits(&pool), 8);
+    }
+
+    #[test]
+    fn the_config_debug_hides_the_sink_and_clones_share_it() {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder;
+        let config = PoolConfig::new().observability_sink(sink);
+        let text = format!("{config:?}");
+        assert!(text.contains("observability_sink: true"), "{text}");
+        assert!(format!("{:?}", PoolConfig::new()).contains("observability_sink: false"));
+        assert!(Arc::ptr_eq(
+            config.sink.as_ref().unwrap(),
+            config.clone().sink.as_ref().unwrap()
+        ));
+        // The builders keep the sink.
+        assert!(config.clone().max_connections(2).sink.is_some());
+        assert!(config.idle_timeout(Duration::from_secs(5)).sink.is_some());
     }
 
     // ---- pending table ----------------------------------------------------

@@ -32,6 +32,20 @@ pub(crate) const NO_ERROR: u32 = 0;
 /// race and is counted as an idle close.
 pub(crate) const TRANSPORT_IDLE_MARGIN: Duration = Duration::from_secs(2);
 
+/// Whether `connection` was ended by the peer: it sent a `CONNECTION_CLOSE`
+/// (transport or application) or a stateless reset. A local close, a timeout
+/// and a protocol failure are not.
+pub(crate) fn closed_by_peer(connection: &Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(
+            ConnectionError::ApplicationClosed(_)
+                | ConnectionError::ConnectionClosed(_)
+                | ConnectionError::Reset
+        )
+    )
+}
+
 /// Builds the `quinn` client configuration for `tls_config`, optionally with a
 /// QUIC idle timeout. Without one the `quinn` default applies.
 pub(crate) fn client_config(

@@ -352,6 +352,13 @@ The sink contract has strict isolation properties:
   another's in-flight upstream call) arrive as `observability::CacheEvent`
   through `ObservabilitySink::record_cache`, a defaulted method that existing
   sinks need not implement;
+- upstream connection-pool signals (a pooled connection opened or closed,
+  with a reason, and a query resent on a fresh connection) arrive as
+  `observability::PoolEvent` through the defaulted
+  `ObservabilitySink::record_upstream_pool`. A backend has no handle to the
+  resolver's sink, so the sink is given to the backend's
+  `upstream::PoolConfig::observability_sink`; it is called outside every pool
+  lock and its panics are ignored, like the resolver's own sink;
 - callbacks cannot alter a resolver decision or answer;
 - callbacks receive no resolver/backend handles or privileged OS authority;
 - resolver locks are released before callbacks run;

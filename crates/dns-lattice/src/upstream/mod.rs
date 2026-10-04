@@ -498,6 +498,8 @@ impl TcpBackend {
                 self.config
                     .connect_timeout
                     .saturating_add(read.saturating_mul(2)),
+                "tcp",
+                &self.config.server.to_string(),
             )
         });
         self

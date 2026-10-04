@@ -359,6 +359,12 @@ hit/miss, upstream attempts/outcomes, timeouts и terminal failures.
   `observability::CacheEvent` через `ObservabilitySink::record_cache` — метод
   с реализацией по умолчанию, который существующим sink не нужно
   реализовывать;
+- сигналы пула upstream-соединений (соединение открыто или закрыто с
+  причиной, запрос отправлен повторно на новом соединении) приходят как
+  `observability::PoolEvent` через `ObservabilitySink::record_upstream_pool`
+  с реализацией по умолчанию. У backend нет доступа к sink резолвера, поэтому
+  sink передаётся в `upstream::PoolConfig::observability_sink`; он вызывается
+  вне блокировок пула, а его panic игнорируется, как и у sink резолвера;
 - callback не может изменить resolver decision или answer;
 - callback не получает resolver/backend handles или privileged OS authority;
 - resolver locks освобождаются до вызова callback;

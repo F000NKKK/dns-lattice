@@ -143,6 +143,9 @@ struct ConnShared {
     state: Mutex<ConnState>,
     /// The connection can no longer carry queries.
     dead: AtomicBool,
+    /// The upstream ended the connection (end of stream or reset), as opposed
+    /// to a local or protocol failure. Only read to label pool events.
+    peer_closed: AtomicBool,
     /// At least one query received its answer here.
     answered: AtomicBool,
     next_serial: AtomicU64,
@@ -256,6 +259,7 @@ impl StreamConn {
                 slack_cap: UNSOLICITED_LIMIT.saturating_add(max_in_flight as u32),
             }),
             dead: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
             answered: AtomicBool::new(false),
             next_serial: AtomicU64::new(0),
             closed,
@@ -416,11 +420,18 @@ async fn run_reader<R: AsyncRead + Unpin>(mut read: R, shared: Arc<ConnShared>, 
                 } else {
                     "upstream closed the connection in the middle of a response"
                 };
+                shared.peer_closed.store(true, Ordering::Release);
                 shared.fail(&Failure::closed(reason));
                 return;
             }
             Ok(_) => {}
             Err(err) => {
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) {
+                    shared.peer_closed.store(true, Ordering::Release);
+                }
                 shared.fail(&Failure::closed(err.to_string()));
                 return;
             }
@@ -497,6 +508,10 @@ impl<O: StreamOpen> Connector for StreamConnector<O> {
     fn close(&self, conn: &StreamConn) {
         conn.shutdown();
     }
+
+    fn peer_closed(&self, conn: &StreamConn) -> bool {
+        conn.shared.peer_closed.load(Ordering::Acquire)
+    }
 }
 
 /// A failed attempt and whether the retry rule allows another one.
@@ -531,6 +546,8 @@ impl<O: StreamOpen> StreamPool<O> {
         opener: O,
         read_timeout: Duration,
         call_budget: Duration,
+        transport: &'static str,
+        server: &str,
     ) -> Self {
         let connector = Arc::new(StreamConnector {
             opener,
@@ -538,7 +555,7 @@ impl<O: StreamOpen> StreamPool<O> {
             read_timeout,
         });
         StreamPool {
-            pool: Pool::new(config, connector, read_timeout),
+            pool: Pool::new(config, connector, read_timeout, transport, server),
             read_timeout,
             call_budget,
         }
@@ -651,7 +668,9 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::time::{advance, sleep};
 
+    use super::super::pool::recorder::Recorder;
     use super::*;
+    use crate::observability::{ObservabilitySink, PoolCloseReason, PoolEvent};
 
     // ---- wire helpers ---------------------------------------------------------
 
@@ -750,6 +769,8 @@ mod tests {
             },
             READ_TIMEOUT,
             Duration::from_secs(10),
+            "tcp",
+            "192.0.2.1:53",
         ));
         Harness { pool, accepted }
     }
@@ -953,6 +974,124 @@ mod tests {
         assert_eq!(stats.connections_opened(), 2);
     }
 
+    fn observed(script: Script) -> (Harness, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        (
+            harness(PoolConfig::new().observability_sink(sink), script),
+            recorder,
+        )
+    }
+
+    fn opened() -> PoolEvent {
+        PoolEvent::ConnectionOpened {
+            transport: "tcp",
+            server: "192.0.2.1:53".to_string(),
+        }
+    }
+
+    fn closed(reason: PoolCloseReason) -> PoolEvent {
+        PoolEvent::ConnectionClosed {
+            transport: "tcp",
+            server: "192.0.2.1:53".to_string(),
+            reason,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_reports_the_peer_close_the_retry_and_the_new_connection() {
+        let (h, recorder) = observed(flaky_then_good(1));
+        h.ask("a.example").await.unwrap();
+        assert_eq!(recorder.events(), vec![opened()]);
+        h.ask("b.example").await.unwrap();
+        assert_eq!(
+            recorder.events(),
+            vec![
+                opened(),
+                closed(PoolCloseReason::PeerClosed),
+                PoolEvent::QueryRetried {
+                    transport: "tcp",
+                    server: "192.0.2.1:53".to_string(),
+                },
+                opened(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_connection_that_closes_reports_the_close_but_no_retry() {
+        let (h, recorder) = observed(close_on_query(0));
+        h.ask("a.example").await.unwrap_err();
+        assert_eq!(
+            recorder.events(),
+            vec![opened(), closed(PoolCloseReason::PeerClosed)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_query_that_is_not_opcode_query_reports_no_retry() {
+        let (h, recorder) = observed(flaky_then_good(1));
+        h.ask("a.example").await.unwrap();
+        let mut notify = query_for("b.example");
+        notify.header.opcode = Opcode::Notify;
+        h.pool.query(&notify).await.unwrap_err();
+        assert_eq!(recorder.retried(), 0);
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::PeerClosed]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_protocol_failure_is_an_error_close_not_a_peer_close() {
+        // The upstream answers with a frame too short to hold a message id
+        // and keeps the connection open.
+        let garbage = script(|_, mut s| async move {
+            let _ = read_query(&mut s).await;
+            let _ = s.write_all(&[0, 1, 0xff]).await;
+            let _ = read_query(&mut s).await;
+        });
+        let (h, recorder) = observed(garbage);
+        h.ask("a.example").await.unwrap_err();
+        assert_eq!(
+            recorder.events(),
+            vec![opened(), closed(PoolCloseReason::Error)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_reports_an_idle_close_and_a_dropped_pool_a_shutdown() {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        let h = harness(
+            PoolConfig::new()
+                .idle_timeout(Duration::from_secs(20))
+                .observability_sink(sink),
+            echo(),
+        );
+        h.ask("a.example").await.unwrap();
+        advance(Duration::from_secs(21)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Idle]);
+        h.ask("b.example").await.unwrap();
+        assert_eq!(recorder.opened(), 2);
+        let Harness { pool, accepted: _ } = h;
+        drop(pool);
+        assert_eq!(
+            recorder.closed(),
+            vec![PoolCloseReason::Idle, PoolCloseReason::Shutdown]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queries_on_a_reused_connection_report_no_events() {
+        let (h, recorder) = observed(echo());
+        for name in ["a.example", "b.example", "c.example", "d.example"] {
+            h.ask(name).await.unwrap();
+        }
+        assert_eq!(recorder.events(), vec![opened()]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_query_that_is_not_opcode_query_is_never_retried() {
         let h = harness(PoolConfig::new(), flaky_then_good(1));
@@ -1083,6 +1222,8 @@ mod tests {
             Hang,
             READ_TIMEOUT,
             Duration::from_secs(5),
+            "tcp",
+            "192.0.2.1:53",
         );
         let started = Instant::now();
         let err = pool.query(&query_for("a.example")).await.unwrap_err();

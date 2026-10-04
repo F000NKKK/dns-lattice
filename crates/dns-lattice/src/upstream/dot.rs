@@ -154,6 +154,8 @@ impl DotBackend {
                 self.config
                     .connect_timeout
                     .saturating_add(read.saturating_mul(3)),
+                "dot",
+                &self.config.server.to_string(),
             )
         });
         self

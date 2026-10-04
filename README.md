@@ -659,6 +659,14 @@ joining another query's in-flight upstream call, arrive as
 `ObservabilitySink::record_cache` method; a sink that does not override it
 ignores them.
 
+Signals of the upstream connection pool (a pooled connection opened or
+closed, with a reason, and a query resent on a fresh connection) arrive as
+`observability::PoolEvent` through the defaulted
+`ObservabilitySink::record_upstream_pool` method. A backend has no handle to
+the resolver's sink, so the sink is attached to the backend's
+`PoolConfig::observability_sink`; it is called outside every pool lock and
+its panics are ignored.
+
 The sink is non-authoritative. It cannot alter routing, answers, cache state,
 or retries; it receives no resolver/backend handles; resolver locks are
 released before callbacks run; callback panics are isolated from resolver

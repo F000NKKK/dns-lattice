@@ -126,6 +126,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection-reuse policy of a DNS-over-HTTPS-over-HTTP/3 backend and read
   its counters (`unsolicited` is always 0, because a request stream carries
   only the answer to its own request).
+- `observability::PoolEvent`, `observability::PoolCloseReason` (both
+  `#[non_exhaustive]`), the defaulted `ObservabilitySink::record_upstream_pool`
+  method and `PoolConfig::observability_sink` report the lifecycle of pooled
+  upstream connections. A backend has no handle to the resolver's sink, so
+  the sink is attached to the backend's `PoolConfig`. `ConnectionOpened`,
+  `ConnectionClosed` (with a reason: idle, lifetime, peer closed, error,
+  shutdown, or other when the transport does not say) and `QueryRetried`
+  carry the transport (`"tcp"`, `"dot"`, `"doh"`, `"doh3"`, `"doq"`) and the
+  upstream address; there is no event per query and no error text. The sink
+  is called outside every pool lock and a panic in it is ignored. Existing
+  sinks compile and behave as before, and a backend with
+  `PoolConfig::disabled()` emits nothing. The DoH backend cannot tell an idle
+  close from a close by the server, so it reports a connection its HTTP
+  client closed, other than at rotation or shutdown, as `Other`.
 
 ### Changed
 

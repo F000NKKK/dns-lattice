@@ -50,8 +50,10 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use tokio::runtime::Id as RuntimeId;
 
-use super::pool::{AbortOnDrop, Connector, Pool, PoolHooks};
-use super::quic::{NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN};
+use crate::observability::PoolCloseReason;
+
+use super::pool::{AbortOnDrop, Connector, Pool, PoolHooks, PoolObserver};
+use super::quic::{NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN, closed_by_peer};
 use super::{IdCheck, PoolConfig, PoolStats, UpstreamBackend, validate_response};
 
 /// The DoH request's HTTP method (RFC 8484 §4.1). Both wire formats carry
@@ -284,7 +286,13 @@ impl Doh3Backend {
                 timeout,
             );
             Doh3Pool {
-                pool: Pool::new(pool, Arc::new(Doh3Connector { client, timeout }), timeout),
+                pool: Pool::new(
+                    pool,
+                    Arc::new(Doh3Connector { client, timeout }),
+                    timeout,
+                    "doh3",
+                    &self.config.server.to_string(),
+                ),
                 uri: self.config.uri.clone(),
                 method: self.config.method,
                 timeout,
@@ -612,6 +620,10 @@ impl Connector for Doh3Connector {
         conn.connection
             .close(quinn::VarInt::from_u32(H3_NO_ERROR), &[]);
     }
+
+    fn peer_closed(&self, conn: &Doh3Conn) -> bool {
+        closed_by_peer(&conn.connection)
+    }
 }
 
 /// A failed attempt and the facts the retry rule needs.
@@ -877,6 +889,9 @@ struct DohCounters {
     reused_queries: AtomicU64,
     retries: AtomicU64,
     queued: AtomicU64,
+    /// Reports connection events to the pool's sink. Called from the
+    /// connection's own task, which owns no lock of this module.
+    observer: PoolObserver,
 }
 
 impl DohCounters {
@@ -942,6 +957,8 @@ impl ConnToken {
 struct GenState {
     /// Set when the generation is replaced for reaching the maximum lifetime.
     retired: AtomicBool,
+    /// Set when the backend is dropped, so its connections report a shutdown.
+    shutdown: AtomicBool,
     /// Connections of this generation that are currently open.
     open: AtomicU64,
     /// Set when a connection of this generation negotiated HTTP/1.1.
@@ -955,6 +972,7 @@ impl GenState {
     fn new() -> Self {
         GenState {
             retired: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
             open: AtomicU64::new(0),
             http1: AtomicBool::new(false),
             http1_seen: Notify::new(),
@@ -1031,6 +1049,7 @@ impl CountedIo {
     ) -> Self {
         DohCounters::bump(&counters.open);
         DohCounters::bump(&counters.opened);
+        counters.observer.opened();
         generation.open.fetch_add(1, Ordering::AcqRel);
         if !io.connected().is_negotiated_h2() {
             generation.http1.store(true, Ordering::Release);
@@ -1049,9 +1068,17 @@ impl Drop for CountedIo {
     fn drop(&mut self) {
         DohCounters::drop_one(&self.counters.open);
         DohCounters::drop_one(&self.generation.open);
-        if self.generation.retired.load(Ordering::Acquire) {
+        let reason = if self.generation.retired.load(Ordering::Acquire) {
             DohCounters::bump(&self.counters.closed_lifetime);
-        }
+            PoolCloseReason::Lifetime
+        } else if self.generation.shutdown.load(Ordering::Acquire) {
+            PoolCloseReason::Shutdown
+        } else {
+            // The HTTP client does not say whether it closed an idle
+            // connection or the server closed it.
+            PoolCloseReason::Other
+        };
+        self.counters.observer.closed(reason);
     }
 }
 
@@ -1210,7 +1237,17 @@ struct DohPool {
 
 impl DohPool {
     fn new(pool: PoolConfig, config: &DohBackendConfig) -> Self {
-        let counters = Arc::new(DohCounters::default());
+        let counters = Arc::new(DohCounters {
+            observer: PoolObserver::new(
+                &pool,
+                "doh",
+                config
+                    .uri
+                    .authority()
+                    .map_or("", |authority| authority.as_str()),
+            ),
+            ..DohCounters::default()
+        });
         let keep_alive_timeout = config
             .timeout
             .clamp(Duration::from_secs(1), H2_KEEP_ALIVE_TIMEOUT_MAX);
@@ -1261,7 +1298,25 @@ impl DohPool {
     fn stats(&self) -> PoolStats {
         self.counters.snapshot()
     }
+}
 
+impl Drop for DohPool {
+    fn drop(&mut self) {
+        // The client (and with it every connection of the current
+        // generation) is dropped right after this; mark why they close.
+        let current = self
+            .current
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        current
+            .generation
+            .state
+            .shutdown
+            .store(true, Ordering::Release);
+    }
+}
+
+impl DohPool {
     /// The generation new queries use, replacing it first when it reached the
     /// maximum lifetime. The old one is marked retired and dropped here; it
     /// stays alive only while queries that already hold it are in flight.
@@ -1336,6 +1391,7 @@ impl DohPool {
                 {
                     retried = true;
                     DohCounters::bump(&self.counters.retries);
+                    self.counters.observer.retried();
                 }
                 Err(failure) => return Err(failure.error),
             }
@@ -2197,6 +2253,9 @@ mod tests {
 
     use std::convert::Infallible;
     use std::sync::atomic::AtomicUsize;
+
+    use super::super::pool::recorder::Recorder;
+    use crate::observability::{ObservabilitySink, PoolEvent};
     use tokio::sync::watch;
     use tokio::task::JoinSet;
 
@@ -2707,6 +2766,115 @@ mod tests {
         assert_eq!(backend.pool_stats().retries(), 1);
         ask(&backend, "three.example.com").await.unwrap();
         assert_eq!(server.accepts(), 2);
+    }
+
+    fn observed_doh(server: &TestServer, pool: PoolConfig) -> (DohBackend, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        (
+            server.backend(
+                DohMethod::Post,
+                Duration::from_secs(5),
+                pool.observability_sink(sink),
+            ),
+            recorder,
+        )
+    }
+
+    #[tokio::test]
+    async fn pooled_doh_events_report_one_open_for_many_queries() {
+        let server = TestServer::start(Proto::H2, echo()).await;
+        let (backend, recorder) = observed_doh(&server, PoolConfig::new());
+        for i in 0..4 {
+            ask(&backend, &format!("q{i}.example.com")).await.unwrap();
+        }
+        assert_eq!(
+            recorder.events(),
+            vec![PoolEvent::ConnectionOpened {
+                transport: "doh",
+                server: format!("localhost:{}", server.addr.port()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_doh_events_report_the_close_the_retry_and_the_new_connection() {
+        let server = TestServer::start(
+            Proto::H2,
+            handler(|ctx| async move {
+                if ctx.conn == 0 && ctx.nth >= 1 {
+                    Action::Hangup
+                } else {
+                    Action::Reply(reply_to(&ctx.query))
+                }
+            }),
+        )
+        .await;
+        let (backend, recorder) = observed_doh(&server, PoolConfig::new());
+        ask(&backend, "one.example.com").await.unwrap();
+        assert_eq!(recorder.retried(), 0);
+        ask(&backend, "two.example.com").await.unwrap();
+        assert_eq!(recorder.retried(), 1);
+        assert_eq!(recorder.opened(), 2);
+        wait_for("the dead connection's close event", || {
+            !recorder.closed().is_empty()
+        })
+        .await;
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Other]);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh_events_report_a_fresh_failure_without_a_retry() {
+        let server = TestServer::start(Proto::H2, handler(|_| async { Action::Hangup })).await;
+        let (backend, recorder) = observed_doh(&server, PoolConfig::new());
+        ask(&backend, "one.example.com").await.unwrap_err();
+        assert_eq!(recorder.retried(), 0);
+        assert_eq!(recorder.opened(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh_events_report_lifetime_and_shutdown_closes() {
+        let server = TestServer::start(Proto::H2, echo()).await;
+        let (backend, lifetime) = observed_doh(
+            &server,
+            PoolConfig::new().max_lifetime(Some(Duration::from_secs(1))),
+        );
+        ask(&backend, "one.example.com").await.unwrap();
+        assert!(lifetime.closed().is_empty(), "negative control: still open");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        ask(&backend, "two.example.com").await.unwrap();
+        wait_for("the rotated connection to close", || {
+            lifetime.closed().len() == 1
+        })
+        .await;
+        assert_eq!(lifetime.closed(), vec![PoolCloseReason::Lifetime]);
+        assert_eq!(lifetime.opened(), 2);
+
+        let (backend, shutdown) = observed_doh(&server, PoolConfig::new());
+        ask(&backend, "three.example.com").await.unwrap();
+        assert!(shutdown.closed().is_empty());
+        drop(backend);
+        wait_for("the dropped backend's close event", || {
+            shutdown.closed().len() == 1
+        })
+        .await;
+        assert_eq!(shutdown.closed(), vec![PoolCloseReason::Shutdown]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_doh_pool_sink_does_not_fail_queries() {
+        let server = TestServer::start(Proto::H2, echo()).await;
+        let recorder = Recorder::panicking();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().observability_sink(sink),
+        );
+        ask(&backend, "one.example.com").await.unwrap();
+        ask(&backend, "two.example.com").await.unwrap();
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(backend.pool_stats().connections_open(), 1);
     }
 
     #[tokio::test]
@@ -3848,6 +4016,111 @@ mod tests {
             H3Counters::get(&server.counters.closed) == 1
         })
         .await;
+    }
+
+    fn observed3(server: &H3Server, pool: PoolConfig) -> (Doh3Backend, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        (
+            server.backend(
+                DohMethod::Post,
+                Duration::from_secs(5),
+                pool.observability_sink(sink),
+            ),
+            recorder,
+        )
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_events_report_one_open_for_many_queries() {
+        let server = h3_echo();
+        let (backend, recorder) = observed3(&server, PoolConfig::new());
+        for i in 0..4 {
+            ask3(&backend, &format!("q{i}.example.com")).await.unwrap();
+        }
+        assert_eq!(
+            recorder.events(),
+            vec![PoolEvent::ConnectionOpened {
+                transport: "doh3",
+                server: server.addr.to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_events_report_the_peer_close_the_retry_and_the_new_connection() {
+        let server = serve_h3(|conn, nth, _| {
+            if conn == 0 && nth == 1 {
+                H3Action::Close
+            } else {
+                H3Action::Echo(Duration::ZERO)
+            }
+        });
+        let (backend, recorder) = observed3(&server, PoolConfig::new());
+        ask3(&backend, "one.example.com").await.unwrap();
+        assert_eq!(recorder.retried(), 0);
+        ask3(&backend, "two.example.com").await.unwrap();
+        let _ = backend.pool_stats();
+        assert_eq!(recorder.opened(), 2);
+        assert_eq!(recorder.retried(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::PeerClosed]);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_events_report_a_fresh_connection_close_without_a_retry() {
+        let server = serve_h3(|_, _, _| H3Action::Close);
+        let (backend, recorder) = observed3(&server, PoolConfig::new());
+        ask3(&backend, "one.example.com").await.unwrap_err();
+        let _ = backend.pool_stats();
+        assert_eq!(recorder.retried(), 0);
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::PeerClosed]);
+    }
+
+    #[tokio::test]
+    async fn pooled_doh3_events_report_idle_lifetime_and_shutdown_closes() {
+        let server = h3_echo();
+        let (backend, idle) = observed3(
+            &server,
+            PoolConfig::new().idle_timeout(Duration::from_secs(1)),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        assert!(idle.closed().is_empty(), "negative control: still open");
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        let _ = backend.pool_stats();
+        assert_eq!(idle.closed(), vec![PoolCloseReason::Idle]);
+
+        let (backend, lifetime) = observed3(
+            &server,
+            PoolConfig::new().max_lifetime(Some(Duration::from_secs(1))),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        ask3(&backend, "two.example.com").await.unwrap();
+        assert_eq!(lifetime.closed(), vec![PoolCloseReason::Lifetime]);
+        assert_eq!(lifetime.opened(), 2);
+
+        let (backend, shutdown) = observed3(&server, PoolConfig::new());
+        ask3(&backend, "one.example.com").await.unwrap();
+        assert!(shutdown.closed().is_empty());
+        drop(backend);
+        assert_eq!(shutdown.closed(), vec![PoolCloseReason::Shutdown]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_doh3_pool_sink_does_not_fail_queries() {
+        let server = h3_echo();
+        let recorder = Recorder::panicking();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        let backend = server.backend(
+            DohMethod::Post,
+            Duration::from_secs(5),
+            PoolConfig::new().observability_sink(sink),
+        );
+        ask3(&backend, "one.example.com").await.unwrap();
+        ask3(&backend, "two.example.com").await.unwrap();
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(backend.pool_stats().connections_open(), 1);
     }
 
     #[tokio::test]

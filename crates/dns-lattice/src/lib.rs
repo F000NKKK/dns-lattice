@@ -362,6 +362,12 @@ mod facade_path_tests {
         let _: fn(&engine::Resolver, &model::Name) -> usize = engine::Resolver::purge_subtree;
         let _: fn(&engine::Resolver) -> cache::CacheStats = engine::Resolver::cache_stats;
         let _: Option<observability::CacheEvent> = None;
+        let _: Option<observability::PoolEvent> = None;
+        let _: Option<observability::PoolCloseReason> = None;
+        let _: fn(
+            upstream::PoolConfig,
+            std::sync::Arc<dyn observability::ObservabilitySink>,
+        ) -> upstream::PoolConfig = upstream::PoolConfig::observability_sink;
         let _: Option<&dyn observability::ObservabilitySink> = None;
         let _: model::Name = model::Name::root();
         let _: Option<model::DomainMatcher<()>> = Some(model::DomainMatcher::new());

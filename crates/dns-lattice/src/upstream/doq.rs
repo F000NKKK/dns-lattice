@@ -55,7 +55,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use super::pool::{Connector, Pool, PoolHooks};
 use super::quic::{
-    NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN, connection_error_to_lattice_error,
+    NO_ERROR, QuicClient, TRANSPORT_IDLE_MARGIN, closed_by_peer, connection_error_to_lattice_error,
     unspecified_like,
 };
 use super::{
@@ -201,7 +201,13 @@ impl DoqBackend {
                 connect,
             );
             DoqPool {
-                pool: Pool::new(pool, Arc::new(DoqConnector { client }), read),
+                pool: Pool::new(
+                    pool,
+                    Arc::new(DoqConnector { client }),
+                    read,
+                    "doq",
+                    &self.config.server.to_string(),
+                ),
                 read_timeout: read,
                 // The longest one call could take without reuse: connect,
                 // open the stream, write, read.
@@ -259,6 +265,10 @@ impl Connector for DoqConnector {
 
     fn close(&self, conn: &DoqConn) {
         conn.connection.close(VarInt::from_u32(NO_ERROR), &[]);
+    }
+
+    fn peer_closed(&self, conn: &DoqConn) -> bool {
+        closed_by_peer(&conn.connection)
     }
 }
 
@@ -859,6 +869,9 @@ mod tests {
     // ---- connection reuse ------------------------------------------------
 
     use std::sync::atomic::AtomicUsize;
+
+    use super::super::pool::recorder::Recorder;
+    use crate::observability::{ObservabilitySink, PoolCloseReason, PoolEvent};
     use tokio::task::JoinSet;
     use tokio::time::sleep;
 
@@ -1473,6 +1486,180 @@ mod tests {
             Counters::get(&server.counters.closed) == 1
         })
         .await;
+    }
+
+    fn observed_backend(
+        server: &Scripted,
+        client_config: RustlsClientConfig,
+        server_name: ServerName<'static>,
+        pool: PoolConfig,
+    ) -> (DoqBackend, Arc<Recorder>) {
+        let recorder = Recorder::new();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        (
+            backend_for(
+                server.addr,
+                client_config,
+                server_name,
+                pool.observability_sink(sink),
+            ),
+            recorder,
+        )
+    }
+
+    fn opened_event(server: &Scripted) -> PoolEvent {
+        PoolEvent::ConnectionOpened {
+            transport: "doq",
+            server: server.addr.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_events_report_one_open_for_many_sequential_queries() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let server = serve(server_config, |_, _, _| Action::ReplyAfter(Duration::ZERO));
+        let (backend, recorder) =
+            observed_backend(&server, client_config, server_name, PoolConfig::new());
+        for i in 0..4 {
+            backend
+                .resolve(&query_for(&format!("q{i}.example.com")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(recorder.events(), vec![opened_event(&server)]);
+    }
+
+    #[tokio::test]
+    async fn pool_events_report_the_peer_close_the_retry_and_the_new_connection() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let server = serve(server_config, |connection, stream, _| {
+            if connection == 0 && stream == 1 {
+                Action::Close
+            } else {
+                Action::ReplyAfter(Duration::ZERO)
+            }
+        });
+        let (backend, recorder) =
+            observed_backend(&server, client_config, server_name, PoolConfig::new());
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(recorder.retried(), 0);
+        backend
+            .resolve(&query_for("two.example.com"))
+            .await
+            .unwrap();
+        let _ = backend.pool_stats();
+        assert_eq!(recorder.opened(), 2);
+        assert_eq!(recorder.retried(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::PeerClosed]);
+        assert!(recorder.events().iter().all(|event| match event {
+            PoolEvent::ConnectionOpened {
+                transport,
+                server: s,
+            }
+            | PoolEvent::QueryRetried {
+                transport,
+                server: s,
+            }
+            | PoolEvent::ConnectionClosed {
+                transport,
+                server: s,
+                ..
+            } => *transport == "doq" && *s == server.addr.to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn pool_events_report_a_fresh_connection_close_without_a_retry() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let server = serve(server_config, |_, _, _| Action::Close);
+        let (backend, recorder) =
+            observed_backend(&server, client_config, server_name, PoolConfig::new());
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .unwrap_err();
+        let _ = backend.pool_stats();
+        assert_eq!(recorder.retried(), 0);
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::PeerClosed]);
+    }
+
+    #[tokio::test]
+    async fn pool_events_report_idle_lifetime_and_shutdown_closes() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let server = serve(server_config, |_, _, _| Action::ReplyAfter(Duration::ZERO));
+        let (backend, idle) = observed_backend(
+            &server,
+            client_config.clone(),
+            server_name.clone(),
+            PoolConfig::new().idle_timeout(Duration::from_secs(1)),
+        );
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .unwrap();
+        assert!(idle.closed().is_empty(), "negative control: still open");
+        sleep(Duration::from_millis(1400)).await;
+        let _ = backend.pool_stats();
+        assert_eq!(idle.closed(), vec![PoolCloseReason::Idle]);
+
+        let (backend, lifetime) = observed_backend(
+            &server,
+            client_config.clone(),
+            server_name.clone(),
+            PoolConfig::new().max_lifetime(Some(Duration::from_secs(1))),
+        );
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(1200)).await;
+        backend
+            .resolve(&query_for("two.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(lifetime.closed(), vec![PoolCloseReason::Lifetime]);
+        assert_eq!(lifetime.opened(), 2);
+
+        let (backend, shutdown) =
+            observed_backend(&server, client_config, server_name, PoolConfig::new());
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .unwrap();
+        assert!(shutdown.closed().is_empty());
+        drop(backend);
+        assert_eq!(shutdown.closed(), vec![PoolCloseReason::Shutdown]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_pool_sink_does_not_fail_queries_or_the_pool() {
+        let (server_config, client_config, server_name) = self_signed_fixture();
+        let server = serve(server_config, |_, _, _| Action::ReplyAfter(Duration::ZERO));
+        let recorder = Recorder::panicking();
+        let sink: Arc<dyn ObservabilitySink> = recorder.clone();
+        let backend = backend_for(
+            server.addr,
+            client_config,
+            server_name,
+            PoolConfig::new().observability_sink(sink),
+        );
+        // The panic in the callback of the open event must not fail the query.
+        backend
+            .resolve(&query_for("one.example.com"))
+            .await
+            .expect("a panicking sink does not fail the query");
+        backend
+            .resolve(&query_for("two.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(recorder.opened(), 1);
+        assert_eq!(backend.pool_stats().connections_open(), 1);
+        drop(backend);
+        assert_eq!(recorder.closed(), vec![PoolCloseReason::Shutdown]);
     }
 
     #[tokio::test]
