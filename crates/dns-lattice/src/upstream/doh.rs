@@ -1867,6 +1867,9 @@ mod tests {
         });
         let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
+        // Close the pooled connection so the responder does not wait for the
+        // idle timeout.
+        drop(backend);
         responder.await.unwrap();
     }
 
@@ -1895,6 +1898,9 @@ mod tests {
             .await
             .expect_err("a DoH3 response with QR=0 is rejected");
         assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        // Close the pooled connection so the responder does not wait for the
+        // idle timeout.
+        drop(backend);
         responder.await.unwrap();
     }
 
@@ -1977,6 +1983,9 @@ mod tests {
         });
         let answer = backend.resolve(&query_for("example.com")).await.unwrap();
         assert!(answer.header.qr);
+        // Close the pooled connection so the responder does not wait for the
+        // idle timeout.
+        drop(backend);
         responder.await.unwrap();
     }
 
@@ -2003,6 +2012,10 @@ mod tests {
             .await
             .expect_err("a non-2xx HTTP/3 status is a transport failure");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
+        // The pooled connection stays open after the answer and the responder
+        // waits for it to close; dropping the backend closes it at once
+        // instead of leaving the wait to the 20 second idle timeout.
+        drop(backend);
         responder.await.unwrap();
     }
 
