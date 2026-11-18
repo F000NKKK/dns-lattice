@@ -71,12 +71,9 @@ application-specific routing. DNS Lattice разделяет эти ответс
 > SemVer-дисциплине внутри линейки `1.x` — breaking change требует явного
 > мажорного бампа. Текущую версию см. в [CHANGELOG.md](CHANGELOG.md).
 
-> **Ветка разработки:** этот README также описывает ещё не выпущенные
-> изменения в `main`, включая настройки кэша, EDNS и пул соединений с
-> upstream. Примеры установки `1.1.3` запрашивают совместимую ветку 1.x,
-> начиная с 1.1.3, и не
-> гарантируют наличие этих API и возможностей. Для опубликованной версии
-> сверяйтесь с соответствующим тегом и [CHANGELOG.md](CHANGELOG.md).
+> **Версия:** примеры ниже используют ветку `1.2`, включающую настройки
+> кэша, EDNS и пул соединений с upstream. Подробности см. в соответствующем
+> теге и [CHANGELOG.md](CHANGELOG.md).
 
 ## 🌟 Ключевые возможности
 
@@ -198,7 +195,7 @@ application-specific routing. DNS Lattice разделяет эти ответс
 ```toml
 [dependencies]
 # Только UDP и TCP: без зависимостей TLS, HTTP и QUIC
-dns-lattice = "1.1.3"
+dns-lattice = "1.2.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -207,16 +204,16 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
 ```toml
 # DNS-over-TLS
-dns-lattice = { version = "1.1.3", features = ["dot"] }
+dns-lattice = { version = "1.2.0", features = ["dot"] }
 
 # DNS-over-HTTPS по HTTP/1.1, HTTP/2 и HTTP/3
-dns-lattice = { version = "1.1.3", features = ["doh"] }
+dns-lattice = { version = "1.2.0", features = ["doh"] }
 
 # DNS-over-QUIC, без HTTP-стека
-dns-lattice = { version = "1.1.3", features = ["doq"] }
+dns-lattice = { version = "1.2.0", features = ["doq"] }
 
 # Всё сразу
-dns-lattice = { version = "1.1.3", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.2.0", features = ["dot", "doh", "doq"] }
 ```
 
 - `dot` — DNS-over-TLS;

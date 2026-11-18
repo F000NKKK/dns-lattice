@@ -42,7 +42,7 @@ No Cargo features and no dependencies.
 
 ```toml
 [dependencies]
-dns-lattice-core = "1.1"
+dns-lattice-core = "1.2"
 ```
 
 ## 🎓 Quick Start

@@ -72,11 +72,9 @@ composable.
 > an explicit major version bump. See [CHANGELOG.md](CHANGELOG.md) for the
 > current version.
 
-> **Development branch:** this README also describes unreleased changes on
-> `main`, including configurable cache, EDNS controls, and upstream connection
-> pooling. The `1.1.3` installation examples request the compatible 1.x line
-> starting at 1.1.3 and do not guarantee those APIs or behaviors. Consult the matching release tag
-> and [CHANGELOG.md](CHANGELOG.md) when integrating a published version.
+> **Version:** the examples below target the `1.2` line, which includes
+> configurable cache, EDNS controls and upstream connection pooling. Consult
+> the matching release tag and [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## 🌟 Key Features
 
@@ -194,7 +192,7 @@ progress. No numbers are published yet; its results table will appear here.
 ```toml
 [dependencies]
 # UDP and TCP only: no TLS, HTTP, or QUIC dependencies
-dns-lattice = "1.1.3"
+dns-lattice = "1.2.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -203,16 +201,16 @@ default-off:
 
 ```toml
 # DNS-over-TLS
-dns-lattice = { version = "1.1.3", features = ["dot"] }
+dns-lattice = { version = "1.2.0", features = ["dot"] }
 
 # DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3
-dns-lattice = { version = "1.1.3", features = ["doh"] }
+dns-lattice = { version = "1.2.0", features = ["doh"] }
 
 # DNS-over-QUIC, without the HTTP stack
-dns-lattice = { version = "1.1.3", features = ["doq"] }
+dns-lattice = { version = "1.2.0", features = ["doq"] }
 
 # Everything
-dns-lattice = { version = "1.1.3", features = ["dot", "doh", "doq"] }
+dns-lattice = { version = "1.2.0", features = ["dot", "doh", "doq"] }
 ```
 
 - `dot` — DNS-over-TLS;

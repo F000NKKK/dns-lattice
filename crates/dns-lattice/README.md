@@ -50,17 +50,16 @@ modules; flat root aliases are intentionally not exposed:
 
 ## 📦 Installation
 
-This README describes the development branch, including unreleased cache,
-EDNS and connection-pooling APIs. The published `1.1` dependency may not
-contain those changes; consult the matching release tag and changelog.
+Version `1.2` includes the cache, EDNS and connection-pooling APIs described
+here. Consult the matching release tag and changelog when using another version.
 
 ```toml
 [dependencies]
-dns-lattice = "1.1"
+dns-lattice = "1.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
 # Encrypted transports are opt-in:
-# dns-lattice = { version = "1.1", features = ["dot", "doh", "doq"] }
+# dns-lattice = { version = "1.2", features = ["dot", "doh", "doq"] }
 ```
 
 Features are independent and default-off; without any of them the crate builds UDP and TCP,
