@@ -11,7 +11,7 @@
 [![Downloads](https://img.shields.io/crates/d/dns-lattice.svg?cacheSeconds=86400)](https://crates.io/crates/dns-lattice)
 [![CI](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/F000NKKK/dns-lattice/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99-lightgrey.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.100-lightgrey.svg)](Cargo.toml)
 
 ![Linux](https://img.shields.io/badge/Linux-supported-success)
 ![Windows](https://img.shields.io/badge/Windows-supported-success)
@@ -715,7 +715,7 @@ privileged-port setup.
 
 ## ✅ Feature and Platform Constraints
 
-MSRV: **Rust 1.99**.
+MSRV: **Rust 1.100**.
 
 CI validates the supported facade surface on:
 

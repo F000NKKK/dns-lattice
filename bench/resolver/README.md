@@ -21,7 +21,7 @@ same harness.
 
 ## Requirements
 
-- Rust 1.99 or newer (the dns-lattice MSRV).
+- Rust 1.100 or newer (the dns-lattice MSRV).
 - Any platform for the micro-benchmarks. No privileges and no network
   access are needed: everything runs in-process.
 - Linux for the client benchmark's CPU and memory figures (they read

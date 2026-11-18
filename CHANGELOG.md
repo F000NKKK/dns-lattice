@@ -143,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the workspace and resolver benchmark MSRV to Rust 1.100.
 - `Doh3Backend` now keeps a bounded pool of persistent HTTP/3 connections on
   one shared UDP socket and sends each query as its own request, multiplexed
   with the others, instead of binding a socket and handshaking a connection
