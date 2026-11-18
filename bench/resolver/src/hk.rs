@@ -8,9 +8,10 @@
 //!   against a responder that drops everything);
 //! - `timeout` equal to the dns-lattice per-query timeout (default 2 s);
 //! - `edns0` with a 1232-byte payload;
-//! - `max_active_requests = 256`, at least the highest concurrency, so
-//!   hickory's default of 32 per multiplexed connection never produces
-//!   busy errors;
+//! - `max_active_requests = 256`, at least the highest concurrency, avoiding
+//!   busy errors from that limit. Hickory's separate bounded request and
+//!   write queues can still report `busy` or `channel-full` during a burst;
+//!   both are counted, not retried;
 //! - `num_concurrent_reqs = 1`, `try_tcp_on_error = false`,
 //!   `case_randomization = false`, the hosts file disabled, and no system
 //!   configuration is read;

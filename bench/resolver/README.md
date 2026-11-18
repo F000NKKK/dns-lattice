@@ -95,6 +95,9 @@ query completed, more than 0.1% of the queries failed, in a warm run the
 upstream saw any query during the measurement, or in a cold run the
 upstream saw fewer queries than the client completed (beyond a slack of
 `--concurrency` in-flight queries at the window edges).
+Invalid rows retain their measurements and error counts for diagnosis, but
+are not valid comparable benchmark results and must not be used to claim a
+throughput or latency advantage.
 
 Scenarios (`variants.tsv`):
 
@@ -111,7 +114,7 @@ Fairness settings, identical for both libraries:
 | Attempts | One. dns-lattice never retries a backend; hickory's `attempts` counts retries, so it is set to `0` (a test checks that this sends exactly one query). |
 | Timeout | 2 s per query. |
 | EDNS(0) | On, 1232-byte payload, on every transport. |
-| Concurrency limit | hickory `max_active_requests = 256`, at least the highest concurrency, so its default of 32 cannot produce busy errors. |
+| Concurrency limit | hickory `max_active_requests = 256`, at least the highest concurrency; its separate bounded queues can still reject bursts. |
 | TLS | One client configuration (aws-lc-rs, default protocol versions, only the fixture CA trusted). |
 | Answer cache | Each library's default. |
 | hickory | `num_concurrent_reqs = 1`, no TCP retry on error, no 0x20 case randomization, hosts file off, one name server. |
@@ -129,11 +132,11 @@ worker. On DoH over HTTP/3 it keeps the same kind of pool of QUIC connections
 and sends each query as its own request on them. The responder counters in
 each result show the connection counts, so every pooled-transport row compares two
 pooling designs, not only two codecs and runtimes. hickory's pooled connections
-also have a bounded request queue (32 slots); a burst of more than 32
-simultaneous requests onto one already-established connection fails with
-a "channel is full" error that the client binary reports under its own
-label, not as busy. The closed-loop scenarios do not hit it at
-concurrency 256.
+also have bounded request and write queues (32 slots). Bursty scheduling,
+including after warm-up, can cause `busy` or `channel-full` outcomes even
+in a closed-loop run at concurrency 256. These errors remain in the
+reported outcomes and latency statistics; the harness neither retries nor
+discards them. Compare failure counts as well as throughput and latency.
 
 ## Running
 

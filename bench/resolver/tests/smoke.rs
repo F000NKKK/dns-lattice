@@ -322,9 +322,9 @@ async fn concurrent<C: Contestant>(contestant: Arc<C>, count: u32) -> Vec<Outcom
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn hickory_with_the_harness_options_has_no_busy_errors_at_concurrency_256() {
-    // The responder holds every answer for 100 ms, so all 256 lookups are
-    // in flight at once on the one pooled DoT connection.
+async fn hickory_closed_loop_accounts_for_queue_saturation_at_concurrency_256() {
+    // The responder holds every answer for 100 ms, sustaining pressure from
+    // 256 workers on the one pooled DoT connection.
     let env = start(ResponderConfig {
         latency: Duration::from_millis(100),
         ..ResponderConfig::default()
@@ -350,13 +350,25 @@ async fn hickory_with_the_harness_options_has_no_busy_errors_at_concurrency_256(
     )
     .await;
     assert!(stats.queries > 0);
+    // Hickory's fixed-size request and stream write queues may reject a
+    // burst even with max_active_requests set to 256. These failures remain
+    // part of the measurement; do not retry or discard them. Other failure
+    // modes would indicate that this loopback scenario itself is broken.
+    let channel_full = stats
+        .outcomes
+        .errors
+        .get("channel-full")
+        .copied()
+        .unwrap_or(0);
+    let busy = stats.outcomes.errors.get("busy").copied().unwrap_or(0);
+    assert!(stats.outcomes.ok > 0, "{:?}", stats.outcomes);
     assert_eq!(
-        stats.outcomes.errors.get("busy").copied().unwrap_or(0),
-        0,
+        stats.outcomes.failures(),
+        channel_full + busy,
         "{:?}",
         stats.outcomes
     );
-    assert_eq!(stats.outcomes.failures(), 0, "{:?}", stats.outcomes);
+    assert_eq!(stats.outcomes.ok + channel_full + busy, stats.queries);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -482,6 +494,56 @@ fn run_client(binary: &str, args: &[String]) -> (bool, serde_json::Value) {
         )
     });
     (output.status.success(), result)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_with_more_than_one_per_thousand_failures_is_invalid() {
+    let env = start(ResponderConfig {
+        drop_every: 1,
+        ..ResponderConfig::default()
+    })
+    .await;
+    let ca = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("smoke-ca-dropped.der");
+    std::fs::write(&ca, &env.ca_der).unwrap();
+    let args: Vec<String> = [
+        "--proto",
+        "udp",
+        "--port",
+        &env.responder.ports().udp.to_string(),
+        "--ca",
+        ca.to_str().unwrap(),
+        "--concurrency",
+        "2",
+        "--warmup",
+        "0.1",
+        "--duration",
+        "0.3",
+        "--timeout-ms",
+        "30",
+        "--names",
+        "4",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect();
+    let (ok, result) =
+        tokio::task::spawn_blocking(move || run_client(env!("CARGO_BIN_EXE_dl-client"), &args))
+            .await
+            .unwrap();
+    assert!(!ok, "{result}");
+    assert_eq!(result["valid"], false, "{result}");
+    assert!(
+        result["stats"]["outcomes"]["timeout"].as_u64().unwrap() > 0,
+        "{result}"
+    );
+    assert!(
+        result["invalid_reason"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| { reason.as_str().unwrap().contains("more than 0.1%") }),
+        "{result}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

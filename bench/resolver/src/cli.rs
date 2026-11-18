@@ -363,7 +363,7 @@ where
         invalid.push("no query completed".to_string());
     }
     let failures = stats.outcomes.failures();
-    if stats.queries > 0 && failures * 1000 > stats.queries {
+    if failure_limit_exceeded(stats.queries, failures) {
         invalid.push(format!(
             "{failures} of {} queries failed (more than 0.1%)",
             stats.queries
@@ -416,6 +416,10 @@ where
     Ok(result)
 }
 
+fn failure_limit_exceeded(queries: u64, failures: u64) -> bool {
+    queries > 0 && u128::from(failures) * 1000 > u128::from(queries)
+}
+
 /// Validity rule for a cold run: every client query uses a fresh name, so
 /// the responder must have seen at least as many queries as the client
 /// completed. Fewer means some answers were served without reaching the
@@ -446,6 +450,15 @@ fn cold_shortfall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_limit_is_strictly_above_one_per_thousand() {
+        assert!(!failure_limit_exceeded(0, 0));
+        assert!(!failure_limit_exceeded(1_000, 1));
+        assert!(failure_limit_exceeded(999, 1));
+        assert!(failure_limit_exceeded(1_000, 2));
+        assert!(failure_limit_exceeded(u64::MAX, u64::MAX));
+    }
 
     #[test]
     fn a_cold_run_with_fewer_responder_queries_than_client_queries_is_invalid() {
