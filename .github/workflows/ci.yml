@@ -25,7 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.100.0"
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: Check workspace at MSRV
         run: cargo check --workspace --all-features
 
@@ -53,7 +53,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: cargo check -p dns-lattice ${{ matrix.feature.cargo_args }}
         run: cargo check -p dns-lattice ${{ matrix.feature.cargo_args }}
@@ -78,7 +78,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       # Build and list each publishable archive from the checkout. This
       # checks the crate-local README/package boundary reproducibly without
@@ -106,7 +106,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -145,7 +145,7 @@ jobs:
 
       # rust-cache's workspace mapping is `<workspace> -> <target dir>`,
       # relative to the workspace, so it saves the directory set above.
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: bench-resolver
           workspaces: bench/resolver -> ../../target/bench-resolver
