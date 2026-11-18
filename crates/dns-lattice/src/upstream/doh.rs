@@ -3334,7 +3334,12 @@ mod tests {
         }
         while let Some(done) = set.join_next().await {
             let err = done.unwrap().unwrap_err();
-            assert!(matches!(err, Error::Transport(_)), "{err:?}");
+            // Under contention, a request can exhaust its deadline while
+            // waiting for admission before it attempts the refused connection.
+            assert!(
+                matches!(err, Error::Transport(_) | Error::Timeout),
+                "{err:?}"
+            );
         }
         let stats = backend.pool_stats();
         assert_eq!((stats.in_flight(), stats.connections_open()), (0, 0));
