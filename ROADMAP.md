@@ -138,9 +138,7 @@ Status: done; prepared for the 0.6.0 release
 - English/Russian public documentation, crate READMEs, CHANGELOG, SECURITY,
   SUPPORT, CONTRIBUTING, architecture/status summaries, and release guidance
   are reconciled as part of the stage-0.6 release preparation.
-- No implementation work remains in stage 0.6. The remaining release action
-  is the mechanical version bump/publication performed by the repository
-  release script.
+- Stage 0.6 is complete and was released; later work is tracked separately.
 
 ## Stage 1.0 — Stable public API and first stable release
 

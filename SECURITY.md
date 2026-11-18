@@ -110,7 +110,7 @@ Reports involving any of the following are in scope:
   hang, or bypass the resolver policy;
 - an inbound UDP answer larger than the documented limit (512 bytes for a
   client without EDNS(0), otherwise the smaller of the client's advertised
-  payload size and the configured server maximum), which would increase
+  payload size raised to at least 512 and the configured server maximum), which would increase
   reflection amplification; operators who want the smallest UDP answers can
   set the server maximum to 512;
 - Fake IP allocation, eviction, reverse lookup, snapshot restoration, or

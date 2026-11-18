@@ -48,6 +48,10 @@ No Cargo features. Its only dependency is
 
 ## 📦 Installation
 
+This README describes the development branch. In particular, the EDNS API
+described above is unreleased and is not included in version `1.1.3`; consult
+the README at the corresponding release tag when using a published version.
+
 ```toml
 [dependencies]
 dns-lattice-model = "1.1"

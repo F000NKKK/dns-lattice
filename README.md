@@ -72,6 +72,12 @@ composable.
 > an explicit major version bump. See [CHANGELOG.md](CHANGELOG.md) for the
 > current version.
 
+> **Development branch:** this README also describes unreleased changes on
+> `main`, including configurable cache, EDNS controls, and upstream connection
+> pooling. The `1.1.3` installation examples request the compatible 1.x line
+> starting at 1.1.3 and do not guarantee those APIs or behaviors. Consult the matching release tag
+> and [CHANGELOG.md](CHANGELOG.md) when integrating a published version.
+
 ## 🌟 Key Features
 
 ### Resolution
@@ -854,7 +860,7 @@ the port.
 
 The inbound UDP listener answers a client without an EDNS0 OPT record with at
 most 512 bytes, and an EDNS0 client with at most the smaller of its advertised
-payload size and the server maximum (1232 bytes by default,
+payload size (raised to at least 512) and the server maximum (1232 bytes by default,
 `ServerBuilder::edns_udp_payload_size`). For a larger answer it sends an empty,
 truncated response (keeping the OPT record for an EDNS0 client) and the client
 is expected to retry over TCP; also listen on TCP (`tcp_addr`) at the same

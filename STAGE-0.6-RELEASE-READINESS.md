@@ -1,5 +1,9 @@
 # DNS Lattice stage 0.6 release readiness
 
+> Historical record from before the 0.6.0 publication. Its pending-release
+> and next-milestone statements describe that date, not the current project
+> status; see [CHANGELOG.md](CHANGELOG.md) and [ROADMAP.md](ROADMAP.md).
+
 Date: 2026-08-15
 Baseline implementation commit: `bcc751b1eca45439d64335d174bc293aa6def0ce`
 Verified GitHub Actions run: `31821041466` (`CI`, `main`)

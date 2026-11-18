@@ -2,8 +2,8 @@ name: CI
 
 # Cross-platform baseline CI: the all-feature matrix covers the implemented
 # upstream transports and inbound listeners on the three supported platforms.
-# Stage 0.6 still adds hardening work such as coverage, fuzz/property, and
-# dedicated privileged jobs; see net-lattice's workflow for that pattern.
+# The workflow includes feature-matrix, rustdoc, packaging and release-script
+# checks. See the roadmap for completed hardening and outstanding work.
 
 on:
   push:

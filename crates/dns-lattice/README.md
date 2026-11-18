@@ -50,6 +50,10 @@ modules; flat root aliases are intentionally not exposed:
 
 ## 📦 Installation
 
+This README describes the development branch, including unreleased cache,
+EDNS and connection-pooling APIs. The published `1.1` dependency may not
+contain those changes; consult the matching release tag and changelog.
+
 ```toml
 [dependencies]
 dns-lattice = "1.1"
@@ -217,7 +221,7 @@ Names are given as backend type / `ServerBuilder` listener method. The TCP, DoT,
 (HTTP/1.1 and HTTP/2), DoH3 and DoQ clients reuse connections by default (`PoolConfig`); the UDP
 client opens a fresh socket per query. The host provides TLS/QUIC server configuration
 and certificate material for the listeners. The inbound UDP listener answers an EDNS(0) client
-with up to min(its advertised payload size, 1232 bytes) — `ServerBuilder::edns_udp_payload_size`
+with up to min(max(its advertised payload size, 512), 1232 bytes) — `ServerBuilder::edns_udp_payload_size`
 changes the maximum, never below 512 — and a plain client with up to 512 bytes; larger answers
 are truncated (`TC=1`) for a TCP retry. Malformed OPT records get a local `FORMERR` that carries a
 bare server OPT record (RFC 6891 §7), and EDNS versions above 0 a local `BADVERS`. Contract details:
