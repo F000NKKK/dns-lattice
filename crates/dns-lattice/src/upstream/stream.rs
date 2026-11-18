@@ -48,7 +48,9 @@
 //! connection is plausible), the failure is at connection level (the peer
 //! closed or reset it, or a write failed), the opcode is `QUERY` and the
 //! call's deadline has not passed. Timeouts, TLS errors, validation
-//! mismatches and undecodable answers are never retried.
+//! mismatches and undecodable answers that identify a waiting query are never
+//! retried. A frame too short to identify its query closes the connection;
+//! its waiters follow the connection-level retry rule.
 //!
 //! # Bounds
 //!
@@ -357,7 +359,7 @@ fn dispatch(shared: &ConnShared, hooks: &PoolHooks, frame: &[u8]) -> bool {
         taken
     };
     match taken {
-        Taken::Pending(waiter) => match Message::decode(frame) {
+        Taken::Pending(waiter) => match super::decode_upstream_response(frame) {
             Ok(message) => {
                 shared.answered.store(true, Ordering::Release);
                 let _ = waiter.tx.send(Ok(message));
@@ -366,7 +368,7 @@ fn dispatch(shared: &ConnShared, hooks: &PoolHooks, frame: &[u8]) -> bool {
             Err(err) => {
                 // The peer sends garbage: do not trust the rest of the
                 // stream. Only the query this frame answered receives the
-                // decode error; the other queries on the connection were
+                // transport error; the other queries on the connection were
                 // healthy and see a lost connection, which the retry rule
                 // and failover treat as retryable.
                 let _ = waiter.tx.send(Err(Failure::terminal(err)));
@@ -1283,7 +1285,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_undecodable_answer_fails_only_its_query_with_the_decode_error_and_closes() {
+    async fn an_undecodable_answer_fails_only_its_query_with_a_transport_error_and_closes() {
         // The server echoes the wire id it received, with a body too short
         // to be a DNS message (a 5-byte frame).
         let garbage = script(|_, mut s| async move {
@@ -1295,10 +1297,7 @@ mod tests {
         });
         let h = harness(PoolConfig::new(), garbage);
         let err = h.ask("a.example").await.unwrap_err();
-        assert!(
-            matches!(err, Error::Truncated { .. } | Error::CountMismatch),
-            "{err:?}"
-        );
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
         assert_eq!(h.stats().retries(), 0, "decode errors are never retried");
         assert_eq!(h.stats().connections_open(), 0);
     }
@@ -1336,8 +1335,8 @@ mod tests {
         });
         let x = x.await.unwrap().unwrap_err();
         assert!(
-            matches!(x, Error::Truncated { .. } | Error::CountMismatch),
-            "the offender gets the decode error: {x:?}"
+            matches!(x, Error::Transport(_)),
+            "the offender gets a transport error: {x:?}"
         );
         let y = y
             .await

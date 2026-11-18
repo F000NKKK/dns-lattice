@@ -1497,7 +1497,7 @@ fn is_connection_level(err: &(dyn std::error::Error + 'static)) -> bool {
 /// differs from the caller's query id. The returned response carries the
 /// caller's query id, so it can be relayed to the original client as is.
 fn decode_validated(query: &Message, body: &[u8]) -> Result<Message> {
-    let mut response = Message::decode(body)?;
+    let mut response = super::decode_upstream_response(body)?;
     validate_response(query, &response, IdCheck::Ignore)?;
     response.header.id = query.header.id;
     Ok(response)
@@ -1588,6 +1588,12 @@ mod tests {
             authorities: vec![],
             additionals: vec![],
         }
+    }
+
+    #[test]
+    fn undecodable_doh_body_is_a_transport_error() {
+        let error = decode_validated(&query_for("example.com"), &[0, 1, 0]).unwrap_err();
+        assert!(matches!(error, Error::Transport(_)), "{error:?}");
     }
 
     fn answer_for(name: &str, id: u16) -> Message {
@@ -2993,7 +2999,7 @@ mod tests {
                     );
                 }
                 "garbage.example.com" => {
-                    assert!(matches!(result, Err(Error::Truncated { .. })), "{result:?}");
+                    assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
                 }
                 _ => {
                     result.unwrap();
@@ -3011,6 +3017,49 @@ mod tests {
             1,
             "bad answers leave the connection alone"
         );
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_over_on_malformed_doh_with_and_without_pool() {
+        use crate::engine::Resolver;
+        use dns_lattice_model::{SplitDnsPolicy, UpstreamGroupId};
+
+        for proto in [Proto::H1, Proto::H2] {
+            for pooled in [false, true] {
+                let bad = TestServer::start(proto, handler(|_| async { Action::Garbage })).await;
+                let good = TestServer::start(proto, echo()).await;
+                let pool = || {
+                    if pooled {
+                        PoolConfig::new()
+                    } else {
+                        PoolConfig::disabled()
+                    }
+                };
+                let group = UpstreamGroupId::new("default");
+                let policy = SplitDnsPolicy::builder()
+                    .default_group(group.clone())
+                    .build();
+                let resolver = Resolver::builder(policy)
+                    .backend(
+                        group.clone(),
+                        bad.backend(DohMethod::Post, Duration::from_secs(5), pool()),
+                    )
+                    .backend(
+                        group,
+                        good.backend(DohMethod::Post, Duration::from_secs(5), pool()),
+                    )
+                    .build();
+                let query = query_for("example.com");
+                let answer = resolver.resolve(&query).await.unwrap();
+                assert_eq!(answer.questions, query.questions);
+                assert_eq!(
+                    bad.requests(),
+                    1,
+                    "malformed answer must not be retried locally"
+                );
+                assert_eq!(good.requests(), 1, "resolver must consult the next backend");
+            }
+        }
     }
 
     #[tokio::test]
@@ -3389,6 +3438,8 @@ mod tests {
         Echo(Duration),
         /// Answers with this message.
         Reply(Message),
+        /// Sends a successful HTTP response with an invalid DNS body.
+        Garbage,
         /// Answers with this HTTP status and no body.
         Status(u16),
         /// Closes the connection without answering.
@@ -3499,6 +3550,7 @@ mod tests {
                 respond(&mut stream, 200, reply_to(&query).encode().unwrap()).await
             }
             H3Action::Reply(message) => respond(&mut stream, 200, message.encode().unwrap()).await,
+            H3Action::Garbage => respond(&mut stream, 200, vec![0xde, 0xad]).await,
             H3Action::Status(status) => respond(&mut stream, status, Vec::new()).await,
             H3Action::Close => {
                 connection.close(7u32.into(), b"scripted close");
@@ -3626,6 +3678,43 @@ mod tests {
         assert_eq!(answer.questions, query.questions, "answer to another query");
         assert_eq!(answer.header.id, query.header.id);
         Ok(answer)
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_over_on_malformed_doh3_with_and_without_pool() {
+        use crate::engine::Resolver;
+        use dns_lattice_model::{SplitDnsPolicy, UpstreamGroupId};
+
+        for pooled in [false, true] {
+            let bad = serve_h3(|_, _, _| H3Action::Garbage);
+            let good = h3_echo();
+            let pool = || {
+                if pooled {
+                    PoolConfig::new()
+                } else {
+                    PoolConfig::disabled()
+                }
+            };
+            let group = UpstreamGroupId::new("default");
+            let policy = SplitDnsPolicy::builder()
+                .default_group(group.clone())
+                .build();
+            let resolver = Resolver::builder(policy)
+                .backend(
+                    group.clone(),
+                    bad.backend(DohMethod::Post, Duration::from_secs(5), pool()),
+                )
+                .backend(
+                    group,
+                    good.backend(DohMethod::Post, Duration::from_secs(5), pool()),
+                )
+                .build();
+            let query = query_for("example.com");
+            let answer = resolver.resolve(&query).await.unwrap();
+            assert_eq!(answer.questions, query.questions);
+            assert_eq!(H3Counters::get(&bad.counters.requests), 1);
+            assert_eq!(H3Counters::get(&good.counters.requests), 1);
+        }
     }
 
     #[tokio::test]

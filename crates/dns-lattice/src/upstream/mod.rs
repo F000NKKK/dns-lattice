@@ -31,7 +31,8 @@
 //! return the response with the caller's query id. [`UdpBackend`] drops a
 //! datagram that does not decode or does not match, and keeps waiting until
 //! its timeout expires; the stream-based backends return
-//! [`Error::Transport`] for a mismatch, which the resolver fails over on.
+//! [`Error::Transport`] for a mismatch or an undecodable answer, which the
+//! resolver fails over on.
 //!
 //! # DoT, DoH, and DoQ (feature-gated)
 //!
@@ -448,9 +449,10 @@ pub struct TcpBackendConfig {
 /// A query is sent again, once, on a fresh connection when the pooled
 /// connection it used had already answered a query and then failed at the
 /// connection level (the server closed or reset it) and the query's opcode
-/// is `QUERY`. Timeouts, validation mismatches and undecodable answers are
-/// never retried, and the error classes are the ones the backend always
-/// returned.
+/// is `QUERY`. Timeouts, validation mismatches and undecodable answers that
+/// identify a waiting query are never retried locally. A frame too short to
+/// identify its query closes the connection, so its waiters follow the
+/// connection-level retry rule.
 ///
 /// A response is accepted only for a query that is waiting for it. A frame
 /// that matches no waiting query (for example a response with a different
@@ -636,7 +638,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     write_framed(stream, budget, query).await?;
-    let response = read_framed(stream, budget).await?;
+    let response = decode_upstream_response(&read_framed_bytes(stream, budget).await?)?;
     validate_response(query, &response, id_check)?;
     Ok(response)
 }
@@ -690,6 +692,15 @@ pub(crate) async fn read_framed<S>(stream: &mut S, budget: Duration) -> Result<M
 where
     S: tokio::io::AsyncRead + Unpin,
 {
+    Message::decode(&read_framed_bytes(stream, budget).await?)
+}
+
+/// Reads a framed payload without deciding whether it is an inbound query or
+/// an upstream response; those two cases have different error contracts.
+pub(crate) async fn read_framed_bytes<S>(stream: &mut S, budget: Duration) -> Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 2];
     timeout(budget, stream.read_exact(&mut len_buf))
         .await
@@ -703,7 +714,13 @@ where
         .map_err(|_| Error::Timeout)?
         .map_err(|err| Error::Transport(err.to_string()))?;
 
-    Message::decode(&response_buf)
+    Ok(response_buf)
+}
+
+/// A malformed response is an upstream failure, not a caller-input error.
+fn decode_upstream_response(bytes: &[u8]) -> Result<Message> {
+    Message::decode(bytes)
+        .map_err(|err| Error::Transport(format!("undecodable upstream response: {err}")))
 }
 
 #[cfg(test)]
@@ -1562,6 +1579,73 @@ mod tests {
         drop(resolver);
         bad_responder.await.unwrap();
         good_responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_over_on_undecodable_tcp_response_with_and_without_pool() {
+        use crate::engine::Resolver;
+        use dns_lattice_model::{SplitDnsPolicy, UpstreamGroupId};
+
+        for pooled in [false, true] {
+            let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bad_addr = bad.local_addr().unwrap();
+            let bad_responder = tokio::spawn(async move {
+                let (mut stream, _) = bad.accept().await.unwrap();
+                let mut length = [0; 2];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut query = vec![0; u16::from_be_bytes(length) as usize];
+                stream.read_exact(&mut query).await.unwrap();
+                // Include the wire ID so a pooled connection can identify
+                // the affected query, but leave the message incomplete.
+                stream
+                    .write_all(&[0, 5, query[0], query[1], 0, 0, 0])
+                    .await
+                    .unwrap();
+            });
+            let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let good_addr = good.local_addr().unwrap();
+            let good_responder = tokio::spawn(serve_one_tcp_response(good, |query| {
+                answer_for("example.com", query.header.id)
+            }));
+            let tcp = |server| {
+                let backend = TcpBackend::new(TcpBackendConfig {
+                    server,
+                    connect_timeout: Duration::from_secs(2),
+                    read_timeout: Duration::from_secs(2),
+                });
+                if pooled {
+                    backend
+                } else {
+                    backend.with_pool(PoolConfig::disabled())
+                }
+            };
+            let group = UpstreamGroupId::new("default");
+            let policy = SplitDnsPolicy::builder()
+                .default_group(group.clone())
+                .build();
+            let resolver = Resolver::builder(policy)
+                .backend(group.clone(), tcp(bad_addr))
+                .backend(group, tcp(good_addr))
+                .build();
+            let answer = resolver.resolve(&query_for("example.com")).await.unwrap();
+            assert_eq!(answer.questions, query_for("example.com").questions);
+            drop(resolver);
+            bad_responder.await.unwrap();
+            good_responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_framed_decode_preserves_the_parse_error() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(&[0, 5, 0, 1, 0, 0, 0]).await.unwrap();
+        let error = read_framed(&mut reader, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Truncated { .. } | Error::CountMismatch),
+            "{error:?}"
+        );
     }
 
     // ---- pooled TCP over loopback ---------------------------------------------

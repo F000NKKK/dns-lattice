@@ -59,7 +59,8 @@ use super::quic::{
     unspecified_like,
 };
 use super::{
-    IdCheck, PoolConfig, PoolStats, UpstreamBackend, framed_query, read_framed, validate_response,
+    IdCheck, PoolConfig, PoolStats, UpstreamBackend, decode_upstream_response, framed_query,
+    read_framed_bytes, validate_response,
 };
 
 /// The ALPN protocol identifier for DNS-over-QUIC (RFC 9250 §4.1.1).
@@ -408,22 +409,29 @@ impl DoqPool {
         let exchanged = timeout_at(deadline, async {
             timeout(self.read_timeout, guard.stream.write_all(framed))
                 .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|err| Error::Transport(err.to_string()))?;
-            let answer = read_framed(&mut guard.stream, self.read_timeout).await?;
-            validate_response(query, &answer, IdCheck::Ignore)?;
-            Ok::<Message, Error>(answer)
+                .map_err(|_| (Error::Timeout, false))?
+                .map_err(|err| (Error::Transport(err.to_string()), false))?;
+            let payload = read_framed_bytes(&mut guard.stream, self.read_timeout)
+                .await
+                .map_err(|err| (err, false))?;
+            let answer = decode_upstream_response(&payload).map_err(|err| (err, true))?;
+            validate_response(query, &answer, IdCheck::Ignore).map_err(|err| (err, false))?;
+            Ok::<Message, (Error, bool)>(answer)
         })
         .await;
         match exchanged {
-            Err(_) | Ok(Err(Error::Timeout)) => {
+            Err(_) | Ok(Err((Error::Timeout, _))) => {
                 drop(guard);
                 lease.note_timeout();
                 Err(AttemptError::final_(Error::Timeout))
             }
-            Ok(Err(err)) => {
+            Ok(Err((err, terminal))) => {
                 drop(guard);
-                Err(failed(err))
+                let mut failure = failed(err);
+                if terminal {
+                    failure.retry = false;
+                }
+                Err(failure)
             }
             Ok(Ok(mut answer)) => {
                 guard.finish();
@@ -678,6 +686,43 @@ mod tests {
             .expect("doq backend resolves");
         assert!(answer.header.qr);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_doq_answer_is_transport_error_with_and_without_pool() {
+        for pooled in [false, true] {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let connection = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                let mut len = [0; 2];
+                recv.read_exact(&mut len).await.unwrap();
+                let mut query = vec![0; u16::from_be_bytes(len) as usize];
+                recv.read_exact(&mut query).await.unwrap();
+                send.write_all(&[0, 5, 0, 0, 0, 0, 0]).await.unwrap();
+                send.finish().unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+            });
+            let mut backend = DoqBackend::new(DoqBackendConfig {
+                server: addr,
+                server_name,
+                tls_config: Arc::new(client_config),
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            });
+            if !pooled {
+                backend = backend.with_pool(PoolConfig::disabled());
+            }
+            let error = backend
+                .resolve(&query_for("example.com"))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Transport(_)), "{error:?}");
+            assert_eq!(backend.pool_stats().retries(), 0);
+            responder.await.unwrap();
+        }
     }
 
     /// Accepts one QUIC connection and one bidirectional stream, reads one

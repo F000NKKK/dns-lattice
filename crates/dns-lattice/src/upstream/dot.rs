@@ -105,8 +105,9 @@ impl DotBackendConfig {
 /// connection it used had already answered a query and then failed at the
 /// connection level (the server closed or reset it) and the query's opcode
 /// is `QUERY`. Timeouts, TLS errors, validation mismatches and undecodable
-/// answers are never retried, and the error classes are the ones the
-/// backend always returned. A response is accepted only for a query that is
+/// answers that identify a waiting query are never retried locally. A frame
+/// too short to identify its query closes the connection, so its waiters follow
+/// the connection-level retry rule. A response is accepted only for a query that is
 /// waiting for it: a frame that matches no waiting query (for example a
 /// response with a different message id) is dropped, so such a reply leaves
 /// the query to time out instead of being reported as [`Error::Transport`],
@@ -390,6 +391,76 @@ mod tests {
             .expect("dot backend resolves");
         assert!(answer.header.qr);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_fails_over_on_malformed_dot_with_and_without_pool() {
+        use crate::engine::Resolver;
+        use crate::upstream::{TcpBackend, TcpBackendConfig};
+        use dns_lattice_model::{SplitDnsPolicy, UpstreamGroupId};
+
+        for pooled in [false, true] {
+            let (server_config, client_config, server_name) = self_signed_fixture();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let acceptor = TlsAcceptor::from(Arc::new(server_config));
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(stream).await.unwrap();
+                let mut len = [0; 2];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut query = vec![0; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut query).await.unwrap();
+                stream
+                    .write_all(&[0, 5, query[0], query[1], 0, 0, 0])
+                    .await
+                    .unwrap();
+            });
+            let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let good_addr = good.local_addr().unwrap();
+            let good_responder = tokio::spawn(async move {
+                let (mut stream, _) = good.accept().await.unwrap();
+                let mut len = [0; 2];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut bytes = vec![0; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let query = Message::decode(&bytes).unwrap();
+                let reply = answer_for("example.com", query.header.id).encode().unwrap();
+                stream
+                    .write_all(&(reply.len() as u16).to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&reply).await.unwrap();
+            });
+            let mut bad = DotBackend::new(DotBackendConfig {
+                server: addr,
+                server_name,
+                tls_config: Arc::new(client_config),
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            });
+            if !pooled {
+                bad = bad.with_pool(PoolConfig::disabled());
+            }
+            let good = TcpBackend::new(TcpBackendConfig {
+                server: good_addr,
+                connect_timeout: Duration::from_secs(2),
+                read_timeout: Duration::from_secs(2),
+            });
+            let group = UpstreamGroupId::new("default");
+            let policy = SplitDnsPolicy::builder()
+                .default_group(group.clone())
+                .build();
+            let resolver = Resolver::builder(policy)
+                .backend(group.clone(), bad)
+                .backend(group, good)
+                .build();
+            let answer = resolver.resolve(&query_for("example.com")).await.unwrap();
+            assert_eq!(answer.questions, query_for("example.com").questions);
+            drop(resolver);
+            responder.await.unwrap();
+            good_responder.await.unwrap();
+        }
     }
 
     #[tokio::test]

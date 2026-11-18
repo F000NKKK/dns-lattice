@@ -329,6 +329,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An undecodable upstream answer over TCP, DoT, DoH (including HTTP/3), or
+  DoQ is now reported as `Error::Transport` instead of a DNS parse error,
+  allowing the resolver to try the next backend. A malformed answer matched
+  to a waiting query is not retried locally, including on pooled DoQ when the
+  connection also closes; previously DoQ could retry in that case. A pooled
+  TCP/DoT frame without a full ID still closes the connection, with the usual
+  connection-level retry for waiters. Other pool retry rules and inbound
+  parsing are unchanged. Direct callers of affected backends now receive a
+  different error variant.
 - A cache hit replayed the TTLs the upstream sent, however long the answer
   had been cached. Every record TTL now counts down by the whole seconds
   elapsed since the answer was stored, and stays at least 1 while the entry

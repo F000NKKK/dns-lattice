@@ -384,8 +384,13 @@ and DoT also require the response message id to equal the query id; DoH and
 DoQ do not compare it, because RFC 8484 and RFC 9250 use id 0 on the wire
 (the DoQ backend sends its query with id 0). DoH and DoQ return the response
 with the caller's query id. The UDP backend drops a datagram that does not
-decode or does not match, and keeps waiting until its timeout; the stream transports report a mismatch as a transport error, so the
-resolver fails over to the next backend.
+decode or does not match, and keeps waiting until its timeout. TCP, DoT,
+DoH (including HTTP/3), and DoQ report undecodable or mismatching upstream
+answers as `Error::Transport`, so the resolver can fail over to the next
+backend. A malformed answer attributable to a waiting query is not eligible
+for a pool's local connection retry. In pooled TCP/DoT, a frame too short to
+identify a query closes the connection and its waiters follow the existing
+connection-level retry rule. Inbound request parsing retains its parse errors.
 
 Implemented transports:
 
