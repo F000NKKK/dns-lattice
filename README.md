@@ -903,8 +903,10 @@ built-in network transports and server still require Tokio. DNSSEC validation
 is not implemented and the built-in TLS configuration uses `aws-lc-rs`.
 
 Current work targets executor-independent networking, flexible TLS crypto
-providers, and DNSSEC validation. Unreleased `main` exposes `tls-ring` for
-explicit rustls configurations; it still links AWS-LC. Within the `1.x` line, breaking API changes
+providers, and DNSSEC validation. On unreleased `main`,
+`--no-default-features --features dot,tls-ring` selects ring without AWS-LC.
+The default provider feature is `tls-aws-lc`; with defaults disabled, TLS
+transports require an explicit provider feature. Within the `1.x` line, breaking API changes
 require a major release.
 
 See [ROADMAP.md](ROADMAP.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the
@@ -922,7 +924,7 @@ cd dns-lattice
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo test -p dns-lattice --no-default-features --features doq   # one feature on its own
+cargo test -p dns-lattice --no-default-features --features doq,tls-ring
 ```
 
 No test needs privileges or network access beyond loopback.

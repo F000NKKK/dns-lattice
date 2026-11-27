@@ -40,11 +40,13 @@ jobs:
           - name: no-default-features
             cargo_args: --no-default-features
           - name: dot
-            cargo_args: --no-default-features --features dot
+            cargo_args: --no-default-features --features dot,tls-aws-lc
           - name: doh
-            cargo_args: --no-default-features --features doh
+            cargo_args: --no-default-features --features doh,tls-aws-lc
           - name: doq
-            cargo_args: --no-default-features --features doq
+            cargo_args: --no-default-features --features doq,tls-aws-lc
+          - name: ring
+            cargo_args: --no-default-features --features dot,doh,doq,tls-ring
           - name: all-features
             cargo_args: --all-features
     steps:

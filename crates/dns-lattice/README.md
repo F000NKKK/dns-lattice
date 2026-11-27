@@ -62,8 +62,9 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 # dns-lattice = { version = "1.2", features = ["dot", "doh", "doq"] }
 ```
 
-Features are independent and default-off; without any of them the crate builds UDP and TCP,
-client and server, on `tokio` alone. MSRV: Rust 1.100.
+Encrypted transport features are default-off. The default `tls-aws-lc` feature
+selects a provider without enabling TLS itself; baseline UDP and TCP still
+use Tokio. MSRV: Rust 1.100.
 
 - `dot`: DNS-over-TLS (`rustls`, `tokio-rustls`, `webpki-roots`);
 - `doh`: DNS-over-HTTPS over HTTP/1.1, HTTP/2, and HTTP/3 (`hyper`, `hyper-rustls`, `h3`,
@@ -261,11 +262,10 @@ servers on timeout, transport or TLS errors. The selector and pool do not
 require a runtime; the configured backends can still require one. Resolver
 events identify the pool as one backend, not its individual servers.
 
-Unreleased `main` also provides the `tls-ring` feature. With it, applications
-can pass rustls client or server configurations built with
-`rustls::crypto::ring::default_provider()` explicitly. The crate still links
-AWS-LC; WebPKI-root convenience constructors use the installed process
-provider or fall back to AWS-LC. When
+Unreleased `main` also provides the `tls-ring` feature. Select it with
+`default-features = false` and a TLS transport to use ring without AWS-LC.
+WebPKI-root convenience constructors use the installed process provider or
+fall back to the selected provider (AWS-LC if both are enabled). When
 both providers are enabled, rustls's global default is ambiguous, so use
 `builder_with_provider` rather than relying on `ClientConfig::builder()` or
 `ServerConfig::builder()`.

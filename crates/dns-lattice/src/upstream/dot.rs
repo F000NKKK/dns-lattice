@@ -59,7 +59,7 @@ impl DotBackendConfig {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let provider = rustls::crypto::CryptoProvider::get_default()
             .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+            .unwrap_or_else(crate::tls_provider);
         let tls_config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("the configured provider must support the default TLS versions")
@@ -333,7 +333,7 @@ mod tests {
     /// that trusts exactly that certificate (not the system/webpki root
     /// store) — fully offline and deterministic per `@.claude/rules/ci.md`.
     fn self_signed_fixture() -> (ServerConfig, ClientConfig, ServerName<'static>) {
-        self_signed_fixture_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        self_signed_fixture_with_provider(Arc::new((*crate::tls_provider()).clone()))
     }
 
     fn self_signed_fixture_with_provider(
@@ -346,7 +346,7 @@ mod tests {
             PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            (*crate::tls_provider()).clone(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()

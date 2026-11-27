@@ -318,6 +318,28 @@ pub mod model {
 pub mod server;
 pub mod upstream;
 
+#[cfg(all(
+    any(feature = "dot", feature = "doh", feature = "doq"),
+    not(any(feature = "tls-aws-lc", feature = "tls-ring"))
+))]
+compile_error!("TLS transports require either the tls-aws-lc or tls-ring feature");
+
+#[cfg(any(feature = "dot", feature = "doh", feature = "doq"))]
+fn tls_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    #[cfg(feature = "tls-aws-lc")]
+    {
+        std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+    #[cfg(all(not(feature = "tls-aws-lc"), feature = "tls-ring"))]
+    {
+        std::sync::Arc::new(rustls::crypto::ring::default_provider())
+    }
+    #[cfg(not(any(feature = "tls-aws-lc", feature = "tls-ring")))]
+    {
+        unreachable!("a TLS provider feature is required")
+    }
+}
+
 #[cfg(test)]
 mod facade_path_tests {
     use super::{cache, core, engine, fakeip, hooks, model, observability, server, upstream};

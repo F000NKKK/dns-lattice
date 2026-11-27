@@ -13,8 +13,10 @@ description = "Programmable Rust DNS control plane for the Lattice networking st
 readme = "README.md"
 
 [features]
+default = ["tls-aws-lc"]
+tls-aws-lc = ["rustls?/aws-lc-rs", "hyper-rustls?/aws-lc-rs", "quinn?/rustls-aws-lc-rs"]
 # Enables rustls's ring provider for caller-supplied TLS configurations.
-tls-ring = ["dep:rustls", "rustls/ring", "quinn?/rustls-ring"]
+tls-ring = ["rustls?/ring", "hyper-rustls?/ring", "quinn?/rustls-ring"]
 # DNS-over-TLS (RFC 7858) upstream backend. Default off: the baseline
 # UDP/TCP build carries no TLS dependency weight unless explicitly opted
 # into. See `DL-A-13` (ADR-0012).

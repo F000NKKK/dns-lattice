@@ -908,9 +908,10 @@ DNS Lattice не изменяет OS DNS settings, не управляет TUN/T
 ещё не реализована, встроенная конфигурация TLS использует `aws-lc-rs`.
 
 Текущая работа: независимость сетевого кода от рантайма, гибкий выбор
-криптопровайдера TLS и проверка DNSSEC. В ещё не выпущенном `main` feature
-`tls-ring` позволяет явно использовать `ring`, но AWS-LC пока тоже остаётся
-зависимостью. Несовместимые изменения публичного
+криптопровайдера TLS и проверка DNSSEC. В ещё не выпущенном `main` команда
+`--no-default-features --features dot,tls-ring` выбирает `ring` без AWS-LC.
+По умолчанию включён `tls-aws-lc`; при отключённых default features для TLS
+нужно явно выбрать провайдер. Несовместимые изменения публичного
 API требуют нового мажорного релиза.
 
 Полные детали см. в [ROADMAP.ru.md](ROADMAP.ru.md) и
@@ -928,7 +929,7 @@ cd dns-lattice
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo test -p dns-lattice --no-default-features --features doq   # одна feature отдельно
+cargo test -p dns-lattice --no-default-features --features doq,tls-ring
 ```
 
 Ни одному тесту не нужны привилегии или сеть дальше loopback.

@@ -13,10 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;
   individual backends can still require a runtime.
-- The `tls-ring` feature enables rustls's `ring` provider for explicitly
-  configured TLS clients and servers. AWS-LC remains linked; WebPKI-root
-  convenience constructors use the installed process provider, or AWS-LC
-  when none is installed.
+- TLS provider features select `tls-aws-lc` (default) or `tls-ring`. With
+  default features disabled, TLS transports require one of them explicitly.
+  WebPKI-root constructors use the installed process provider, falling back
+  to the selected provider (AWS-LC when both are selected).
 
 ### Changed
 

@@ -26,15 +26,8 @@ event-listener = "5.4.2"
 futures-channel = "0.3.34"
 tokio = { version = "1.53.1", default-features = false, features = ["net", "time", "rt", "macros", "io-util", "sync"] }
 
-# DoT (dns-lattice `dot` feature, RFC 7858). `aws-lc-rs` is enabled
-# directly here (not left to arrive transitively via `doh`'s
-# `hyper-rustls` or `doq`'s `quinn`) so `rustls` has a process-level
-# `CryptoProvider` even when the `dot` Cargo feature is enabled on its
-# own — without it, any TLS handshake panics at runtime with "Could not
-# automatically determine the process-level CryptoProvider" (this
-# workspace already standardizes on `aws-lc-rs`, not `ring`, per
-# `DL-A-14`/ADR-0013's rationale for `doq`'s matching choice).
-rustls = { version = "0.23.45", default-features = false, features = ["tls12", "std", "aws-lc-rs"] }
+# TLS providers are selected by dns-lattice's Cargo features.
+rustls = { version = "0.23.45", default-features = false, features = ["tls12", "std"] }
 rustls-pki-types = "1.15.1"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
 webpki-roots = "1.0.9"
@@ -42,7 +35,7 @@ webpki-roots = "1.0.9"
 # DoH (dns-lattice `doh` feature, RFC 8484)
 hyper = "1.11.1"
 hyper-util = { version = "0.1.21", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
-hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "webpki-roots", "aws-lc-rs"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "tls12", "webpki-roots"] }
 http = "1.5.0"
 http-body-util = "0.1.5"
 # `Service` trait of the counting connector wrapped around `hyper-rustls`'s
@@ -53,12 +46,8 @@ base64 = "0.23.1"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
-# DoQ (dns-lattice `doq` feature, RFC 9250). `rustls-aws-lc-rs` shares this
-# workspace's already-pinned `rustls`/`aws-lc-rs` crypto-provider line
-# (pulled in by `doh`'s `hyper-rustls` dependency) rather than also
-# compiling in `ring` via quinn's default `rustls-ring` feature. See
-# `DL-A-14` (ADR-0013).
-quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# DoQ/DoH3 use the same selected TLS provider as rustls.
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio"] }
 
 # Test-only: generates a self-signed certificate/key pair for the loopback
 # DoT/DoH/DoQ TLS test fixtures (dns-lattice `dot`/`doh`/`doq` feature

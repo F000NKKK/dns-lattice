@@ -165,9 +165,10 @@ run_preflight() {
 
     for feature_args in \
         "--no-default-features" \
-        "--no-default-features --features dot" \
-        "--no-default-features --features doh" \
-        "--no-default-features --features doq" \
+        "--no-default-features --features dot,tls-aws-lc" \
+        "--no-default-features --features doh,tls-aws-lc" \
+        "--no-default-features --features doq,tls-aws-lc" \
+        "--no-default-features --features dot,doh,doq,tls-ring" \
         "--all-features"; do
         info "Preflight: strict rustdoc dns-lattice $feature_args ..."
         RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path "$WS/Cargo.toml" --no-deps \

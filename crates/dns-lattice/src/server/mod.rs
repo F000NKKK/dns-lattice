@@ -2411,7 +2411,7 @@ mod tests {
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
             let server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
+                (*crate::tls_provider()).clone(),
             ))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -2422,7 +2422,7 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
             let client_config = ClientConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
+                (*crate::tls_provider()).clone(),
             ))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -2604,7 +2604,7 @@ mod tests {
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
             let mut server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
+                (*crate::tls_provider()).clone(),
             ))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -2616,7 +2616,7 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
             let client_config = ClientConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
+                (*crate::tls_provider()).clone(),
             ))
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -3406,7 +3406,7 @@ mod tests {
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
             let mut rustls_server_config = RustlsServerConfig::builder_with_provider(
-                std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+                std::sync::Arc::new((*crate::tls_provider()).clone()),
             )
             .with_safe_default_protocol_versions()
             .unwrap()
@@ -3422,7 +3422,7 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
             let mut rustls_client_config = RustlsClientConfig::builder_with_provider(
-                std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+                std::sync::Arc::new((*crate::tls_provider()).clone()),
             )
             .with_safe_default_protocol_versions()
             .unwrap()
