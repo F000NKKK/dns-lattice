@@ -21,7 +21,9 @@ dns-lattice-model = { path = "crates/dns-lattice-model", version = "1.2.0" }
 dns-lattice = { path = "crates/dns-lattice", version = "1.2.0" }
 
 async-trait = "0.1.92"
+async-channel = "2.5"
 event-listener = "5.4.2"
+futures-channel = "0.3.34"
 tokio = { version = "1.53.1", default-features = false, features = ["net", "time", "rt", "macros", "io-util", "sync"] }
 
 # DoT (dns-lattice `dot` feature, RFC 7858). `aws-lc-rs` is enabled

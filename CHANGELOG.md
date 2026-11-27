@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In-flight cache coalescing uses executor-independent notifications instead
   of a Tokio watch channel. Built-in transports and other resolver features
   still require Tokio.
+- Connection-result and stream-close notifications, the stream write queue,
+  and per-query response channels no longer depend on Tokio synchronization.
+  Stream I/O, task scheduling, and deadlines still require Tokio.
 
 ## [1.2.0] - 2026-11-18
 

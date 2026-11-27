@@ -68,8 +68,8 @@ use std::time::Duration;
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{Message, Opcode};
 use event_listener::Event;
+use futures_channel::oneshot;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::pool::{
@@ -194,7 +194,7 @@ impl ConnShared {
 /// and the two tasks (aborted when the connection is dropped).
 pub(crate) struct StreamConn {
     shared: Arc<ConnShared>,
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: async_channel::Sender<Vec<u8>>,
     reader: AbortOnDrop,
     writer: AbortOnDrop,
 }
@@ -259,7 +259,7 @@ impl StreamConn {
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (read_half, write_half) = tokio::io::split(stream);
-        let (frames, queue) = mpsc::channel(max_in_flight.max(1));
+        let (frames, queue) = async_channel::bounded(max_in_flight.max(1));
         let shared = Arc::new(ConnShared {
             state: Mutex::new(ConnState {
                 table: PendingTable::new(max_in_flight, read_timeout),
@@ -449,7 +449,7 @@ async fn run_reader<R: AsyncRead + Unpin>(mut read: R, shared: Arc<ConnShared>, 
 
 async fn run_writer<W: AsyncWrite + Unpin>(
     mut write: W,
-    mut queue: mpsc::Receiver<Vec<u8>>,
+    queue: async_channel::Receiver<Vec<u8>>,
     shared: Arc<ConnShared>,
     write_timeout: Duration,
 ) {
@@ -457,12 +457,14 @@ async fn run_writer<W: AsyncWrite + Unpin>(
     let mut out: Vec<u8> = Vec::new();
     loop {
         let received = tokio::select! {
-            n = queue.recv_many(&mut batch, WRITE_BATCH) => n,
+            frame = queue.recv() => frame,
             _ = shared.wait_closed() => return,
         };
-        if received == 0 {
-            // Every sender is gone: the connection was dropped.
-            return;
+        let Ok(first) = received else { return };
+        batch.push(first);
+        while batch.len() < WRITE_BATCH {
+            let Ok(frame) = queue.try_recv() else { break };
+            batch.push(frame);
         }
         out.clear();
         for frame in batch.drain(..) {
@@ -708,6 +710,39 @@ mod tests {
         shared.fail(&Failure::closed("test"));
         async_io::block_on(first);
         async_io::block_on(shared.wait_closed());
+    }
+
+    #[test]
+    fn stream_failure_delivers_pending_query_without_tokio() {
+        use std::task::{Context, Poll, Waker};
+
+        let (tx, rx) = oneshot::channel();
+        let mut table = PendingTable::new(1, Duration::from_secs(1));
+        assert!(
+            table
+                .register(Waiter { serial: 0, tx }, Instant::now())
+                .is_ok()
+        );
+        let shared = ConnShared {
+            state: Mutex::new(ConnState {
+                table,
+                closed: false,
+                slack: 0,
+                slack_cap: 0,
+            }),
+            dead: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
+            next_serial: AtomicU64::new(0),
+            closed: Event::new(),
+        };
+        let mut rx = Box::pin(rx);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(rx.as_mut().poll(&mut context), Poll::Pending));
+        shared.fail(&Failure::closed("connection lost"));
+        assert!(
+            matches!(async_io::block_on(rx), Ok(Err(Failure { error: Error::Transport(message), connection_level: true })) if message == "connection lost")
+        );
     }
 
     // ---- wire helpers ---------------------------------------------------------

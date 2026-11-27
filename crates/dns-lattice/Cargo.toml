@@ -43,7 +43,9 @@ doq = ["dep:quinn", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 dns-lattice-core = { workspace = true }
 dns-lattice-model = { workspace = true }
 async-trait = { workspace = true }
+async-channel = { workspace = true }
 event-listener = { workspace = true }
+futures-channel = { workspace = true }
 tokio = { workspace = true }
 
 rustls = { workspace = true, optional = true }
