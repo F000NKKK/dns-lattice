@@ -215,12 +215,12 @@ a client-specific answer is never shared.
 
 Concurrent misses for one cache key are coalesced (`CacheConfig::coalesce`,
 on by default). A private registry of flights, sharded by the same canonical
-key bytes and keyed hash as the store, holds one watch channel per key. The
-first miss registers a flight and leads: it re-checks the cache, runs the
+key bytes and keyed hash as the store, holds one shared state and notification
+event per key. The first miss registers a flight and leads: it re-checks the cache, runs the
 ordered failover loop, inserts a cacheable answer into the store, then
 unregisters the flight and publishes its outcome to the followers that
-joined, so a query arriving at any moment finds either the flight or the
-entry. A follower waits on the channel and answers from the published
+joined. A query arriving after an uncacheable, rejected, or invalidated answer
+may start a new flight. A follower registers a cancellable listener and answers from the published
 outcome (a cacheable answer rebuilt like a hit, an uncacheable answer such
 as `SERVFAIL` with only its transaction fields replaced, or the leader's
 error); it emits `CacheMiss`, then `CacheEvent::Coalesced` through the

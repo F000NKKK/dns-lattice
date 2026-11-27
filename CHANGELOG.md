@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- In-flight cache coalescing uses executor-independent notifications instead
+  of a Tokio watch channel. Built-in transports and other resolver features
+  still require Tokio.
+
 ## [1.2.0] - 2026-11-18
 
 ### Added

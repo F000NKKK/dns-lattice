@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use dns_lattice_core::Error;
 use dns_lattice_model::Message;
-use tokio::sync::watch;
+use event_listener::{Event, EventListener};
 
 use super::store::CachedAnswer;
 
@@ -66,7 +66,28 @@ pub(crate) enum Wait {
 
 struct Registered {
     key: Box<[u8]>,
-    sender: Arc<watch::Sender<State>>,
+    flight: Arc<Flight>,
+}
+
+struct Flight {
+    state: Mutex<State>,
+    completed: Event,
+}
+
+impl Flight {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(State::Pending),
+            completed: Event::new(),
+        }
+    }
+
+    fn follow(self: &Arc<Self>) -> Follower {
+        Follower {
+            listener: self.completed.listen(),
+            flight: Arc::clone(self),
+        }
+    }
 }
 
 /// The registry of in-flight queries.
@@ -85,21 +106,21 @@ pub(crate) enum Join {
 
 /// A waiting query.
 pub(crate) struct Follower {
-    receiver: watch::Receiver<State>,
+    flight: Arc<Flight>,
+    listener: EventListener,
 }
 
 impl Follower {
     /// Waits for the leader to publish or to be dropped.
-    pub(crate) async fn wait(mut self) -> Wait {
-        let state = match self
-            .receiver
-            .wait_for(|state| !matches!(state, State::Pending))
-            .await
-        {
-            Ok(state) => state.clone(),
-            // The sender can only vanish without publishing if its leader was
-            // dropped; treat that as abandonment.
-            Err(_) => State::Abandoned,
+    pub(crate) async fn wait(self) -> Wait {
+        // Registering the listener before the state check prevents a
+        // publication between the check and await from being lost.
+        let state = lock(&self.flight.state).clone();
+        let state = if matches!(state, State::Pending) {
+            self.listener.await;
+            lock(&self.flight.state).clone()
+        } else {
+            state
         };
         match state {
             State::Done(outcome) => Wait::Done(outcome),
@@ -136,29 +157,27 @@ impl Flights {
     pub(crate) fn join_or_lead(self: &Arc<Self>, hash: u64, key: &[u8]) -> Join {
         let mut shard = lock(self.shard(hash));
         match shard.get(&hash) {
-            Some(registered) if *registered.key == *key => Join::Follow(Follower {
-                receiver: registered.sender.subscribe(),
-            }),
+            Some(registered) if *registered.key == *key => Join::Follow(registered.flight.follow()),
             Some(_) => Join::Lead(LeaderGuard {
                 flights: Arc::clone(self),
                 hash,
-                sender: Arc::new(watch::channel(State::Pending).0),
+                flight: Arc::new(Flight::new()),
                 registered: false,
                 finished: false,
             }),
             None => {
-                let sender = Arc::new(watch::channel(State::Pending).0);
+                let flight = Arc::new(Flight::new());
                 shard.insert(
                     hash,
                     Registered {
                         key: key.into(),
-                        sender: Arc::clone(&sender),
+                        flight: Arc::clone(&flight),
                     },
                 );
                 Join::Lead(LeaderGuard {
                     flights: Arc::clone(self),
                     hash,
-                    sender,
+                    flight,
                     registered: true,
                     finished: false,
                 })
@@ -166,12 +185,12 @@ impl Flights {
         }
     }
 
-    /// Removes the flight registered under `hash` if it is `sender`'s.
-    fn unregister(&self, hash: u64, sender: &Arc<watch::Sender<State>>) {
+    /// Removes the flight registered under `hash` if it is the same flight.
+    fn unregister(&self, hash: u64, flight: &Arc<Flight>) {
         let mut shard = lock(self.shard(hash));
         if shard
             .get(&hash)
-            .is_some_and(|registered| Arc::ptr_eq(&registered.sender, sender))
+            .is_some_and(|registered| Arc::ptr_eq(&registered.flight, flight))
         {
             shard.remove(&hash);
         }
@@ -189,7 +208,7 @@ impl Flights {
 pub(crate) struct LeaderGuard {
     flights: Arc<Flights>,
     hash: u64,
-    sender: Arc<watch::Sender<State>>,
+    flight: Arc<Flight>,
     registered: bool,
     finished: bool,
 }
@@ -198,24 +217,26 @@ impl LeaderGuard {
     /// A follower of this flight, so the leader itself can wait for a result
     /// that a background task will publish.
     pub(crate) fn follower(&self) -> Follower {
-        Follower {
-            receiver: self.sender.subscribe(),
-        }
+        self.flight.follow()
     }
 
     /// Unregisters the flight, then publishes `outcome` to the followers that
     /// already joined. The outcome is built only if there are any.
     ///
-    /// The caller must have stored a cacheable answer already, so a query
-    /// arriving after the flight is gone finds the cache entry instead.
+    /// The caller attempts any cache insertion before finishing. If insertion
+    /// was rejected or invalidated, a later query may start another flight.
     pub(crate) fn finish(mut self, outcome: impl FnOnce() -> Outcome) {
-        self.finished = true;
         if self.registered {
-            self.flights.unregister(self.hash, &self.sender);
+            self.flights.unregister(self.hash, &self.flight);
         }
-        // No new follower can join now, so the count is final.
-        if self.sender.receiver_count() > 0 {
-            self.sender.send_replace(State::Done(outcome()));
+        // The leader is the only remaining owner when there are no followers.
+        if Arc::strong_count(&self.flight) > 1 {
+            let outcome = outcome();
+            *lock(&self.flight.state) = State::Done(outcome);
+            self.finished = true;
+            self.flight.completed.notify(usize::MAX);
+        } else {
+            self.finished = true;
         }
     }
 }
@@ -226,9 +247,10 @@ impl Drop for LeaderGuard {
             return;
         }
         if self.registered {
-            self.flights.unregister(self.hash, &self.sender);
+            self.flights.unregister(self.hash, &self.flight);
         }
-        self.sender.send_replace(State::Abandoned);
+        *lock(&self.flight.state) = State::Abandoned;
+        self.flight.completed.notify(usize::MAX);
     }
 }
 
@@ -325,5 +347,85 @@ mod tests {
             panic!("first caller must lead");
         };
         leader.finish(|| panic!("no follower is waiting"));
+    }
+
+    #[test]
+    fn a_pending_follower_completes_on_async_io_without_tokio() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let flights = flights();
+        let Join::Lead(leader) = flights.join_or_lead(7, b"key") else {
+            panic!("first caller must lead");
+        };
+        let follower = leader.follower();
+        let mut wait = Box::pin(follower.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        leader.finish(|| Outcome::Failed(Error::NoRoute));
+        assert!(matches!(
+            async_io::block_on(wait),
+            Wait::Done(Outcome::Failed(Error::NoRoute))
+        ));
+    }
+
+    #[test]
+    fn completion_wakes_each_live_follower_after_another_is_cancelled() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let flights = flights();
+        let Join::Lead(leader) = flights.join_or_lead(9, b"key") else {
+            panic!("first caller must lead");
+        };
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut context = Context::from_waker(&waker);
+        let mut first = Box::pin(leader.follower().wait());
+        let mut second = Box::pin(leader.follower().wait());
+        let mut cancelled = Box::pin(leader.follower().wait());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            cancelled.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(cancelled);
+        leader.finish(|| Outcome::Failed(Error::NoRoute));
+        assert_eq!(counter.0.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            async_io::block_on(first),
+            Wait::Done(Outcome::Failed(Error::NoRoute))
+        ));
+        assert!(matches!(
+            async_io::block_on(second),
+            Wait::Done(Outcome::Failed(Error::NoRoute))
+        ));
+    }
+
+    #[test]
+    fn panicking_outcome_builder_abandons_waiting_followers() {
+        let flights = flights();
+        let Join::Lead(leader) = flights.join_or_lead(8, b"key") else {
+            panic!("first caller must lead");
+        };
+        let follower = leader.follower();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            leader.finish(|| panic!("outcome failed"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(flights.len(), 0);
+        assert!(matches!(
+            async_io::block_on(follower.wait()),
+            Wait::Abandoned
+        ));
     }
 }
