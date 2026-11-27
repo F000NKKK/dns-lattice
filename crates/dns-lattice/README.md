@@ -130,8 +130,8 @@ identity includes the effective upstream group and the query's RD and EDNS DO bi
 questions routed to different groups never share an answer. Answers are stored without their OPT
 record; an answer to an EDNS(0) query always carries one, and an answer to a plain query never
 does. The cache is sharded and bounded to about 16 MiB by default (an estimate of heap use),
-enforced on every insert by evicting expired entries first and then entries that were never
-reused, so a flood of one-off names cannot grow it or push out the popular names. Use
+enforced on every insert by evicting expired entries first and then using S3-FIFO, which
+gives reused entries additional protection but does not guarantee their retention. Use
 `ResolverBuilder::cache(CacheConfig::new().max_bytes(..))` to change the bound, the shard count,
 or the TTL limits (positive 0 s to 86 400 s, negative 0 s to 3 600 s by default), or
 `CacheConfig::disabled()` to keep nothing.

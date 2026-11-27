@@ -10,7 +10,8 @@ use super::record::{Class, RData, RecordType};
 ///
 /// Equality and hashing compare ASCII-lowercased labels (DNS names are
 /// case-insensitive per RFC 1035 §2.3.3), but the original case is kept
-/// internally so encoding round-trips byte-for-byte.
+/// internally so encoding preserves the case of each label. Wire compression
+/// pointers are expanded on decoding and are not preserved on encoding.
 #[derive(Debug, Clone)]
 pub struct Name(pub(crate) Vec<Vec<u8>>);
 

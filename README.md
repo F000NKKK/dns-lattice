@@ -139,10 +139,9 @@ public resolvers.
   shard of an in-memory store, clones a reference, and returns; concurrent
   hits on other shards do not wait for each other. The hook still runs
   first, upstreams do not.
-- **A cache that cannot grow without bound**: the store holds a fixed
-  number of bytes (16 MiB by default) and evicts on every insert, expired
-  entries first, so a flood of one-off names cannot push out the names that
-  are asked for again and again.
+- **A bounded cache budget**: the store accounts for estimated entry costs
+  against a 16 MiB default budget and evicts on every insert, expired entries
+  first. S3-FIFO gives reused entries extra protection, not guaranteed retention.
 - **One task per request, no shared worker**: the server spawns a Tokio task
   per UDP datagram, per TCP/DoT/DoH connection, and per DoQ stream, all
   sharing one `Arc<Resolver>`.
@@ -569,10 +568,9 @@ query's RD bit and EDNS DO bit (RFC 3225) are part of the identity too.
   such answer).
 - **Memory bound**: the store is split into shards, each with its own lock
   and an equal share of `CacheConfig::max_bytes` (16 MiB by default). Every
-  insert evicts until its shard is back within its share: expired entries
-  first, then entries that were never reused (S3-FIFO), so a flood of
-  unique names, such as random-subdomain NXDOMAIN queries, leaves the
-  popular names in place. The cache is never flushed as a whole to make
+  insert evicts until its shard is back within its estimated share: expired
+  entries first, followed by S3-FIFO, which gives reused entries additional
+  chances but may still evict them. The cache is never flushed as a whole to make
   room. An answer larger than an eighth of a shard's share is returned but
   not stored. `CacheConfig::disabled()` (or `max_bytes(0)`) keeps nothing.
 - **Hits**: TTLs count down by the whole seconds since the answer was

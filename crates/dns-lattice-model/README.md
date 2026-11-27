@@ -36,8 +36,9 @@ operating-system dependency.
   `RData`).
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
-  an ordinary additional record; a message whose OPT is never touched
-  round-trips byte-for-byte. Options are kept as raw code/data pairs.
+  an ordinary additional record, and options are kept as raw code/data pairs.
+  Re-encoding a message does not preserve its original name compression, and
+  non-OPT TTLs with the high bit set are normalized to zero.
 - ✅ **`matcher`**: a zone/domain matcher (`DomainPattern`,
   `DomainMatcher<T>`) with deterministic exact/suffix/wildcard precedence.
 - ✅ **`policy`**: split-DNS policy types (`UpstreamGroupId`,
