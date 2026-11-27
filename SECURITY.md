@@ -34,15 +34,15 @@ informed as the issue is investigated and resolved.
 
 ## Resolver cache memory bound
 
-The resolver's answer cache is bounded so that a client cannot exhaust the
-host's memory by asking for many distinct names (for example random-subdomain
-queries). By default it holds at most 16 MiB, an estimate of the heap its
+The resolver's answer cache limits its estimated entry cost when clients ask
+for many distinct names (for example random-subdomain queries). By default it
+accounts for at most 16 MiB, an estimate of the heap its
 entries occupy rather than an allocator-exact figure. The limit is enforced
 on every insert, not by a background cleaner that could be outrun: each of
 the cache's shards owns an equal share of the limit and evicts, one entry at
 a time, until it is back within that share. Expired entries go first, then
-entries that were never reused, so a flood of one-off names displaces other
-one-off names and not the names that are asked for repeatedly. An answer
+entries that were never reused. Reuse gives entries additional chances to
+remain in the cache; it does not guarantee their retention. An answer
 larger than an eighth of a shard's share is returned to the client but never
 stored, and the cache is never flushed as a whole to make room. Cache keys
 are hashed with a per-resolver random key and compared in full on every hit,
@@ -53,8 +53,9 @@ question's answer.
 (`max_bytes`), the shard count (`shards`) and the TTL limits
 (`positive_ttl`, `negative_ttl`, `negative_ttl_without_soa`);
 `CacheConfig::disabled()` keeps no answers. Size the bound for the host: the
-bound covers the cache only, not in-flight queries, connections or the
-inbound server's own buffers. Concurrent identical misses are merged into
+bound is an estimate for cached entries only, not a bound on process memory,
+in-flight queries, connections or the inbound server's own buffers.
+Concurrent identical misses are merged into
 one upstream query (`CacheConfig::coalesce`, on by default), so a burst of
 identical misses sends one query upstream rather than one each; this also
 narrows the window in which an off-path attacker can race one outstanding

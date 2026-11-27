@@ -52,13 +52,14 @@ use dns_lattice_core::{Error, Result};
 
 fn decode_class(raw: u16) -> Result<u16> {
     match raw {
-        1 | 3 => Ok(raw),
-        other => Err(Error::InvalidClass(other)),
+        0 => Err(Error::InvalidClass(raw)),
+        other => Ok(other),
     }
 }
 
 assert!(decode_class(1).is_ok());
-assert!(decode_class(9999).is_err());
+assert!(decode_class(0).is_err());
+assert!(decode_class(9999).is_ok());
 ```
 
 ## 📌 Status

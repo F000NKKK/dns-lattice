@@ -26,7 +26,7 @@
 ## 📖 Overview
 
 The application-facing crate of [DNS Lattice](https://github.com/F000NKKK/dns-lattice): an
-embeddable DNS resolver and server engine with split DNS, a TTL-aware, byte-bounded cache scoped by
+embeddable DNS resolver and server engine with split DNS, a TTL-aware cache with an estimated byte budget scoped by
 upstream group, Fake IP, dynamic route selection, structured observability, and UDP/TCP/DoT/DoH/DoQ
 transports in both directions. It is for Rust applications that need custom DNS behavior: the
 host application owns the process and configuration, while this crate owns DNS protocol
@@ -249,9 +249,11 @@ effects from its own hook or sink implementation is responsible for those effect
 
 ## 📌 Status
 
-**Stable `1.x` releases are published** on crates.io. Stages 0.0 through 1.0 are complete,
-and ordinary SemVer applies within `1.x`: additive changes are minor releases, fixes are
-patch releases, and a breaking change requires an explicit major version bump.
+**Version `1.2.0` is published** on crates.io. Built-in transports and server listeners
+currently require Tokio. DNSSEC validation is not implemented; EDNS DO and upstream AD
+bits do not imply local validation. TLS configurations use `aws-lc-rs` by default.
+Executor independence, selectable TLS providers and DNSSEC validation are planned work.
+Breaking public API changes require a major release.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •

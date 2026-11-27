@@ -58,19 +58,12 @@ implementation starts.
 
 ## Current status
 
-Stages 0.0 through 1.0 are complete. The 0.6 release line contains the full
-pre-1.0 implementation surface: DNS model and matching, static split DNS,
-resolver/cache, UDP/TCP/DoT/DoH/DoQ upstreams and inbound listeners, Fake IP,
-route-selection hooks, structured observability, deterministic hardening
-coverage, cross-platform feature-matrix CI, strict rustdoc gates, package
-validation, and release-automation regression checks.
-
-Stage 1.0 froze and audited the public API, established the stable SemVer
-contract, verified package/docs.rs behavior, and published `dns-lattice`,
-`dns-lattice-core`, and `dns-lattice-model` as `1.0.0` on crates.io. Within
-the `1.x` line, ordinary SemVer now applies: additive changes are minor
-releases, fixes are patch releases, and a breaking change requires an
-explicit major version bump.
+The three crates are published at `1.2.0`. They provide the DNS model,
+resolver and cache, built-in UDP/TCP/DoT/DoH/DoQ transports and listeners,
+Fake IP, routing hooks and observability. Built-in network I/O currently
+requires Tokio; DNSSEC validation and a choice of TLS crypto provider are
+not yet implemented. Executor independence, DNSSEC and provider selection
+are current work. Breaking public API changes require a major release.
 
 See `CONTRIBUTING.md` and `SUPPORT.md` for contributor and support guidance.
 

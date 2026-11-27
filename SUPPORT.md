@@ -10,25 +10,10 @@ Thank you for your interest in DNS Lattice.
 
 ## Project Status
 
-DNS Lattice reached its first stable release, `1.0.0`. Stages 0.1-0.3 delivered the DNS
-message/matcher/policy model, resolver/cache, upstream transports, failover,
-and inbound server listeners. Stage 0.4 added opt-in Fake IP synthesis,
-TTL-bound mappings, and caller-owned process-local snapshots. Stage 0.5 added
-the dynamic route-selection hook pipeline: it selects an existing upstream
-group before route-scoped cache lookup, has no OS/network side-effect
-authority, and does not silently fall back after hook failures or invalid
-selections.
-
-Stage 0.6 defined the `0.6.0` hardening release: the public surface has
-Linux/Windows/macOS feature-matrix validation, deterministic
-parser/matcher/cache/Fake-IP invariant coverage, structured non-authoritative
-resolver observability, strict per-feature rustdoc gates, package-content
-checks, and release-automation regression coverage.
-
-Stage 1.0 froze and audited the public API, established the stable SemVer
-commitment, and published `dns-lattice`, `dns-lattice-core`, and
-`dns-lattice-model` as `1.0.0` on crates.io. Within the `1.x` line, the public
-API follows ordinary SemVer: additive changes are minor releases, fixes are
-patch releases, and a breaking change requires an explicit major version
+The published `dns-lattice`, `dns-lattice-core`, and `dns-lattice-model`
+crates are at version `1.2.0`. The resolver includes caching, Fake IP,
+route-selection hooks, upstream transports and inbound listeners. Built-in
+network I/O currently requires Tokio, and DNSSEC validation is not yet
+implemented. Within `1.x`, breaking API changes require a major version
 bump. Durable Fake IP persistence remains outside the current crate scope.
 Questions, bug reports, and design discussion are welcome.

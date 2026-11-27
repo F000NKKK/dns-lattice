@@ -9,6 +9,21 @@ Each stage below is broken down into one or more bounded implementation
 slices when work starts; this file tracks stage-level status only, not
 individual slices.
 
+## Current work
+
+- **Executor independence (active):** remove the Tokio requirement from the
+  library's network I/O, scheduling and timers; internal notifications and
+  stream channels have begun moving to runtime-independent primitives. The
+  built-in transports and listeners still require Tokio.
+- **TLS provider selection (planned):** support both `aws-lc-rs` and `ring`
+  without relying on an ambiguous process-wide rustls provider.
+- **DNSSEC validation (planned):** validate signatures and chains from
+  configured trust anchors, including authenticated denial of existence.
+  An EDNS DO bit or an upstream AD bit alone is not validation.
+
+The stages below are historical milestones; the published crates are at
+`1.2.0`.
+
 ## Stage status legend
 
 - `planned` — scoped here, work not yet started.

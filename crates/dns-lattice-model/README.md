@@ -33,7 +33,8 @@ operating-system dependency.
 - ✅ **`message`**: a hand-rolled DNS message model (`Header`, `Question`,
   `ResourceRecord`, `Message`) with wire encode/decode.
 - ✅ **`record`**: DNS record types and resource-data (`RecordType`, `Class`,
-  `RData`).
+  `RData`). DNSSEC-specific record types currently remain raw unknown records;
+  this crate does not perform DNSSEC validation.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.
@@ -86,9 +87,8 @@ inserted rule wins.
 
 ## 🧪 Hardening
 
-Stage-0.6 hardening added deterministic property-style verification around
-message parsing/compression bounds and matcher precedence without introducing
-network or OS responsibilities into this crate.
+Deterministic tests cover message parsing, compression bounds, and matcher
+precedence without introducing network or OS responsibilities into this crate.
 
 ## 📌 Status
 

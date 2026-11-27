@@ -4,8 +4,8 @@ Thank you for your interest in contributing to DNS Lattice.
 
 ## Project Status
 
-DNS Lattice reached its first stable release, `1.0.0` (`dns-lattice`,
-`dns-lattice-core`, `dns-lattice-model` on crates.io). The repository
+The published `dns-lattice`, `dns-lattice-core`, and `dns-lattice-model`
+crates are at version `1.2.0`. The repository
 contains the DNS message/matcher/policy model, resolver/cache,
 UDP/TCP/DoT/DoH/DoQ upstream transports, failover, matching inbound server
 listeners, Fake IP synthesis and snapshots, dynamic route-selection hooks,
@@ -24,7 +24,8 @@ The most valuable contributions now are:
   contract;
 - package/release reproducibility and cross-platform validation improvements;
 - focused bug fixes with deterministic regression coverage;
-- design discussion for new capability domains beyond the current 1.0 scope.
+- executor-independent I/O and scheduling, selectable TLS crypto providers,
+  and DNSSEC validation.
 
 Please check open issues and discussions before starting significant work, to
 avoid duplicated effort.

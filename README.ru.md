@@ -65,11 +65,10 @@ application-specific routing. DNS Lattice разделяет эти ответс
 - **🧾 Стабильный API**: `1.x` следует SemVer; breaking change требует новой
   мажорной версии.
 
-> **Статус:** **стабильные релизы `1.x` опубликованы** на crates.io
-> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Стадии 0.0–1.0
-> завершены: публичный API заморожен, воркспейс следует обычной
-> SemVer-дисциплине внутри линейки `1.x` — breaking change требует явного
-> мажорного бампа. Текущую версию см. в [CHANGELOG.md](CHANGELOG.md).
+> **Статус:** `dns-lattice`, `dns-lattice-core` и `dns-lattice-model`
+> опубликованы в версии `1.2.0`. Встроенный сетевой код пока требует Tokio,
+> а проверка DNSSEC не реализована. Текущая работа описана в
+> [ROADMAP.ru.md](ROADMAP.ru.md), история релизов — в [CHANGELOG.md](CHANGELOG.md).
 
 > **Версия:** примеры ниже используют ветку `1.2`, включающую настройки
 > кэша, EDNS и пул соединений с upstream. Подробности см. в соответствующем
@@ -903,23 +902,14 @@ DNS Lattice не изменяет OS DNS settings, не управляет TUN/T
 
 ## 🗺️ Текущий статус и роадмап
 
-Завершены:
+Все три крейта опубликованы в стабильной версии `1.2.0`. Реализованы
+резолвер, кеш, Fake IP, хуки маршрутизации и встроенные транспорты.
+Встроенные сетевые транспорты и сервер пока требуют Tokio. Проверка DNSSEC
+ещё не реализована, встроенная конфигурация TLS использует `aws-lc-rs`.
 
-1. **0.0** — repository/architecture baseline;
-2. **0.1** — базовая DNS model;
-3. **0.2** — resolver и static split DNS;
-4. **0.3** — upstream transports, failover, inbound server;
-5. **0.4** — Fake IP;
-6. **0.5** — dynamic route hooks;
-7. **0.6** — hardening, cross-platform validation, observability, package и
-   release checks;
-8. **1.0** — аудит/заморозка публичного API, фиксация stable SemVer contract
-   и первый stable release (`dns-lattice`, `dns-lattice-core`,
-   `dns-lattice-model` `1.0.0` на crates.io).
-
-Публичный API теперь заморожен: внутри линейки `1.x` аддитивные изменения
-идут минорными релизами, фиксы — патчами; breaking change требует явного
-мажорного бампа.
+Текущая работа: независимость сетевого кода от рантайма, выбор
+криптопровайдера TLS и проверка DNSSEC. Несовместимые изменения публичного
+API требуют нового мажорного релиза.
 
 Полные детали см. в [ROADMAP.ru.md](ROADMAP.ru.md) и
 [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md).

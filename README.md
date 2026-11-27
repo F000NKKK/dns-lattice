@@ -65,12 +65,10 @@ composable.
 - **🧾 A stable API**: `1.x` follows SemVer; a breaking change needs a new
   major version.
 
-> **Status:** **stable `1.x` releases are published** on crates.io
-> (`dns-lattice`, `dns-lattice-core`, `dns-lattice-model`). Stages 0.0
-> through 1.0 are complete: the public API is frozen and the workspace
-> follows ordinary SemVer within the `1.x` line — a breaking change requires
-> an explicit major version bump. See [CHANGELOG.md](CHANGELOG.md) for the
-> current version.
+> **Status:** `dns-lattice`, `dns-lattice-core`, and `dns-lattice-model` are
+> published at `1.2.0`. Built-in networking currently requires Tokio and
+> DNSSEC validation is not implemented. See [ROADMAP.md](ROADMAP.md) for
+> ongoing work and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 > **Version:** the examples below target the `1.2` line, which includes
 > configurable cache, EDNS controls and upstream connection pooling. Consult
@@ -899,23 +897,14 @@ belong to the host application or sibling Lattice components.
 
 ## 🗺️ Current Status and Roadmap
 
-Completed:
+The three crates are published as stable `1.2.0` releases. The resolver,
+cache, Fake IP, routing hooks and built-in transports are implemented. The
+built-in network transports and server still require Tokio. DNSSEC validation
+is not implemented and the built-in TLS configuration uses `aws-lc-rs`.
 
-1. **0.0** — repository/architecture baseline;
-2. **0.1** — core DNS model;
-3. **0.2** — resolver and static split DNS;
-4. **0.3** — upstream transports, failover, inbound server;
-5. **0.4** — Fake IP;
-6. **0.5** — dynamic route hooks;
-7. **0.6** — hardening, cross-platform validation, observability, package and
-   release checks;
-8. **1.0** — audited/froze the public API, established the stable SemVer
-   contract, and published the first stable release (`dns-lattice`,
-   `dns-lattice-core`, `dns-lattice-model` `1.0.0` on crates.io).
-
-The public API is now frozen: within the `1.x` line, additive changes land as
-minor releases and fixes as patch releases; a breaking change requires an
-explicit major version bump.
+Current work targets executor-independent networking, a choice of TLS crypto
+provider, and DNSSEC validation. Within the `1.x` line, breaking API changes
+require a major release.
 
 See [ROADMAP.md](ROADMAP.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the
 full delivery and contract details.
