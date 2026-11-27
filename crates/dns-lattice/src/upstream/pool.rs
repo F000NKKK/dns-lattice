@@ -60,7 +60,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use dns_lattice_core::{Error, Result};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
+use event_listener::Event;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
@@ -614,10 +615,59 @@ pub(crate) trait Connector: Send + Sync + 'static {
 /// The outcome of the connect in progress: `None` until it finishes.
 type ConnectState = Option<Result<()>>;
 
+/// One-shot connection result shared by all callers waiting for this attempt.
+struct ConnectSignal {
+    state: Mutex<ConnectState>,
+    completed: Event,
+}
+
+impl ConnectSignal {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            completed: Event::new(),
+        }
+    }
+
+    fn publish(&self, outcome: Result<()>) {
+        *lock(&self.state) = Some(outcome);
+        self.completed.notify(usize::MAX);
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let listener = self.completed.listen();
+        if let Some(outcome) = lock(&self.state).clone() {
+            return outcome;
+        }
+        listener.await;
+        lock(&self.state).clone().unwrap_or_else(|| {
+            Err(Error::Transport(
+                "upstream connection attempt was abandoned".to_string(),
+            ))
+        })
+    }
+}
+
+/// Publishes an abandonment if the connection owner disappears unexpectedly.
+struct ConnectPublisher(Arc<ConnectSignal>);
+
+impl Drop for ConnectPublisher {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        if state.is_none() {
+            *state = Some(Err(Error::Transport(
+                "upstream connection attempt was abandoned".to_string(),
+            )));
+            drop(state);
+            self.0.completed.notify(usize::MAX);
+        }
+    }
+}
+
 /// The connect currently in progress.
 struct Connecting {
     epoch: u64,
-    tx: watch::Sender<ConnectState>,
+    tx: ConnectPublisher,
     // Held for abort-on-drop only.
     _task: AbortOnDrop,
 }
@@ -850,7 +900,7 @@ impl<K: Connector> Shared<K> {
     fn start_connect_locked(this: &Arc<Self>, st: &mut State<K::Conn>) {
         let epoch = st.next_epoch;
         st.next_epoch += 1;
-        let (tx, _rx) = watch::channel(None);
+        let tx = ConnectPublisher(Arc::new(ConnectSignal::new()));
         let handle = tokio::spawn(run_connect(
             Arc::downgrade(this),
             Arc::clone(&this.connector),
@@ -931,7 +981,7 @@ impl<K: Connector> Shared<K> {
             this.observer.opened();
         }
         if let Some((tx, outcome)) = notify {
-            tx.send_replace(Some(outcome));
+            tx.0.publish(outcome);
         }
     }
 }
@@ -1299,7 +1349,7 @@ impl<K: Connector> Pool<K> {
                             Shared::start_connect_locked(shared, &mut st);
                         }
                         match st.connecting.as_ref() {
-                            Some(connecting) => Err(Some(connecting.tx.subscribe())),
+                            Some(connecting) => Err(Some(Arc::clone(&connecting.tx.0))),
                             None => Err(None),
                         }
                     }
@@ -1326,13 +1376,10 @@ fn pool_closed() -> Error {
     Error::Transport("upstream connection pool has no capacity".to_string())
 }
 
-async fn wait_connect(mut rx: watch::Receiver<ConnectState>, deadline: Instant) -> Result<()> {
-    match timeout_at(deadline, rx.wait_for(Option::is_some)).await {
+async fn wait_connect(signal: Arc<ConnectSignal>, deadline: Instant) -> Result<()> {
+    match timeout_at(deadline, signal.wait()).await {
         Err(_) => Err(Error::Timeout),
-        Ok(Err(_)) => Err(Error::Transport(
-            "upstream connection attempt was abandoned".to_string(),
-        )),
-        Ok(Ok(state)) => state.clone().unwrap_or(Ok(())),
+        Ok(outcome) => outcome,
     }
 }
 
@@ -1640,6 +1687,44 @@ mod tests {
 
     use super::recorder::Recorder;
     use super::*;
+
+    #[test]
+    fn connect_signal_wakes_followers_without_a_tokio_runtime() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let signal = Arc::new(ConnectSignal::new());
+        let publisher = ConnectPublisher(Arc::clone(&signal));
+        let mut first = Box::pin(signal.wait());
+        let mut second = Box::pin(signal.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        drop(first);
+        publisher.0.publish(Err(Error::NoRoute));
+        drop(publisher);
+        assert!(matches!(async_io::block_on(second), Err(Error::NoRoute)));
+        assert!(matches!(
+            async_io::block_on(signal.wait()),
+            Err(Error::NoRoute)
+        ));
+    }
+
+    #[test]
+    fn dropping_connect_publisher_wakes_waiters_with_abandoned_error() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let signal = Arc::new(ConnectSignal::new());
+        let publisher = ConnectPublisher(Arc::clone(&signal));
+        let mut wait = Box::pin(signal.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        drop(publisher);
+        assert!(
+            matches!(async_io::block_on(wait), Err(Error::Transport(message)) if message.contains("abandoned"))
+        );
+    }
 
     // ---- fake connector ---------------------------------------------------
 
