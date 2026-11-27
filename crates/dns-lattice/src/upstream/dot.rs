@@ -57,7 +57,12 @@ impl DotBackendConfig {
     ) -> Self {
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+        let tls_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the configured provider must support the default TLS versions")
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -328,25 +333,92 @@ mod tests {
     /// that trusts exactly that certificate (not the system/webpki root
     /// store) — fully offline and deterministic per `@.claude/rules/ci.md`.
     fn self_signed_fixture() -> (ServerConfig, ClientConfig, ServerName<'static>) {
+        self_signed_fixture_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+    }
+
+    fn self_signed_fixture_with_provider(
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> (ServerConfig, ClientConfig, ServerName<'static>) {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der: CertificateDer<'static> = cert.der().clone();
         let key_der: PrivateKeyDer<'static> =
             PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-        let server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)
-            .unwrap();
+        let server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .unwrap();
 
         let mut roots = RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let client_config = ClientConfig::builder()
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
 
         let server_name = ServerName::try_from("localhost").unwrap();
         (server_config, client_config, server_name)
+    }
+
+    #[cfg(feature = "tls-ring")]
+    #[test]
+    fn webpki_constructor_works_with_both_providers_compiled() {
+        let config = DotBackendConfig::with_webpki_roots(
+            "127.0.0.1:853".parse().unwrap(),
+            ServerName::try_from("localhost").unwrap(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert_eq!(config.server.port(), 853);
+    }
+
+    #[cfg(feature = "tls-ring")]
+    #[tokio::test]
+    async fn ring_client_resolves_over_tls_with_both_providers_enabled() {
+        let (server, client, server_name) =
+            self_signed_fixture_with_provider(Arc::new(rustls::crypto::ring::default_provider()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(server))
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut length = [0; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut bytes = vec![0; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let query = Message::decode(&bytes).unwrap();
+            let response = answer_for("example.com", query.header.id).encode().unwrap();
+            stream
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        let backend = DotBackend::new(DotBackendConfig {
+            server: addr,
+            server_name,
+            tls_config: Arc::new(client),
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+        });
+        assert!(
+            backend
+                .resolve(&query_for("example.com"))
+                .await
+                .unwrap()
+                .header
+                .qr
+        );
+        responder.await.unwrap();
     }
 
     #[tokio::test]

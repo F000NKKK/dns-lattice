@@ -15,8 +15,9 @@ individual slices.
   library's network I/O, scheduling and timers; internal notifications and
   stream channels have begun moving to runtime-independent primitives. The
   built-in transports and listeners still require Tokio.
-- **TLS provider selection (planned):** support both `aws-lc-rs` and `ring`
-  without relying on an ambiguous process-wide rustls provider.
+- **TLS provider selection (active):** `tls-ring` enables explicit `ring`
+  configurations alongside AWS-LC. Removing the unconditional AWS-LC
+  dependency and expanding provider coverage remain to be done.
 - **DNSSEC validation (planned):** validate signatures and chains from
   configured trust anchors, including authenticated denial of existence.
   An EDNS DO bit or an upstream AD bit alone is not validation.

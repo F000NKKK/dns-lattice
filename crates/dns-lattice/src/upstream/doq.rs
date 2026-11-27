@@ -109,7 +109,12 @@ impl DoqBackendConfig {
     ) -> Self {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut tls_config = RustlsClientConfig::builder()
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+        let mut tls_config = RustlsClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the configured provider must support the default TLS versions")
             .with_root_certificates(root_store)
             .with_no_client_auth();
         tls_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
@@ -606,10 +611,14 @@ mod tests {
         let key_der: PrivateKeyDer<'static> =
             PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-        let mut rustls_server_config = RustlsServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)
-            .unwrap();
+        let mut rustls_server_config = RustlsServerConfig::builder_with_provider(
+            std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .unwrap();
         rustls_server_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
 
         let quic_server_config: QuicServerConfig = rustls_server_config
@@ -625,9 +634,13 @@ mod tests {
 
         let mut roots = RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let mut client_config = RustlsClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut client_config = RustlsClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         client_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
 
         let server_name = ServerName::try_from("localhost").unwrap();

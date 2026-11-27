@@ -1610,17 +1610,25 @@ mod tests {
         let key_der: PrivateKeyDer<'static> =
             PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)
-            .unwrap();
+        let mut server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .unwrap();
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let mut roots = RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let client_config = ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
 
         (server_config, client_config)
     }

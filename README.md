@@ -766,7 +766,7 @@ docs.rs page (version 0.26.3).
 | **Purpose** | Resolver engine plus inbound server in one crate | Stub resolver (serving is a separate crate, `hickory-server`) |
 | **UDP / TCP** | ✅ Default build | ✅ Default build |
 | **DoT / DoH / DoH3 / DoQ upstreams** | ✅ `dot`, `doh`, `doq` features | ✅ `tls-*`, `https-*`, `h3-*`, `quic-*` features |
-| **TLS crypto provider** | `aws-lc-rs` | `aws-lc-rs` or `ring` |
+| **TLS crypto provider** | `aws-lc-rs`; unreleased `main` also supports `ring` in explicit TLS configs | `aws-lc-rs` or `ring` |
 | **Inbound DoT / DoH / DoQ listener** | ✅ Built in | ➖ Not part of the resolver crate |
 | **Per-domain split DNS to upstream groups** | ✅ `SplitDnsPolicy` | ➖ Not described in its docs |
 | **Fake IP** | ✅ Built in | ➖ Not described in its docs |
@@ -902,8 +902,9 @@ cache, Fake IP, routing hooks and built-in transports are implemented. The
 built-in network transports and server still require Tokio. DNSSEC validation
 is not implemented and the built-in TLS configuration uses `aws-lc-rs`.
 
-Current work targets executor-independent networking, a choice of TLS crypto
-provider, and DNSSEC validation. Within the `1.x` line, breaking API changes
+Current work targets executor-independent networking, flexible TLS crypto
+providers, and DNSSEC validation. Unreleased `main` exposes `tls-ring` for
+explicit rustls configurations; it still links AWS-LC. Within the `1.x` line, breaking API changes
 require a major release.
 
 See [ROADMAP.md](ROADMAP.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for the

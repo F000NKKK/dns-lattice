@@ -261,6 +261,15 @@ servers on timeout, transport or TLS errors. The selector and pool do not
 require a runtime; the configured backends can still require one. Resolver
 events identify the pool as one backend, not its individual servers.
 
+Unreleased `main` also provides the `tls-ring` feature. With it, applications
+can pass rustls client or server configurations built with
+`rustls::crypto::ring::default_provider()` explicitly. The crate still links
+AWS-LC; WebPKI-root convenience constructors use the installed process
+provider or fall back to AWS-LC. When
+both providers are enabled, rustls's global default is ambiguous, so use
+`builder_with_provider` rather than relying on `ClientConfig::builder()` or
+`ServerConfig::builder()`.
+
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •
 [architecture](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md) •

@@ -2410,16 +2410,24 @@ mod tests {
             let key_der: PrivateKeyDer<'static> =
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-            let server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der.clone()], key_der)
-                .unwrap();
+            let server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
 
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
-            let client_config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let client_config = ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
 
             let server_name = ServerName::try_from("localhost").unwrap();
             (server_config, client_config, server_name)
@@ -2595,17 +2603,25 @@ mod tests {
             let key_der: PrivateKeyDer<'static> =
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der.clone()], key_der)
-                .unwrap();
+            let mut server_config = ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
             server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
-            let client_config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let client_config = ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
 
             let server_name = ServerName::try_from("localhost").unwrap();
             (server_config, client_config, server_name)
@@ -3389,10 +3405,14 @@ mod tests {
             let key_der: PrivateKeyDer<'static> =
                 PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
-            let mut rustls_server_config = RustlsServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der.clone()], key_der)
-                .unwrap();
+            let mut rustls_server_config = RustlsServerConfig::builder_with_provider(
+                std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
             rustls_server_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
             let quic_server_config: QuicServerConfig = rustls_server_config
                 .try_into()
@@ -3401,9 +3421,13 @@ mod tests {
 
             let mut roots = RootCertStore::empty();
             roots.add(cert_der).unwrap();
-            let mut rustls_client_config = RustlsClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let mut rustls_client_config = RustlsClientConfig::builder_with_provider(
+                std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             rustls_client_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
             let quic_client_config: QuicClientConfig =
                 rustls_client_config.try_into().expect("valid tls config");
