@@ -67,8 +67,9 @@ use std::time::Duration;
 
 use dns_lattice_core::{Error, Result};
 use dns_lattice_model::{Message, Opcode};
+use event_listener::Event;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::pool::{
@@ -151,7 +152,7 @@ struct ConnShared {
     /// At least one query received its answer here.
     answered: AtomicBool,
     next_serial: AtomicU64,
-    closed: watch::Sender<bool>,
+    closed: Event,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -171,7 +172,7 @@ impl ConnShared {
             st.table.drain_pending()
         };
         self.dead.store(true, Ordering::Release);
-        self.closed.send_replace(true);
+        self.closed.notify(usize::MAX);
         for waiter in waiters {
             let _ = waiter.tx.send(Err(failure.clone()));
         }
@@ -179,6 +180,13 @@ impl ConnShared {
 
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    async fn wait_closed(&self) {
+        let listener = self.closed.listen();
+        if !self.is_dead() {
+            listener.await;
+        }
     }
 }
 
@@ -252,7 +260,6 @@ impl StreamConn {
     {
         let (read_half, write_half) = tokio::io::split(stream);
         let (frames, queue) = mpsc::channel(max_in_flight.max(1));
-        let (closed, _) = watch::channel(false);
         let shared = Arc::new(ConnShared {
             state: Mutex::new(ConnState {
                 table: PendingTable::new(max_in_flight, read_timeout),
@@ -264,7 +271,7 @@ impl StreamConn {
             peer_closed: AtomicBool::new(false),
             answered: AtomicBool::new(false),
             next_serial: AtomicU64::new(0),
-            closed,
+            closed: Event::new(),
         });
         let reader = tokio::spawn(run_reader(read_half, Arc::clone(&shared), hooks));
         let writer = tokio::spawn(run_writer(
@@ -385,7 +392,6 @@ fn dispatch(shared: &ConnShared, hooks: &PoolHooks, frame: &[u8]) -> bool {
 }
 
 async fn run_reader<R: AsyncRead + Unpin>(mut read: R, shared: Arc<ConnShared>, hooks: PoolHooks) {
-    let mut closed = shared.closed.subscribe();
     let mut buf: Vec<u8> = Vec::with_capacity(INITIAL_READ_BUFFER);
     loop {
         let mut consumed = 0;
@@ -413,7 +419,7 @@ async fn run_reader<R: AsyncRead + Unpin>(mut read: R, shared: Arc<ConnShared>, 
         }
         let read_some = tokio::select! {
             result = read.read_buf(&mut buf) => result,
-            _ = closed.wait_for(|c| *c) => return,
+            _ = shared.wait_closed() => return,
         };
         match read_some {
             Ok(0) => {
@@ -447,13 +453,12 @@ async fn run_writer<W: AsyncWrite + Unpin>(
     shared: Arc<ConnShared>,
     write_timeout: Duration,
 ) {
-    let mut closed = shared.closed.subscribe();
     let mut batch: Vec<Vec<u8>> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
     loop {
         let received = tokio::select! {
             n = queue.recv_many(&mut batch, WRITE_BATCH) => n,
-            _ = closed.wait_for(|c| *c) => return,
+            _ = shared.wait_closed() => return,
         };
         if received == 0 {
             // Every sender is gone: the connection was dropped.
@@ -673,6 +678,37 @@ mod tests {
     use super::super::pool::recorder::Recorder;
     use super::*;
     use crate::observability::{ObservabilitySink, PoolCloseReason, PoolEvent};
+
+    #[test]
+    fn closing_a_stream_wakes_all_live_listeners_without_tokio() {
+        use std::task::{Context, Poll, Waker};
+
+        let shared = ConnShared {
+            state: Mutex::new(ConnState {
+                table: PendingTable::new(1, Duration::from_secs(1)),
+                closed: false,
+                slack: 0,
+                slack_cap: 0,
+            }),
+            dead: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
+            next_serial: AtomicU64::new(0),
+            closed: Event::new(),
+        };
+        let mut first = Box::pin(shared.wait_closed());
+        let mut cancelled = Box::pin(shared.wait_closed());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            cancelled.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(cancelled);
+        shared.fail(&Failure::closed("test"));
+        async_io::block_on(first);
+        async_io::block_on(shared.wait_closed());
+    }
 
     // ---- wire helpers ---------------------------------------------------------
 
