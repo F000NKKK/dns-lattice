@@ -773,7 +773,7 @@ docs.rs page (version 0.26.3).
 | **Per-query routing hook** | ✅ `RouteHook` | ➖ Not described in its docs |
 | **DNSSEC validation** | ❌ | ✅ `dnssec-*` features |
 | **System resolver config** (`/etc/resolv.conf`, Windows) | ❌ By design; the host configures everything | ✅ `system-config` (default) |
-| **Upstream connection reuse** | ⚠️ Pooled for TCP, DoT, DoH (HTTP/1.1, HTTP/2), DoH3 and DoQ | ✅ Name-server pool |
+| **Upstream pooling** | Connection reuse for TCP, DoT, DoH, DoH3 and DoQ; pluggable name-server pool in unreleased `main` | ✅ Name-server pool |
 | **EDNS0 on UDP** | ➖ The inbound server answers EDNS clients with up to 1232 bytes (configurable), with `FORMERR`/`BADVERS` handled locally; `UdpBackend` forwards the client's OPT record and, unless `with_edns_udp_payload_size` opts in, adds none | Not compared |
 | **Throughput and latency** | Not yet benchmarked | Not yet benchmarked |
 

@@ -1630,7 +1630,7 @@ fn outcome_of(result: &Result<UpstreamAnswer>) -> Outcome {
 /// retryable, since none indicate a client-input problem and a different
 /// backend in the same group may have independent connectivity/TLS
 /// configuration.
-fn is_retryable(err: &Error) -> bool {
+pub(crate) fn is_retryable(err: &Error) -> bool {
     matches!(err, Error::Timeout | Error::Transport(_) | Error::Tls(_))
 }
 
@@ -2085,6 +2085,26 @@ mod tests {
             0,
             "second backend never called once the first succeeds"
         );
+    }
+
+    #[test]
+    fn resolver_can_use_a_nameserver_pool_without_tokio() {
+        let policy = SplitDnsPolicy::builder()
+            .default_group(UpstreamGroupId::new("g"))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pool = crate::upstream::NameServerPool::new(FailingBackend(Error::Timeout))
+            .with_backend(CountingBackend {
+                answer: answer_tagged(2),
+                calls: Arc::clone(&calls),
+            });
+        let resolver = Resolver::builder(policy)
+            .backend(UpstreamGroupId::new("g"), pool)
+            .cache(CacheConfig::disabled())
+            .build();
+        async_io::block_on(resolver.resolve(&query_for("example.com"))).unwrap();
+        async_io::block_on(resolver.resolve(&query_for("example.net"))).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

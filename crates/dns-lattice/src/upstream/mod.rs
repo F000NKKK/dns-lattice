@@ -105,6 +105,8 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 mod pool;
 pub use pool::{PoolConfig, PoolStats};
+mod nameservers;
+pub use nameservers::{NameServerBalancer, NameServerPool, RoundRobin};
 
 mod stream;
 use stream::{StreamOpen, StreamPool};

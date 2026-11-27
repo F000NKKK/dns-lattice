@@ -149,6 +149,13 @@ A hook failure, unknown selected group, or selected group with no backends is
 an error. DNS Lattice does not silently fall back to a different static group
 after the hook has failed or selected an invalid route.
 
+An upstream group can contain a `NameServerPool` backend (unreleased): its
+pluggable `NameServerBalancer` chooses the first server, and retryable
+failures try the remaining servers in cyclic registration order. The default
+is `RoundRobin`. The pool owns no runtime; its member backends may require
+one. Resolver observability reports the pool as one backend, while caching
+remains scoped to the upstream group.
+
 ## DNS model and matching
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:

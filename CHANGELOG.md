@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `NameServerPool` groups upstream backends using a pluggable
+  `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
+  the remaining servers in cyclic order. The pool is executor-independent;
+  individual backends can still require a runtime.
+
 ### Changed
 
 - In-flight cache coalescing uses executor-independent notifications instead

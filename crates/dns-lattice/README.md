@@ -255,6 +255,12 @@ bits do not imply local validation. TLS configurations use `aws-lc-rs` by defaul
 Executor independence, selectable TLS providers and DNSSEC validation are planned work.
 Breaking public API changes require a major release.
 
+Unreleased `main` adds `NameServerPool`, a backend that selects among servers
+through a `NameServerBalancer` (round-robin by default) and retries other
+servers on timeout, transport or TLS errors. The selector and pool do not
+require a runtime; the configured backends can still require one. Resolver
+events identify the pool as one backend, not its individual servers.
+
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •
 [architecture](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md) •
