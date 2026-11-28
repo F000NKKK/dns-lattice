@@ -37,8 +37,8 @@ operating-system dependency.
   this crate does not perform DNSSEC validation.
 - **Unreleased `main`:** `dnssec::Dnskey`, `dnssec::Ds` and `dnssec::Rrsig`
   parse their respective RDATA, including DNSKEY key-tag calculation. The
-  optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
-  matching. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
+  `DsDigest` trait supports pluggable DS matching; optional `dnssec-sha2`
+  provides SHA-256 and SHA-384. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
   other than DS and DNSKEY are rejected. A `SignatureVerifier` trait allows
   alternative implementations; the `dnssec-ring` backend verifies RSA/SHA-256,
   RSA/SHA-512, Ed25519 and ECDSA P-256/P-384

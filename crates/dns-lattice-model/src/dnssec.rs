@@ -7,10 +7,7 @@
 /// Runtime-independent signature backend interface and implementations.
 pub mod crypto;
 
-use crypto::{CryptoError, SignatureVerifier};
-
-#[cfg(feature = "dnssec-sha2")]
-use sha2::{Digest, Sha256};
+use crypto::{CryptoError, DsDigest, SignatureVerifier};
 
 use crate::{Class, Name, RData, ResourceRecord};
 
@@ -85,22 +82,6 @@ impl<'a> Dnskey<'a> {
         sum += (sum >> 16) & 0xffff;
         Some(sum as u16)
     }
-
-    /// Computes the SHA-256 DS digest of the canonical owner name and this
-    /// DNSKEY RDATA (RFC 4509). This does not establish trust in the key.
-    #[cfg(feature = "dnssec-sha2")]
-    pub fn ds_digest_sha256(&self, owner: &Name) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for label in owner.labels() {
-            hasher.update([label.len() as u8]);
-            for byte in label {
-                hasher.update([byte.to_ascii_lowercase()]);
-            }
-        }
-        hasher.update([0]);
-        hasher.update(self.wire);
-        hasher.finalize().into()
-    }
 }
 
 /// A delegation signer (DS) RDATA view (RFC 4034 section 5.1).
@@ -135,16 +116,20 @@ impl<'a> Ds<'a> {
         })
     }
 
-    /// Tests whether this SHA-256 DS has the key tag, algorithm and digest
+    /// Tests whether this DS has the key tag, algorithm and digest
     /// of `key` under `owner`. A match alone does not authenticate the DS,
     /// validate key flags/protocol, or validate any DNSSEC signatures.
-    /// Unsupported digest types and malformed digest lengths return `false`.
-    #[cfg(feature = "dnssec-sha2")]
-    pub fn matches_dnskey_sha256(&self, owner: &Name, key: &Dnskey<'_>) -> bool {
-        self.digest_type == 2
+    /// A digest type mismatch or malformed digest length returns `false`.
+    pub fn matches_dnskey(
+        &self,
+        digest: &(impl DsDigest + ?Sized),
+        owner: &Name,
+        key: &Dnskey<'_>,
+    ) -> bool {
+        self.digest_type == digest.digest_type()
             && key.key_tag() == Some(self.key_tag)
             && key.algorithm() == self.algorithm
-            && self.digest == key.ds_digest_sha256(owner)
+            && self.digest == digest.digest(owner, key)
     }
 }
 
@@ -482,30 +467,30 @@ mod tests {
                 0x46, 0x9d, 0xa5, 0x0a,
             ];
             let owner = Name::from_ascii("DsKey.Example.COM").unwrap();
-            assert_eq!(key.ds_digest_sha256(&owner), expected);
+            assert_eq!(crypto::Sha256Digest.digest(&owner, &key), expected);
             let ds = Ds {
                 key_tag: 60485,
                 algorithm: 5,
                 digest_type: 2,
                 digest: &expected,
             };
-            assert!(ds.matches_dnskey_sha256(&owner, &key));
-            assert!(!ds.matches_dnskey_sha256(&Name::root(), &key));
-            assert!(!Ds { key_tag: 1, ..ds }.matches_dnskey_sha256(&owner, &key));
-            assert!(!Ds { algorithm: 8, ..ds }.matches_dnskey_sha256(&owner, &key));
+            assert!(ds.matches_dnskey(&crypto::Sha256Digest, &owner, &key));
+            assert!(!ds.matches_dnskey(&crypto::Sha256Digest, &Name::root(), &key));
+            assert!(!Ds { key_tag: 1, ..ds }.matches_dnskey(&crypto::Sha256Digest, &owner, &key));
+            assert!(!Ds { algorithm: 8, ..ds }.matches_dnskey(&crypto::Sha256Digest, &owner, &key));
             assert!(
                 !Ds {
                     digest_type: 1,
                     ..ds
                 }
-                .matches_dnskey_sha256(&owner, &key)
+                .matches_dnskey(&crypto::Sha256Digest, &owner, &key)
             );
             assert!(
                 !Ds {
                     digest: &expected[..31],
                     ..ds
                 }
-                .matches_dnskey_sha256(&owner, &key)
+                .matches_dnskey(&crypto::Sha256Digest, &owner, &key)
             );
         }
     }
@@ -527,6 +512,28 @@ mod tests {
         assert!(Ds::parse(&[0, 1, 8]).is_none());
         assert!(Ds::parse(&vec![0; 65536]).is_none());
         assert!(Dnskey::parse(&vec![0; 65536]).is_none());
+    }
+
+    #[test]
+    fn ds_accepts_a_custom_digest_backend_without_features() {
+        struct External;
+        impl DsDigest for External {
+            fn digest_type(&self) -> u8 {
+                222
+            }
+            fn digest(&self, _owner: &Name, _key: &Dnskey<'_>) -> Vec<u8> {
+                vec![1, 2, 3]
+            }
+        }
+        let key = Dnskey::parse(&[1, 0, 3, 8, 4]).unwrap();
+        let ds = Ds {
+            key_tag: key.key_tag().unwrap(),
+            algorithm: 8,
+            digest_type: 222,
+            digest: &[1, 2, 3],
+        };
+        let backend: &dyn DsDigest = &External;
+        assert!(ds.matches_dnskey(backend, &Name::root(), &key));
     }
 
     #[test]

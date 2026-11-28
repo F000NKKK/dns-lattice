@@ -166,6 +166,9 @@ signature bytes. The `dnssec-ring` feature provides `RingVerifier`, currently
 supporting RSA/SHA-256, RSA/SHA-512, Ed25519 and ECDSA P-256/P-384.
 Signature verification alone does not establish a chain
 of trust or validate negative DNS answers.
+The independent `DsDigest` trait selects a DS digest implementation;
+`dnssec-sha2` provides SHA-256 and SHA-384. Comparing a DS digest does not
+authenticate the DS record or the DNSKEY.
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
 

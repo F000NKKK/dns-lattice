@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Model helpers parse DNSKEY, DS and RRSIG RDATA and calculate DNSKEY key tags.
-  The optional `dnssec-sha2` feature computes and compares SHA-256 DS digests;
+  A pluggable `DsDigest` interface supports optional SHA-256 and SHA-384 DS
+  digests through `dnssec-sha2`;
   these helpers do not validate DNSSEC responses or establish trust.
 - RRSIG can construct canonical signed data for typed RRsets and raw DS or
   DNSKEY RRsets. Other raw types are rejected until supported explicitly.

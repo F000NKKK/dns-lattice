@@ -2,8 +2,23 @@
 
 #[cfg(feature = "dnssec-ring")]
 mod ring;
+#[cfg(feature = "dnssec-sha2")]
+mod sha2;
 #[cfg(feature = "dnssec-ring")]
 pub use ring::RingVerifier;
+#[cfg(feature = "dnssec-sha2")]
+pub use sha2::{Sha256Digest, Sha384Digest};
+
+use crate::{Name, dnssec::Dnskey};
+
+/// Computes one DS digest algorithm over a canonical DNSKEY owner and RDATA.
+/// A digest match is not a validation of trust, key flags or signatures.
+pub trait DsDigest: Send + Sync {
+    /// DNSSEC DS digest type number.
+    fn digest_type(&self) -> u8;
+    /// Computes the complete digest for `key` and its owner.
+    fn digest(&self, owner: &Name, key: &Dnskey<'_>) -> Vec<u8>;
+}
 
 /// A cryptographic backend for DNSSEC signature algorithms.
 ///
