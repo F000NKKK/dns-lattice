@@ -7,7 +7,7 @@
 #[cfg(feature = "dnssec-sha2")]
 use sha2::{Digest, Sha256};
 
-use crate::Name;
+use crate::{Class, Name, RData, ResourceRecord};
 
 /// A DNSKEY RDATA view (RFC 4034 section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +209,147 @@ impl<'a> Rrsig<'a> {
             signature: &rdata[cursor..],
         })
     }
+
+    /// Builds the canonical bytes covered by this RRSIG for an RRset.
+    ///
+    /// `owner` and `class` are the RRSIG record's owner and class. Every
+    /// record must match them and the covered type. The method reconstructs
+    /// wildcard owners, uses the original TTL, sorts canonical RDATA, and
+    /// removes duplicate records. It supports the model's typed RDATA and
+    /// raw DS/DNSKEY records; other raw types are rejected because their
+    /// canonical form may require type-specific processing. This method does
+    /// not check signature time, signer authority, or cryptography.
+    pub fn signed_data(
+        &self,
+        owner: &Name,
+        class: Class,
+        rrset: &[ResourceRecord],
+    ) -> Result<Vec<u8>, CanonicalError> {
+        if rrset.is_empty() {
+            return Err(CanonicalError::EmptySet);
+        }
+        if class.to_u16() == 0 {
+            return Err(CanonicalError::InvalidRecord);
+        }
+        let labels: Vec<_> = owner.labels().collect();
+        let signed_labels = usize::from(self.labels);
+        if signed_labels > labels.len() {
+            return Err(CanonicalError::InvalidLabels);
+        }
+        let mut canonical_owner = Vec::new();
+        if signed_labels < labels.len() {
+            canonical_owner.extend_from_slice(&[1, b'*']);
+        }
+        for label in &labels[labels.len() - signed_labels..] {
+            canonical_owner.push(label.len() as u8);
+            canonical_owner.extend(label.iter().map(u8::to_ascii_lowercase));
+        }
+        canonical_owner.push(0);
+
+        let mut records = Vec::with_capacity(rrset.len());
+        for rr in rrset {
+            if rr.name != *owner
+                || rr.class != class
+                || rr.rtype.to_u16() != self.type_covered
+                || rr.rdata.record_type().to_u16() != self.type_covered
+            {
+                return Err(CanonicalError::InvalidRecord);
+            }
+            let mut data = Vec::new();
+            canonical_rdata(&rr.rdata, &mut data)?;
+            if data.len() > usize::from(u16::MAX) {
+                return Err(CanonicalError::DataTooLong);
+            }
+            records.push(data);
+        }
+        records.sort_unstable();
+        records.dedup();
+
+        let mut output = Vec::new();
+        output.extend_from_slice(&self.type_covered.to_be_bytes());
+        output.extend_from_slice(&[self.algorithm, self.labels]);
+        output.extend_from_slice(&self.original_ttl.to_be_bytes());
+        output.extend_from_slice(&self.expiration.to_be_bytes());
+        output.extend_from_slice(&self.inception.to_be_bytes());
+        output.extend_from_slice(&self.key_tag.to_be_bytes());
+        canonical_name(&self.signer, &mut output);
+        for data in records {
+            output.extend_from_slice(&canonical_owner);
+            output.extend_from_slice(&self.type_covered.to_be_bytes());
+            output.extend_from_slice(&class.to_u16().to_be_bytes());
+            output.extend_from_slice(&self.original_ttl.to_be_bytes());
+            output.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            output.extend_from_slice(&data);
+        }
+        Ok(output)
+    }
+}
+
+/// Why a DNSSEC RRset cannot be converted to supported canonical form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalError {
+    /// The RRset contains no records.
+    EmptySet,
+    /// RRSIG label count exceeds the owner label count.
+    InvalidLabels,
+    /// A record's owner, class, type or data does not match the RRset.
+    InvalidRecord,
+    /// The raw record type needs canonicalization not implemented here.
+    UnsupportedType,
+    /// Encoded record data exceeds the DNS RDLENGTH limit.
+    DataTooLong,
+}
+
+impl std::fmt::Display for CanonicalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNSSEC canonicalization failed: {self:?}")
+    }
+}
+impl std::error::Error for CanonicalError {}
+
+fn canonical_name(name: &Name, output: &mut Vec<u8>) {
+    for label in name.labels() {
+        output.push(label.len() as u8);
+        output.extend(label.iter().map(u8::to_ascii_lowercase));
+    }
+    output.push(0);
+}
+
+fn canonical_rdata(rdata: &RData, output: &mut Vec<u8>) -> Result<(), CanonicalError> {
+    match rdata {
+        RData::Cname(name) | RData::Ptr(name) | RData::Ns(name) => canonical_name(name, output),
+        RData::Mx {
+            preference,
+            exchange,
+        } => {
+            output.extend_from_slice(&preference.to_be_bytes());
+            canonical_name(exchange, output);
+        }
+        RData::Soa {
+            mname,
+            rname,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minimum,
+        } => {
+            canonical_name(mname, output);
+            canonical_name(rname, output);
+            for field in [serial, refresh, retry, expire, minimum] {
+                output.extend_from_slice(&field.to_be_bytes());
+            }
+        }
+        RData::Unknown {
+            rtype: 43 | 48,
+            data,
+        } => output.extend_from_slice(data),
+        RData::Unknown { .. } => return Err(CanonicalError::UnsupportedType),
+        other => other
+            .encode(output)
+            .map_err(|_| CanonicalError::InvalidRecord)?,
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,5 +473,98 @@ mod tests {
         data.extend_from_slice(&[0]);
         assert!(Rrsig::parse(&data).unwrap().signer.is_root());
         assert!(Rrsig::parse(&vec![0; 65536]).is_none());
+    }
+
+    #[test]
+    fn signed_data_sorts_deduplicates_and_reconstructs_wildcard() {
+        use crate::RecordType;
+        use std::net::Ipv4Addr;
+        let owner = Name::from_ascii("WWW.Example.COM").unwrap();
+        let sig = Rrsig {
+            type_covered: 1,
+            algorithm: 8,
+            labels: 2,
+            original_ttl: 300,
+            expiration: 8,
+            inception: 4,
+            key_tag: 42,
+            signer: Name::from_ascii("EXAMPLE.com").unwrap(),
+            signature: &[],
+        };
+        let record = |addr| ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::A,
+            class: Class::In,
+            ttl: 1,
+            rdata: RData::A(Ipv4Addr::new(192, 0, 2, addr)),
+        };
+        let data = sig
+            .signed_data(&owner, Class::In, &[record(2), record(1), record(2)])
+            .unwrap();
+        let mut expected = vec![0, 1, 8, 2, 0, 0, 1, 44, 0, 0, 0, 8, 0, 0, 0, 4, 0, 42];
+        expected.extend_from_slice(b"\x07example\x03com\0");
+        for addr in [1, 2] {
+            expected.extend_from_slice(b"\x01*\x07example\x03com\0");
+            expected.extend_from_slice(&[0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, addr]);
+        }
+        assert_eq!(data, expected);
+        assert_eq!(
+            sig.signed_data(&owner, Class::In, &[]),
+            Err(CanonicalError::EmptySet)
+        );
+        assert_eq!(
+            sig.signed_data(&owner, Class::Ch, &[record(1)]),
+            Err(CanonicalError::InvalidRecord)
+        );
+        let mut invalid = sig.clone();
+        invalid.labels = 4;
+        assert_eq!(
+            invalid.signed_data(&owner, Class::In, &[record(1)]),
+            Err(CanonicalError::InvalidLabels)
+        );
+    }
+
+    #[test]
+    fn signed_data_canonicalizes_names_and_rejects_unknown_type() {
+        use crate::RecordType;
+        let owner = Name::from_ascii("Example.COM").unwrap();
+        let mut sig = Rrsig {
+            type_covered: 5,
+            algorithm: 8,
+            labels: 2,
+            original_ttl: 1,
+            expiration: 2,
+            inception: 1,
+            key_tag: 3,
+            signer: owner.clone(),
+            signature: &[],
+        };
+        let cname = ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::Cname,
+            class: Class::In,
+            ttl: 5,
+            rdata: RData::Cname(Name::from_ascii("Alias.Example").unwrap()),
+        };
+        assert!(
+            sig.signed_data(&owner, Class::In, &[cname])
+                .unwrap()
+                .ends_with(b"\x05alias\x07example\0")
+        );
+        sig.type_covered = 47;
+        let unknown = ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::Other(47),
+            class: Class::In,
+            ttl: 5,
+            rdata: RData::Unknown {
+                rtype: 47,
+                data: vec![0],
+            },
+        };
+        assert_eq!(
+            sig.signed_data(&owner, Class::In, &[unknown]),
+            Err(CanonicalError::UnsupportedType)
+        );
     }
 }

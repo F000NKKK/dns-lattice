@@ -19,7 +19,8 @@ individual slices.
   AWS-LC when default features are disabled. Cross-platform validation of
   both providers remains in progress.
 - **DNSSEC validation (active):** DNSKEY/DS/RRSIG RDATA parsing, key-tag calculation,
-  and optional SHA-256 DS matching are implemented. Signature validation, chains from configured
+  optional SHA-256 DS matching, and canonicalization of supported RRsets are
+  implemented. Signature validation, chains from configured
   trust anchors, and authenticated denial of existence remain outstanding.
   An EDNS DO bit or an upstream AD bit alone is not validation.
 

@@ -38,8 +38,9 @@ operating-system dependency.
 - **Unreleased `main`:** `dnssec::Dnskey`, `dnssec::Ds` and `dnssec::Rrsig`
   parse their respective RDATA, including DNSKEY key-tag calculation. The
   optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
-  matching. These helpers do not authenticate a DS or verify signatures or
-  a chain of trust.
+  matching. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
+  other than DS and DNSKEY are rejected. These helpers do not authenticate a
+  DS or verify signatures or a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.
