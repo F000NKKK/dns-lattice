@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DelegationProof` combines signed DS and child DNSKEY checks into one
   positive delegation step with a caller-selected digest. It does not prove
   the zone cut, handle absence of DS, or resolve a complete trust chain.
+- `verify_positive_chain` checks a supplied sequence of such steps from a
+  trusted DNSKEY and requires each next key to belong to the previously
+  authenticated DNSKEY RRset. Record discovery, zone cuts, denial of
+  existence and final answer validation remain outside this helper.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;

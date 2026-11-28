@@ -280,7 +280,8 @@ caller has already authenticated.
 a parent DNSKEY the caller has already authenticated.
 `dnssec::delegation::DelegationProof` combines the DS and child DNSKEY
 checks for one positive delegation; it does not verify the zone cut or build
-a full trust chain.
+a full trust chain. `verify_positive_chain` composes supplied positive steps
+from a trusted DNSKEY; zone cuts and final DNS answers still need validation.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •

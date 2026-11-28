@@ -176,6 +176,10 @@ authenticated DS. These operations do not yet build a full trust chain.
 `DelegationProof` composes both checks for one positive delegation using one
 caller-selected digest; parent trust, zone-cut validation and digest selection
 remain the caller's responsibility.
+`verify_positive_chain` composes supplied steps from a trusted DNSKEY and
+requires each parent key to occur in the preceding authenticated DNSKEY
+RRset. It neither discovers records nor proves zone cuts, negative answers,
+or the final answer.
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
 
