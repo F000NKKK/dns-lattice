@@ -271,9 +271,9 @@ both providers are enabled, rustls's global default is ambiguous, so use
 `ServerConfig::builder()`.
 
 Unreleased `main` offers `dnssec-sha2` for SHA-256 DS matching and
-`dnssec-ring` for Ed25519 RRSIG checks; `verify_ed25519_at` includes the
-validity-period check. These do not authenticate the DS record or establish
-a chain of trust.
+`dnssec-ring` supplies an Ed25519 backend implementing `SignatureVerifier`;
+`Rrsig::verify_at` includes the validity-period check. These do not
+authenticate the DS record or establish a chain of trust.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •

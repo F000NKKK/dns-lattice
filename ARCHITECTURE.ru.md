@@ -160,6 +160,14 @@ DNS Lattice не выполняет молчаливый fallback к друго�
 
 ## DNS-модель и matching
 
+Криптографическая проверка DNSSEC использует независимый от рантайма трейт
+`dns_lattice::model::dnssec::crypto::SignatureVerifier`. Общий код RRSIG
+проверяет идентичность ключа, связь подписанта, канонический RRset и при
+необходимости время; backend проверяет ключ и подпись конкретного алгоритма.
+Feature `dnssec-ring` предоставляет `RingVerifier` с поддержкой Ed25519.
+Проверка подписи сама по себе не устанавливает цепочку доверия и не
+подтверждает отрицательные DNS-ответы.
+
 `dns-lattice-model` владеет protocol/domain типами, используемыми engine:
 
 - DNS `Message`, `Header`, `Question` и `ResourceRecord` wire model;

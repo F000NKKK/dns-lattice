@@ -4,6 +4,11 @@
 //! message model. These borrowed views allow callers to inspect their RDATA
 //! without altering the existing wire representation or allocating.
 
+/// Runtime-independent signature backend interface and implementations.
+pub mod crypto;
+
+use crypto::{CryptoError, SignatureVerifier};
+
 #[cfg(feature = "dnssec-sha2")]
 use sha2::{Digest, Sha256};
 
@@ -293,30 +298,28 @@ impl<'a> Rrsig<'a> {
         Ok(output)
     }
 
-    /// Verifies an Ed25519 RRSIG (algorithm 15) over a supported RRset.
+    /// Verifies an RRSIG over a supported RRset using `verifier`.
     ///
     /// This checks the DNSKEY owner against the signer name, zone-key flag,
     /// protocol, algorithm, key tag, signer ancestry and cryptographic
     /// signature. It does **not** authenticate the DNSKEY or DS, check the
     /// signature's validity period, establish a trust chain, or validate a
     /// DNS response. Callers must perform those checks separately.
-    #[cfg(feature = "dnssec-ring")]
-    pub fn verify_ed25519(
+    pub fn verify(
         &self,
+        verifier: &(impl SignatureVerifier + ?Sized),
         key_owner: &Name,
         key: &Dnskey<'_>,
         owner: &Name,
         class: Class,
         rrset: &[ResourceRecord],
     ) -> Result<(), SignatureError> {
-        if self.algorithm != 15 || key.algorithm() != 15 {
-            return Err(SignatureError::UnsupportedAlgorithm);
-        }
         if *key_owner != self.signer
             || !owner.ends_with(&self.signer)
             || usize::from(self.labels) < self.signer.label_count()
             || key.flags() & 0x0100 == 0
             || key.protocol() != 3
+            || key.algorithm() != self.algorithm
             || key.key_tag() != Some(self.key_tag)
         {
             return Err(SignatureError::InvalidKey);
@@ -324,18 +327,19 @@ impl<'a> Rrsig<'a> {
         let data = self
             .signed_data(owner, class, rrset)
             .map_err(SignatureError::Canonical)?;
-        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_key())
-            .verify(&data, self.signature)
-            .map_err(|_| SignatureError::InvalidSignature)
+        verifier
+            .verify(self.algorithm, key.public_key(), &data, self.signature)
+            .map_err(SignatureError::Crypto)
     }
 
-    /// Checks the validity window and verifies the Ed25519 signature.
+    /// Checks the validity window and verifies the signature.
     ///
-    /// `now` is Unix time in seconds modulo 2³². Like [`Self::verify_ed25519`],
+    /// `now` is Unix time in seconds modulo 2³². Like [`Self::verify`],
     /// this does not authenticate the DNSKEY or establish a trust chain.
-    #[cfg(feature = "dnssec-ring")]
-    pub fn verify_ed25519_at(
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_at(
         &self,
+        verifier: &(impl SignatureVerifier + ?Sized),
         key_owner: &Name,
         key: &Dnskey<'_>,
         owner: &Name,
@@ -346,34 +350,29 @@ impl<'a> Rrsig<'a> {
         if !self.valid_at(now) {
             return Err(SignatureError::OutsideValidityPeriod);
         }
-        self.verify_ed25519(key_owner, key, owner, class, rrset)
+        self.verify(verifier, key_owner, key, owner, class, rrset)
     }
 }
 
 /// Failure to cryptographically check a supported DNSSEC signature.
-#[cfg(feature = "dnssec-ring")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureError {
     /// The signature is not currently valid or its time window is ambiguous.
     OutsideValidityPeriod,
-    /// The requested verifier does not implement this algorithm.
-    UnsupportedAlgorithm,
     /// The DNSKEY or signer identity does not match the RRSIG.
     InvalidKey,
     /// The covered RRset cannot be canonicalized.
     Canonical(CanonicalError),
-    /// The public key or signature is malformed, or verification failed.
-    InvalidSignature,
+    /// The cryptographic backend rejected the algorithm, key, or signature.
+    Crypto(CryptoError),
 }
 
-#[cfg(feature = "dnssec-ring")]
 impl std::fmt::Display for SignatureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "DNSSEC signature check failed: {self:?}")
     }
 }
 
-#[cfg(feature = "dnssec-ring")]
 impl std::error::Error for SignatureError {}
 
 /// Why a DNSSEC RRset cannot be converted to supported canonical form.
@@ -694,6 +693,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signature_verifier_can_be_supplied_as_a_trait_object() {
+        use crate::RecordType;
+        struct External;
+        impl SignatureVerifier for External {
+            fn verify(
+                &self,
+                algorithm: u8,
+                key: &[u8],
+                data: &[u8],
+                sig: &[u8],
+            ) -> Result<(), CryptoError> {
+                assert_eq!((algorithm, key, sig), (222, &[7, 8][..], &[9][..]));
+                assert!(!data.is_empty());
+                Ok(())
+            }
+        }
+        let key_wire = [1, 0, 3, 222, 7, 8];
+        let key = Dnskey::parse(&key_wire).unwrap();
+        let owner = Name::from_ascii("example.com").unwrap();
+        let rr = ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::A,
+            class: Class::In,
+            ttl: 1,
+            rdata: RData::A(std::net::Ipv4Addr::LOCALHOST),
+        };
+        let sig = Rrsig {
+            type_covered: 1,
+            algorithm: 222,
+            labels: 2,
+            original_ttl: 1,
+            expiration: 2,
+            inception: 1,
+            key_tag: key.key_tag().unwrap(),
+            signer: owner.clone(),
+            signature: &[9],
+        };
+        let verifier: &dyn SignatureVerifier = &External;
+        assert_eq!(
+            sig.verify_at(verifier, &owner, &key, &owner, Class::In, &[rr], 1),
+            Ok(())
+        );
+    }
+
     #[cfg(feature = "dnssec-ring")]
     #[test]
     fn verifies_ed25519_rrset_and_rejects_tampering() {
@@ -729,11 +773,19 @@ mod tests {
         let signature = pair.sign(&signed);
         sig.signature = signature.as_ref();
         assert_eq!(
-            sig.verify_ed25519(&signer, &key, &owner, Class::In, std::slice::from_ref(&rr)),
+            sig.verify(
+                &crypto::RingVerifier,
+                &signer,
+                &key,
+                &owner,
+                Class::In,
+                std::slice::from_ref(&rr)
+            ),
             Ok(())
         );
         assert_eq!(
-            sig.verify_ed25519_at(
+            sig.verify_at(
+                &crypto::RingVerifier,
                 &signer,
                 &key,
                 &owner,
@@ -744,7 +796,8 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            sig.verify_ed25519_at(
+            sig.verify_at(
+                &crypto::RingVerifier,
                 &signer,
                 &key,
                 &owner,
@@ -757,11 +810,25 @@ mod tests {
         let mut tampered = rr.clone();
         tampered.rdata = RData::A(std::net::Ipv4Addr::new(192, 0, 2, 2));
         assert_eq!(
-            sig.verify_ed25519(&signer, &key, &owner, Class::In, &[tampered]),
-            Err(SignatureError::InvalidSignature)
+            sig.verify(
+                &crypto::RingVerifier,
+                &signer,
+                &key,
+                &owner,
+                Class::In,
+                &[tampered]
+            ),
+            Err(SignatureError::Crypto(CryptoError::InvalidSignature))
         );
         assert_eq!(
-            sig.verify_ed25519(&owner, &key, &owner, Class::In, &[rr]),
+            sig.verify(
+                &crypto::RingVerifier,
+                &owner,
+                &key,
+                &owner,
+                Class::In,
+                &[rr]
+            ),
             Err(SignatureError::InvalidKey)
         );
     }
@@ -806,7 +873,14 @@ mod tests {
             signature: &signature,
         };
         assert_eq!(
-            sig.verify_ed25519(&owner, &key, &owner, Class::In, &[rr]),
+            sig.verify(
+                &crypto::RingVerifier,
+                &owner,
+                &key,
+                &owner,
+                Class::In,
+                &[rr]
+            ),
             Ok(())
         );
     }

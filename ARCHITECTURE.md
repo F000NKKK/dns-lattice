@@ -158,6 +158,14 @@ remains scoped to the upstream group.
 
 ## DNS model and matching
 
+DNSSEC signature cryptography uses the runtime-independent
+`dns_lattice::model::dnssec::crypto::SignatureVerifier` boundary. Common
+RRSIG logic checks the key identity, signer relationship, canonical RRset and
+optionally time; the supplied backend verifies algorithm-specific key and
+signature bytes. The `dnssec-ring` feature provides `RingVerifier`, currently
+supporting Ed25519. Signature verification alone does not establish a chain
+of trust or validate negative DNS answers.
+
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
 
 - DNS `Message`, `Header`, `Question`, and `ResourceRecord` wire model;
