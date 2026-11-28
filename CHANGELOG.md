@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these helpers do not validate DNSSEC responses or establish trust.
 - RRSIG can construct canonical signed data for typed RRsets and raw DS or
   DNSKEY RRsets. Other raw types are rejected until supported explicitly.
+- The optional `dnssec-ring` feature checks Ed25519 RRSIG signatures over
+  supported RRsets. It does not check signature time or establish trust.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;

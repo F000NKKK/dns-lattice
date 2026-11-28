@@ -20,7 +20,8 @@ individual slices.
   both providers remains in progress.
 - **DNSSEC validation (active):** DNSKEY/DS/RRSIG RDATA parsing, key-tag calculation,
   optional SHA-256 DS matching, and canonicalization of supported RRsets are
-  implemented. Signature validation, chains from configured
+  implemented. Optional Ed25519 signature checks are available; validity
+  periods, other signature algorithms, chains from configured
   trust anchors, and authenticated denial of existence remain outstanding.
   An EDNS DO bit or an upstream AD bit alone is not validation.
 

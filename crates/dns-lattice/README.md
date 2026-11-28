@@ -270,8 +270,8 @@ both providers are enabled, rustls's global default is ambiguous, so use
 `builder_with_provider` rather than relying on `ClientConfig::builder()` or
 `ServerConfig::builder()`.
 
-Unreleased `main` offers `dnssec-sha2` for computing and matching SHA-256 DS
-digests against DNSKEY records. This does not validate DNSSEC signatures,
+Unreleased `main` offers `dnssec-sha2` for SHA-256 DS matching and
+`dnssec-ring` for Ed25519 RRSIG checks. These do not check signature time,
 authenticate the DS record, or establish a chain of trust.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •

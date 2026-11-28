@@ -39,8 +39,9 @@ operating-system dependency.
   parse their respective RDATA, including DNSKEY key-tag calculation. The
   optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
   matching. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
-  other than DS and DNSKEY are rejected. These helpers do not authenticate a
-  DS or verify signatures or a chain of trust.
+  other than DS and DNSKEY are rejected. The optional `dnssec-ring` feature
+  verifies Ed25519 RRSIG signatures. These helpers do not check signature
+  validity periods, authenticate a DS, or establish a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.
@@ -53,7 +54,8 @@ operating-system dependency.
 
 The default build depends only on
 [`dns-lattice-core`](https://crates.io/crates/dns-lattice-core); the
-unreleased `dnssec-sha2` feature also enables `sha2`.
+unreleased `dnssec-sha2` feature also enables `sha2`; `dnssec-ring` enables
+`ring` for Ed25519 verification.
 
 ## 📦 Installation
 

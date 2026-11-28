@@ -283,7 +283,67 @@ impl<'a> Rrsig<'a> {
         }
         Ok(output)
     }
+
+    /// Verifies an Ed25519 RRSIG (algorithm 15) over a supported RRset.
+    ///
+    /// This checks the DNSKEY owner against the signer name, zone-key flag,
+    /// protocol, algorithm, key tag, signer ancestry and cryptographic
+    /// signature. It does **not** authenticate the DNSKEY or DS, check the
+    /// signature's validity period, establish a trust chain, or validate a
+    /// DNS response. Callers must perform those checks separately.
+    #[cfg(feature = "dnssec-ring")]
+    pub fn verify_ed25519(
+        &self,
+        key_owner: &Name,
+        key: &Dnskey<'_>,
+        owner: &Name,
+        class: Class,
+        rrset: &[ResourceRecord],
+    ) -> Result<(), SignatureError> {
+        if self.algorithm != 15 || key.algorithm() != 15 {
+            return Err(SignatureError::UnsupportedAlgorithm);
+        }
+        if *key_owner != self.signer
+            || !owner.ends_with(&self.signer)
+            || usize::from(self.labels) < self.signer.label_count()
+            || key.flags() & 0x0100 == 0
+            || key.protocol() != 3
+            || key.key_tag() != Some(self.key_tag)
+        {
+            return Err(SignatureError::InvalidKey);
+        }
+        let data = self
+            .signed_data(owner, class, rrset)
+            .map_err(SignatureError::Canonical)?;
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_key())
+            .verify(&data, self.signature)
+            .map_err(|_| SignatureError::InvalidSignature)
+    }
 }
+
+/// Failure to cryptographically check a supported DNSSEC signature.
+#[cfg(feature = "dnssec-ring")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureError {
+    /// The requested verifier does not implement this algorithm.
+    UnsupportedAlgorithm,
+    /// The DNSKEY or signer identity does not match the RRSIG.
+    InvalidKey,
+    /// The covered RRset cannot be canonicalized.
+    Canonical(CanonicalError),
+    /// The public key or signature is malformed, or verification failed.
+    InvalidSignature,
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl std::fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNSSEC signature check failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl std::error::Error for SignatureError {}
 
 /// Why a DNSSEC RRset cannot be converted to supported canonical form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +625,101 @@ mod tests {
         assert_eq!(
             sig.signed_data(&owner, Class::In, &[unknown]),
             Err(CanonicalError::UnsupportedType)
+        );
+    }
+
+    #[cfg(feature = "dnssec-ring")]
+    #[test]
+    fn verifies_ed25519_rrset_and_rejects_tampering() {
+        use crate::RecordType;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let pair = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let mut key_wire = vec![1, 1, 3, 15];
+        key_wire.extend_from_slice(pair.public_key().as_ref());
+        let key = Dnskey::parse(&key_wire).unwrap();
+        let owner = Name::from_ascii("www.example.com").unwrap();
+        let signer = Name::from_ascii("example.com").unwrap();
+        let rr = ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::A,
+            class: Class::In,
+            ttl: 1,
+            rdata: RData::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        };
+        let mut sig = Rrsig {
+            type_covered: 1,
+            algorithm: 15,
+            labels: 3,
+            original_ttl: 300,
+            expiration: 10,
+            inception: 1,
+            key_tag: key.key_tag().unwrap(),
+            signer: signer.clone(),
+            signature: &[],
+        };
+        let signed = sig
+            .signed_data(&owner, Class::In, std::slice::from_ref(&rr))
+            .unwrap();
+        let signature = pair.sign(&signed);
+        sig.signature = signature.as_ref();
+        assert_eq!(
+            sig.verify_ed25519(&signer, &key, &owner, Class::In, std::slice::from_ref(&rr)),
+            Ok(())
+        );
+        let mut tampered = rr.clone();
+        tampered.rdata = RData::A(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        assert_eq!(
+            sig.verify_ed25519(&signer, &key, &owner, Class::In, &[tampered]),
+            Err(SignatureError::InvalidSignature)
+        );
+        assert_eq!(
+            sig.verify_ed25519(&owner, &key, &owner, Class::In, &[rr]),
+            Err(SignatureError::InvalidKey)
+        );
+    }
+
+    #[cfg(feature = "dnssec-ring")]
+    #[test]
+    fn verifies_rfc_8080_ed25519_mx_example() {
+        use crate::RecordType;
+        let mut key_wire = vec![1, 1, 3, 15];
+        key_wire.extend_from_slice(&[
+            151, 77, 150, 162, 45, 34, 75, 192, 26, 219, 145, 80, 145, 71, 125, 68, 204, 217, 28,
+            154, 65, 161, 20, 48, 1, 1, 23, 213, 44, 89, 36, 14,
+        ]);
+        let key = Dnskey::parse(&key_wire).unwrap();
+        // RFC 8080 verified erratum 4935 corrects the original signature.
+        let signature = [
+            160, 191, 100, 172, 155, 167, 239, 23, 193, 56, 133, 156, 24, 120, 187, 153, 168, 57,
+            254, 23, 89, 172, 165, 176, 215, 152, 207, 26, 177, 233, 141, 7, 145, 2, 244, 221, 179,
+            54, 143, 15, 228, 11, 179, 119, 241, 240, 14, 12, 221, 237, 183, 153, 22, 125, 86, 182,
+            233, 50, 120, 48, 114, 186, 141, 2,
+        ];
+        let owner = Name::from_ascii("example.com").unwrap();
+        let rr = ResourceRecord {
+            name: owner.clone(),
+            rtype: RecordType::Mx,
+            class: Class::In,
+            ttl: 3600,
+            rdata: RData::Mx {
+                preference: 10,
+                exchange: Name::from_ascii("mail.example.com").unwrap(),
+            },
+        };
+        let sig = Rrsig {
+            type_covered: 15,
+            algorithm: 15,
+            labels: 2,
+            original_ttl: 3600,
+            expiration: 1440021600,
+            inception: 1438207200,
+            key_tag: 3613,
+            signer: owner.clone(),
+            signature: &signature,
+        };
+        assert_eq!(
+            sig.verify_ed25519(&owner, &key, &owner, Class::In, &[rr]),
+            Ok(())
         );
     }
 }

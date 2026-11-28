@@ -49,6 +49,8 @@ jobs:
             cargo_args: --no-default-features --features dot,doh,doq,tls-ring
           - name: dnssec-sha2
             cargo_args: --no-default-features --features dnssec-sha2
+          - name: dnssec-ring
+            cargo_args: --no-default-features --features dnssec-ring
           - name: all-features
             cargo_args: --all-features
     steps:
