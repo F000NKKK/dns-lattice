@@ -766,12 +766,13 @@ mod tests {
     }
 
     /// Binds a UDP socket and a TCP listener on the same loopback port. An
-    /// ephemeral UDP port can already be taken by a TCP socket of another
-    /// test, so the pair is retried on a fresh port.
+    /// Bind TCP first so the OS excludes unavailable TCP ports, including
+    /// ports still in TIME_WAIT on Windows. The selected port may still be
+    /// in use by UDP, in which case the pair is retried.
     async fn bind_udp_tcp_pair() -> (UdpSocket, TcpListener) {
         for _ in 0..50 {
-            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
                 return (udp, tcp);
             }
         }
