@@ -170,6 +170,15 @@ pub struct Rrsig<'a> {
 }
 
 impl<'a> Rrsig<'a> {
+    /// Checks the RRSIG time window against Unix seconds modulo 2³², using
+    /// DNS serial-number arithmetic. Inception and expiration are inclusive.
+    /// Windows of 2³¹ seconds or longer are ambiguous and return `false`.
+    /// The caller supplies time; no clock or runtime is required.
+    pub fn valid_at(&self, now: u32) -> bool {
+        let duration = self.expiration.wrapping_sub(self.inception);
+        duration < (1 << 31) && now.wrapping_sub(self.inception) <= duration
+    }
+
     /// Parses RRSIG RDATA. Returns `None` for an oversized or truncated
     /// record, a malformed name, or a compressed signer name.
     pub fn parse(rdata: &'a [u8]) -> Option<Self> {
@@ -319,12 +328,34 @@ impl<'a> Rrsig<'a> {
             .verify(&data, self.signature)
             .map_err(|_| SignatureError::InvalidSignature)
     }
+
+    /// Checks the validity window and verifies the Ed25519 signature.
+    ///
+    /// `now` is Unix time in seconds modulo 2³². Like [`Self::verify_ed25519`],
+    /// this does not authenticate the DNSKEY or establish a trust chain.
+    #[cfg(feature = "dnssec-ring")]
+    pub fn verify_ed25519_at(
+        &self,
+        key_owner: &Name,
+        key: &Dnskey<'_>,
+        owner: &Name,
+        class: Class,
+        rrset: &[ResourceRecord],
+        now: u32,
+    ) -> Result<(), SignatureError> {
+        if !self.valid_at(now) {
+            return Err(SignatureError::OutsideValidityPeriod);
+        }
+        self.verify_ed25519(key_owner, key, owner, class, rrset)
+    }
 }
 
 /// Failure to cryptographically check a supported DNSSEC signature.
 #[cfg(feature = "dnssec-ring")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureError {
+    /// The signature is not currently valid or its time window is ambiguous.
+    OutsideValidityPeriod,
     /// The requested verifier does not implement this algorithm.
     UnsupportedAlgorithm,
     /// The DNSKEY or signer identity does not match the RRSIG.
@@ -536,6 +567,41 @@ mod tests {
     }
 
     #[test]
+    fn rrsig_time_window_handles_boundaries_wrap_and_ambiguity() {
+        let mut sig = Rrsig {
+            type_covered: 1,
+            algorithm: 15,
+            labels: 0,
+            original_ttl: 1,
+            expiration: 20,
+            inception: 10,
+            key_tag: 0,
+            signer: Name::root(),
+            signature: &[],
+        };
+        for now in [10, 11, 19, 20] {
+            assert!(sig.valid_at(now));
+        }
+        for now in [9, 21] {
+            assert!(!sig.valid_at(now));
+        }
+        sig.inception = u32::MAX - 2;
+        sig.expiration = 2;
+        for now in [u32::MAX - 2, u32::MAX, 0, 2] {
+            assert!(sig.valid_at(now));
+        }
+        for now in [u32::MAX - 3, 3] {
+            assert!(!sig.valid_at(now));
+        }
+        sig.inception = 0;
+        sig.expiration = 1 << 31;
+        assert!(!sig.valid_at(0));
+        sig.expiration = 0;
+        assert!(sig.valid_at(0));
+        assert!(!sig.valid_at(1));
+    }
+
+    #[test]
     fn signed_data_sorts_deduplicates_and_reconstructs_wildcard() {
         use crate::RecordType;
         use std::net::Ipv4Addr;
@@ -665,6 +731,28 @@ mod tests {
         assert_eq!(
             sig.verify_ed25519(&signer, &key, &owner, Class::In, std::slice::from_ref(&rr)),
             Ok(())
+        );
+        assert_eq!(
+            sig.verify_ed25519_at(
+                &signer,
+                &key,
+                &owner,
+                Class::In,
+                std::slice::from_ref(&rr),
+                10
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            sig.verify_ed25519_at(
+                &signer,
+                &key,
+                &owner,
+                Class::In,
+                std::slice::from_ref(&rr),
+                11
+            ),
+            Err(SignatureError::OutsideValidityPeriod)
         );
         let mut tampered = rr.clone();
         tampered.rdata = RData::A(std::net::Ipv4Addr::new(192, 0, 2, 2));

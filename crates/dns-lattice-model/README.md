@@ -40,8 +40,8 @@ operating-system dependency.
   optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
   matching. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
   other than DS and DNSKEY are rejected. The optional `dnssec-ring` feature
-  verifies Ed25519 RRSIG signatures. These helpers do not check signature
-  validity periods, authenticate a DS, or establish a chain of trust.
+  verifies Ed25519 RRSIG signatures, with optional validity-period checking.
+  These helpers do not authenticate a DS or establish a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.
