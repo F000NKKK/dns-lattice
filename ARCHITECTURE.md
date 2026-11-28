@@ -163,7 +163,8 @@ DNSSEC signature cryptography uses the runtime-independent
 RRSIG logic checks the key identity, signer relationship, canonical RRset and
 optionally time; the supplied backend verifies algorithm-specific key and
 signature bytes. The `dnssec-ring` feature provides `RingVerifier`, currently
-supporting Ed25519 and ECDSA P-256/P-384. Signature verification alone does not establish a chain
+supporting RSA/SHA-256, RSA/SHA-512, Ed25519 and ECDSA P-256/P-384.
+Signature verification alone does not establish a chain
 of trust or validate negative DNS answers.
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
