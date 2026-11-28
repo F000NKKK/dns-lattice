@@ -40,7 +40,7 @@ operating-system dependency.
   optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
   matching. `Rrsig::signed_data` canonicalizes supported RRsets; raw types
   other than DS and DNSKEY are rejected. A `SignatureVerifier` trait allows
-  alternative implementations; the `dnssec-ring` backend verifies Ed25519
+  alternative implementations; the `dnssec-ring` backend verifies Ed25519 and ECDSA P-256/P-384
   signatures, with optional validity-period checking.
   These helpers do not authenticate a DS or establish a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
@@ -56,7 +56,7 @@ operating-system dependency.
 The default build depends only on
 [`dns-lattice-core`](https://crates.io/crates/dns-lattice-core); the
 unreleased `dnssec-sha2` feature also enables `sha2`; `dnssec-ring` enables
-`ring` for Ed25519 verification.
+`ring` for Ed25519 and ECDSA verification.
 
 ## 📦 Installation
 

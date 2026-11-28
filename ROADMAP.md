@@ -21,7 +21,7 @@ individual slices.
 - **DNSSEC validation (active):** DNSKEY/DS/RRSIG RDATA parsing, key-tag calculation,
   optional SHA-256 DS matching, and canonicalization of supported RRsets are
   implemented. Pluggable signature verification with an optional ring
-  Ed25519 backend and validity-period checks is
+  Ed25519 and ECDSA P-256/P-384 backend and validity-period checks is
   available; other signature algorithms, chains from configured
   trust anchors, and authenticated denial of existence remain outstanding.
   An EDNS DO bit or an upstream AD bit alone is not validation.

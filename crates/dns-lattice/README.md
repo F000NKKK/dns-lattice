@@ -271,7 +271,7 @@ both providers are enabled, rustls's global default is ambiguous, so use
 `ServerConfig::builder()`.
 
 Unreleased `main` offers `dnssec-sha2` for SHA-256 DS matching and
-`dnssec-ring` supplies an Ed25519 backend implementing `SignatureVerifier`;
+`dnssec-ring` supplies an Ed25519 and ECDSA P-256/P-384 backend implementing `SignatureVerifier`;
 `Rrsig::verify_at` includes the validity-period check. These do not
 authenticate the DS record or establish a chain of trust.
 

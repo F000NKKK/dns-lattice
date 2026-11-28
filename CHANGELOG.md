@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RRSIG can construct canonical signed data for typed RRsets and raw DS or
   DNSKEY RRsets. Other raw types are rejected until supported explicitly.
 - RRSIG verification uses a pluggable `SignatureVerifier`; the optional
-  `dnssec-ring` backend supports Ed25519. `verify_at` also checks signature
+  `dnssec-ring` backend supports Ed25519 and ECDSA P-256/P-384. `verify_at` also checks signature
   time using DNS serial arithmetic. Neither check establishes trust.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
