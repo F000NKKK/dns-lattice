@@ -131,7 +131,74 @@ impl<'a> Ds<'a> {
             && key.algorithm() == self.algorithm
             && self.digest == digest.digest(owner, key)
     }
+
+    /// Checks a DNSKEY RRset against this already-authenticated DS record.
+    ///
+    /// The DS owner must have been authenticated as `zone` by the caller.
+    /// This checks the digest against every DNSKEY candidate and requires a
+    /// valid, currently effective RRSIG made by a matching key. One DS and
+    /// one RRSIG are checked per call; digest preference, multiple trust
+    /// anchors, parent-zone validation and response validation remain the
+    /// caller's responsibility. A result is meaningful only if `digest` and
+    /// `verifier` are trusted implementations.
+    pub fn verify_dnskey_rrset(
+        &self,
+        digest: &(impl DsDigest + ?Sized),
+        verifier: &(impl SignatureVerifier + ?Sized),
+        zone: &Name,
+        rrset: &[ResourceRecord],
+        signature: &Rrsig<'_>,
+        now: u32,
+    ) -> Result<(), DnskeyAuthenticationError> {
+        if self.digest_type != digest.digest_type() {
+            return Err(DnskeyAuthenticationError::UnsupportedDigest);
+        }
+        if signature.type_covered != 48 || rrset.is_empty() {
+            return Err(DnskeyAuthenticationError::InvalidRrset);
+        }
+        let class = rrset[0].class;
+        let mut last_error = None;
+        for rr in rrset {
+            let RData::Unknown { rtype: 48, data } = &rr.rdata else {
+                continue;
+            };
+            let Some(key) = Dnskey::parse(data) else {
+                continue;
+            };
+            if !self.matches_dnskey(digest, zone, &key) {
+                continue;
+            }
+            match signature.verify_at(verifier, zone, &key, zone, class, rrset, now) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.map_or(
+            DnskeyAuthenticationError::NoMatchingKey,
+            DnskeyAuthenticationError::Signature,
+        ))
+    }
 }
+
+/// Failure to check a DNSKEY RRset against a supplied authenticated DS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnskeyAuthenticationError {
+    /// The selected digest implementation does not match the DS digest type.
+    UnsupportedDigest,
+    /// The RRset is empty or the signature covers a type other than DNSKEY.
+    InvalidRrset,
+    /// No DNSKEY in the RRset matches the supplied DS.
+    NoMatchingKey,
+    /// The matching key did not produce a valid signature on this RRset.
+    Signature(SignatureError),
+}
+
+impl std::fmt::Display for DnskeyAuthenticationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DNSKEY RRset authentication failed: {self:?}")
+    }
+}
+impl std::error::Error for DnskeyAuthenticationError {}
 
 /// A parsed RRSIG RDATA view (RFC 4034 section 3.1).
 ///
@@ -534,6 +601,101 @@ mod tests {
         };
         let backend: &dyn DsDigest = &External;
         assert!(ds.matches_dnskey(backend, &Name::root(), &key));
+    }
+
+    #[cfg(all(feature = "dnssec-ring", feature = "dnssec-sha2"))]
+    #[test]
+    fn authenticated_ds_requires_matching_key_and_current_dnskey_rrsig() {
+        use crate::RecordType;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let pair = Ed25519KeyPair::from_seed_unchecked(&[13; 32]).unwrap();
+        let mut wire = vec![1, 1, 3, 15];
+        wire.extend_from_slice(pair.public_key().as_ref());
+        let key = Dnskey::parse(&wire).unwrap();
+        let zone = Name::from_ascii("example.com").unwrap();
+        let digest = crypto::Sha256Digest.digest(&zone, &key);
+        let ds = Ds {
+            key_tag: key.key_tag().unwrap(),
+            algorithm: 15,
+            digest_type: 2,
+            digest: &digest,
+        };
+        let rr = ResourceRecord {
+            name: zone.clone(),
+            rtype: RecordType::Other(48),
+            class: Class::In,
+            ttl: 100,
+            rdata: RData::Unknown {
+                rtype: 48,
+                data: wire.clone(),
+            },
+        };
+        let mut sig = Rrsig {
+            type_covered: 48,
+            algorithm: 15,
+            labels: 2,
+            original_ttl: 100,
+            expiration: 20,
+            inception: 10,
+            key_tag: key.key_tag().unwrap(),
+            signer: zone.clone(),
+            signature: &[],
+        };
+        let data = sig
+            .signed_data(&zone, Class::In, std::slice::from_ref(&rr))
+            .unwrap();
+        let signed = pair.sign(&data);
+        sig.signature = signed.as_ref();
+        let check = |anchor: &Ds<'_>, records: &[ResourceRecord], now| {
+            anchor.verify_dnskey_rrset(
+                &crypto::Sha256Digest,
+                &crypto::RingVerifier,
+                &zone,
+                records,
+                &sig,
+                now,
+            )
+        };
+        assert_eq!(check(&ds, std::slice::from_ref(&rr), 10), Ok(()));
+        assert_eq!(
+            check(&ds, std::slice::from_ref(&rr), 21),
+            Err(DnskeyAuthenticationError::Signature(
+                SignatureError::OutsideValidityPeriod
+            ))
+        );
+        assert_eq!(
+            check(
+                &Ds {
+                    digest_type: 4,
+                    ..ds
+                },
+                std::slice::from_ref(&rr),
+                10
+            ),
+            Err(DnskeyAuthenticationError::UnsupportedDigest)
+        );
+        assert_eq!(
+            check(
+                &Ds {
+                    digest: &[0; 32],
+                    ..ds
+                },
+                std::slice::from_ref(&rr),
+                10
+            ),
+            Err(DnskeyAuthenticationError::NoMatchingKey)
+        );
+        let mut added = rr.clone();
+        if let RData::Unknown { data, .. } = &mut added.rdata {
+            data.push(0);
+        }
+        assert_eq!(
+            check(&ds, &[rr, added], 10),
+            Err(DnskeyAuthenticationError::Signature(
+                SignatureError::Crypto(CryptoError::InvalidSignature)
+            ))
+        );
     }
 
     #[test]

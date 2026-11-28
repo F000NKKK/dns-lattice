@@ -43,7 +43,9 @@ operating-system dependency.
   alternative implementations; the `dnssec-ring` backend verifies RSA/SHA-256,
   RSA/SHA-512, Ed25519 and ECDSA P-256/P-384
   signatures, with optional validity-period checking.
-  These helpers do not authenticate a DS or establish a chain of trust.
+  `Ds::verify_dnskey_rrset` checks a DNSKEY RRset against one
+  caller-authenticated DS and a current RRSIG. These helpers do not
+  authenticate the DS or establish a complete chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.

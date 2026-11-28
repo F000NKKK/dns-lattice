@@ -274,6 +274,8 @@ Unreleased `main` offers `dnssec-sha2` for SHA-256 and SHA-384 DS matching and
 `dnssec-ring` supplies an RSA/SHA-2, Ed25519 and ECDSA P-256/P-384 backend implementing `SignatureVerifier`;
 `Rrsig::verify_at` includes the validity-period check. These do not
 authenticate the DS record or establish a chain of trust.
+`Ds::verify_dnskey_rrset` checks a DNSKEY RRset against one DS record the
+caller has already authenticated.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •

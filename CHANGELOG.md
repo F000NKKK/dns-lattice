@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dnssec-ring` backend supports RSA/SHA-256, RSA/SHA-512, Ed25519 and ECDSA
   P-256/P-384. RSA verification accepts 1024–8192-bit moduli. `verify_at` also checks signature
   time using DNS serial arithmetic. Neither check establishes trust.
+- `Ds::verify_dnskey_rrset` checks a DNSKEY RRset and its RRSIG against one
+  caller-authenticated DS. Parent DS authentication and full DNSSEC chain
+  and response validation remain the caller's responsibility.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;
