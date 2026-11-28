@@ -770,13 +770,21 @@ mod tests {
     /// ports still in TIME_WAIT on Windows. The selected port may still be
     /// in use by UDP, in which case the pair is retried.
     async fn bind_udp_tcp_pair() -> (UdpSocket, TcpListener) {
-        for _ in 0..50 {
+        let mut reserved = Vec::new();
+        let mut last_error = None;
+        for _ in 0..256 {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
-                return (udp, tcp);
+            match UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                Ok(udp) => return (udp, tcp),
+                Err(error) => {
+                    last_error = Some(error);
+                    // Keep the candidate occupied, otherwise Windows can
+                    // immediately hand the same TCP port out again.
+                    reserved.push(tcp);
+                }
             }
         }
-        panic!("no free loopback port for a UDP/TCP pair");
+        panic!("no free loopback port for a UDP/TCP pair: {last_error:?}");
     }
 
     #[tokio::test]
