@@ -6,6 +6,8 @@
 
 /// Runtime-independent signature backend interface and implementations.
 pub mod crypto;
+/// Verification of signed delegation records with an authenticated parent key.
+pub mod delegation;
 
 use crypto::{CryptoError, DsDigest, SignatureVerifier};
 

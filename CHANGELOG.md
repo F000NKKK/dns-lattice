@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Ds::verify_dnskey_rrset` checks a DNSKEY RRset and its RRSIG against one
   caller-authenticated DS. Parent DS authentication and full DNSSEC chain
   and response validation remain the caller's responsibility.
+- `dnssec::delegation::verify_ds_rrset` checks a child DS RRset and its RRSIG
+  using a caller-authenticated parent DNSKEY. The caller must establish the
+  delegation and parent-key trust independently.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;

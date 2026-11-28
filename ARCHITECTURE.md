@@ -169,6 +169,10 @@ of trust or validate negative DNS answers.
 The independent `DsDigest` trait selects a DS digest implementation;
 `dnssec-sha2` provides SHA-256 and SHA-384. Comparing a DS digest does not
 authenticate the DS record or the DNSKEY.
+`delegation::verify_ds_rrset` checks one signed child DS RRset using a
+caller-authenticated parent key; the caller must establish the delegation.
+`Ds::verify_dnskey_rrset` checks a child DNSKEY RRset against one
+authenticated DS. These operations do not yet build a full trust chain.
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
 

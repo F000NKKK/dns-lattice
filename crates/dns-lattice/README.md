@@ -276,6 +276,8 @@ Unreleased `main` offers `dnssec-sha2` for SHA-256 and SHA-384 DS matching and
 authenticate the DS record or establish a chain of trust.
 `Ds::verify_dnskey_rrset` checks a DNSKEY RRset against one DS record the
 caller has already authenticated.
+`dnssec::delegation::verify_ds_rrset` verifies signed child DS records using
+a parent DNSKEY the caller has already authenticated.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •
