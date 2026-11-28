@@ -460,7 +460,9 @@ where
             let mut frame = Vec::with_capacity(answer.len() + 2);
             frame.extend_from_slice(&len.to_be_bytes());
             frame.extend_from_slice(&answer);
-            if writer.write_all(&frame).await.is_err() {
+            // TLS can buffer ciphertext after write_all. Flush each response
+            // so the final response is sent even when no later query arrives.
+            if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                 return;
             }
         }

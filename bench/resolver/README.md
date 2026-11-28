@@ -40,6 +40,9 @@ same harness.
 | `src/metrics.rs`, `src/cli.rs` | Process CPU and memory from `/proc`; argument handling for the binaries. |
 | `variants.tsv` | The client scenarios `scripts/bench-resolver.sh run` executes. |
 | `tests/smoke.rs` | Loopback tests of the responder, both contestants, the load loop and the client binaries. |
+
+The TCP/DoT responder flushes each framed answer, ensuring TLS does not leave
+the final response buffered while a client waits for it.
 | `benches/codec.rs` | Message decode and encode, dns-lattice and hickory-proto on the same bytes. |
 | `benches/name.rs` | Name parsing, hashing (`HashMap` lookups) and case-insensitive equality, both libraries. |
 | `benches/matcher.rs` | `DomainMatcher` and `SplitDnsPolicy` with 10, 1,000 and 100,000 rules (dns-lattice only). |
