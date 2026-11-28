@@ -1,13 +1,12 @@
 //! DNSSEC wire-record helpers. These helpers do not validate DNS answers.
 //!
-//! DNSKEY and DS records are still represented by `RData::Unknown` in the
+//! DNSKEY, DS and RRSIG records are still represented by `RData::Unknown` in the
 //! message model. These borrowed views allow callers to inspect their RDATA
 //! without altering the existing wire representation or allocating.
 
 #[cfg(feature = "dnssec-sha2")]
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "dnssec-sha2")]
 use crate::Name;
 
 /// A DNSKEY RDATA view (RFC 4034 section 2.1).
@@ -144,6 +143,74 @@ impl<'a> Ds<'a> {
     }
 }
 
+/// A parsed RRSIG RDATA view (RFC 4034 section 3.1).
+///
+/// Parsing does not verify the signature, timestamps, signer authority, or
+/// the covered RRset. The signer name is owned; the signature borrows RDATA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rrsig<'a> {
+    /// Numeric type of the covered RRset.
+    pub type_covered: u16,
+    /// DNSSEC signature algorithm number.
+    pub algorithm: u8,
+    /// Number of labels in the original owner name.
+    pub labels: u8,
+    /// Original TTL of the signed RRset.
+    pub original_ttl: u32,
+    /// Signature expiration in DNS serial-number time.
+    pub expiration: u32,
+    /// Signature inception in DNS serial-number time.
+    pub inception: u32,
+    /// Tag of the signing DNSKEY.
+    pub key_tag: u16,
+    /// Signer name, which must be uncompressed on the wire.
+    pub signer: Name,
+    /// Algorithm-specific signature bytes.
+    pub signature: &'a [u8],
+}
+
+impl<'a> Rrsig<'a> {
+    /// Parses RRSIG RDATA. Returns `None` for an oversized or truncated
+    /// record, a malformed name, or a compressed signer name.
+    pub fn parse(rdata: &'a [u8]) -> Option<Self> {
+        if rdata.len() > usize::from(u16::MAX) || rdata.len() < 19 {
+            return None;
+        }
+        let mut cursor = 18;
+        // RFC 4034 forbids compression in the signer name. Validate the
+        // encoding before using the general DNS name decoder, which permits
+        // pointers for ordinary names.
+        loop {
+            let length = usize::from(*rdata.get(cursor)?);
+            if length > 63 {
+                return None;
+            }
+            cursor += 1;
+            if length == 0 {
+                break;
+            }
+            cursor = cursor.checked_add(length)?;
+            if cursor > rdata.len() {
+                return None;
+            }
+        }
+        let mut name_pos = 18;
+        let signer = crate::message::decode_name(rdata, &mut name_pos).ok()?;
+        debug_assert_eq!(name_pos, cursor);
+        Some(Self {
+            type_covered: u16::from_be_bytes([rdata[0], rdata[1]]),
+            algorithm: rdata[2],
+            labels: rdata[3],
+            original_ttl: u32::from_be_bytes(rdata[4..8].try_into().ok()?),
+            expiration: u32::from_be_bytes(rdata[8..12].try_into().ok()?),
+            inception: u32::from_be_bytes(rdata[12..16].try_into().ok()?),
+            key_tag: u16::from_be_bytes([rdata[16], rdata[17]]),
+            signer,
+            signature: &rdata[cursor..],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +296,41 @@ mod tests {
         assert!(Ds::parse(&[0, 1, 8]).is_none());
         assert!(Ds::parse(&vec![0; 65536]).is_none());
         assert!(Dnskey::parse(&vec![0; 65536]).is_none());
+    }
+
+    #[test]
+    fn rrsig_parses_fields_and_preserves_signature() {
+        let data = [
+            0, 1, 8, 2, 0, 0, 14, 16, 0, 0, 0, 9, 0, 0, 0, 4, 0x12, 0x34, 3, b'W', b'W', b'W', 7,
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 0xaa, 0xbb,
+        ];
+        let sig = Rrsig::parse(&data).unwrap();
+        assert_eq!(
+            (
+                sig.type_covered,
+                sig.algorithm,
+                sig.labels,
+                sig.original_ttl
+            ),
+            (1, 8, 2, 3600)
+        );
+        assert_eq!((sig.expiration, sig.inception, sig.key_tag), (9, 4, 0x1234));
+        assert_eq!(sig.signer, Name::from_ascii("www.example").unwrap());
+        assert_eq!(sig.signature, [0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn rrsig_rejects_bad_names_and_truncated_headers() {
+        assert!(Rrsig::parse(&[0; 18]).is_none());
+        let mut data = vec![0; 18];
+        data.extend_from_slice(&[0xc0, 0]);
+        assert!(Rrsig::parse(&data).is_none());
+        data.truncate(18);
+        data.extend_from_slice(&[4, b'a', b'b']);
+        assert!(Rrsig::parse(&data).is_none());
+        data.truncate(18);
+        data.extend_from_slice(&[0]);
+        assert!(Rrsig::parse(&data).unwrap().signer.is_root());
+        assert!(Rrsig::parse(&vec![0; 65536]).is_none());
     }
 }

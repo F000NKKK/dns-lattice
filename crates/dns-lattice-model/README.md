@@ -35,8 +35,8 @@ operating-system dependency.
 - ✅ **`record`**: DNS record types and resource-data (`RecordType`, `Class`,
   `RData`). DNSSEC-specific record types currently remain raw unknown records;
   this crate does not perform DNSSEC validation.
-- **Unreleased `main`:** `dnssec::Dnskey` and `dnssec::Ds` provide borrowed
-  views of DNSKEY and DS RDATA, including DNSKEY key-tag calculation. The
+- **Unreleased `main`:** `dnssec::Dnskey`, `dnssec::Ds` and `dnssec::Rrsig`
+  parse their respective RDATA, including DNSKEY key-tag calculation. The
   optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
   matching. These helpers do not authenticate a DS or verify signatures or
   a chain of trust.
