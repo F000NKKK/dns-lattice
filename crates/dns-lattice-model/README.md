@@ -48,6 +48,8 @@ operating-system dependency.
   authenticate the DS or establish a complete chain of trust.
   `delegation::verify_ds_rrset` verifies signed child DS records against a
   previously authenticated parent DNSKEY; the caller establishes delegation.
+  `DelegationProof` combines this with the child DNSKEY check for one positive
+  delegation; digest preference and zone-cut verification remain with the caller.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.

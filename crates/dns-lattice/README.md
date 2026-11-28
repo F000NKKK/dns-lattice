@@ -278,6 +278,9 @@ authenticate the DS record or establish a chain of trust.
 caller has already authenticated.
 `dnssec::delegation::verify_ds_rrset` verifies signed child DS records using
 a parent DNSKEY the caller has already authenticated.
+`dnssec::delegation::DelegationProof` combines the DS and child DNSKEY
+checks for one positive delegation; it does not verify the zone cut or build
+a full trust chain.
 
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •

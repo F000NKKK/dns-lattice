@@ -173,6 +173,9 @@ authenticate the DS record or the DNSKEY.
 caller-authenticated parent key; the caller must establish the delegation.
 `Ds::verify_dnskey_rrset` checks a child DNSKEY RRset against one
 authenticated DS. These operations do not yet build a full trust chain.
+`DelegationProof` composes both checks for one positive delegation using one
+caller-selected digest; parent trust, zone-cut validation and digest selection
+remain the caller's responsibility.
 
 `dns-lattice-model` owns the protocol/domain types used throughout the engine:
 

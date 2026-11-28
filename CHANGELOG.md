@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dnssec::delegation::verify_ds_rrset` checks a child DS RRset and its RRSIG
   using a caller-authenticated parent DNSKEY. The caller must establish the
   delegation and parent-key trust independently.
+- `DelegationProof` combines signed DS and child DNSKEY checks into one
+  positive delegation step with a caller-selected digest. It does not prove
+  the zone cut, handle absence of DS, or resolve a complete trust chain.
 - `NameServerPool` groups upstream backends using a pluggable
   `NameServerBalancer`; `RoundRobin` is the default. Retryable errors try
   the remaining servers in cyclic order. The pool is executor-independent;
