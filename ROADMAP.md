@@ -18,8 +18,9 @@ individual slices.
 - **TLS provider selection (active):** `tls-ring` selects ring without
   AWS-LC when default features are disabled. Cross-platform validation of
   both providers remains in progress.
-- **DNSSEC validation (planned):** validate signatures and chains from
-  configured trust anchors, including authenticated denial of existence.
+- **DNSSEC validation (active):** DNSKEY/DS RDATA views and key-tag
+  calculation are implemented. Signature validation, chains from configured
+  trust anchors, and authenticated denial of existence remain outstanding.
   An EDNS DO bit or an upstream AD bit alone is not validation.
 
 The stages below are historical milestones; the published crates are at

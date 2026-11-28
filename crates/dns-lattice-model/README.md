@@ -35,6 +35,9 @@ operating-system dependency.
 - ✅ **`record`**: DNS record types and resource-data (`RecordType`, `Class`,
   `RData`). DNSSEC-specific record types currently remain raw unknown records;
   this crate does not perform DNSSEC validation.
+- **Unreleased `main`:** `dnssec::Dnskey` and `dnssec::Ds` provide borrowed
+  views of DNSKEY and DS RDATA, including DNSKEY key-tag calculation. They do
+  not verify signatures, digests, or a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.

@@ -309,6 +309,7 @@ pub mod observability;
 /// `dns-lattice-model`; for example, import [`dns_lattice_model::Name`] as
 /// `dns_lattice::model::Name`.
 pub mod model {
+    pub use dns_lattice_model::dnssec;
     pub use dns_lattice_model::{
         Class, DomainMatcher, DomainPattern, Edns, EdnsOption, Header, Message, Name, Opcode,
         Question, RData, Rcode, RecordType, ResourceRecord, SplitDnsPolicy, SplitDnsPolicyBuilder,

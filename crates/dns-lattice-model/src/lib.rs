@@ -10,6 +10,7 @@
 
 #![warn(missing_docs)]
 
+pub mod dnssec;
 pub mod edns;
 pub mod matcher;
 pub mod message;
