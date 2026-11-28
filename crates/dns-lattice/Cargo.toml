@@ -14,6 +14,7 @@ readme = "README.md"
 
 [features]
 default = ["tls-aws-lc"]
+dnssec-sha2 = ["dns-lattice-model/dnssec-sha2"]
 tls-aws-lc = ["rustls?/aws-lc-rs", "hyper-rustls?/aws-lc-rs", "quinn?/rustls-aws-lc-rs"]
 # Enables rustls's ring provider for caller-supplied TLS configurations.
 tls-ring = ["rustls?/ring", "hyper-rustls?/ring", "quinn?/rustls-ring"]

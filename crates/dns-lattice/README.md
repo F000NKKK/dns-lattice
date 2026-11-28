@@ -270,6 +270,10 @@ both providers are enabled, rustls's global default is ambiguous, so use
 `builder_with_provider` rather than relying on `ClientConfig::builder()` or
 `ServerConfig::builder()`.
 
+Unreleased `main` offers `dnssec-sha2` for computing and matching SHA-256 DS
+digests against DNSKEY records. This does not validate DNSSEC signatures,
+authenticate the DS record, or establish a chain of trust.
+
 **Documentation:** [API reference](https://docs.rs/dns-lattice) •
 [project](https://github.com/F000NKKK/dns-lattice) •
 [architecture](https://github.com/F000NKKK/dns-lattice/blob/main/ARCHITECTURE.md) •

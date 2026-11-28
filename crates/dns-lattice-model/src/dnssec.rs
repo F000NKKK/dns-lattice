@@ -4,6 +4,12 @@
 //! message model. These borrowed views allow callers to inspect their RDATA
 //! without altering the existing wire representation or allocating.
 
+#[cfg(feature = "dnssec-sha2")]
+use sha2::{Digest, Sha256};
+
+#[cfg(feature = "dnssec-sha2")]
+use crate::Name;
+
 /// A DNSKEY RDATA view (RFC 4034 section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dnskey<'a> {
@@ -75,6 +81,22 @@ impl<'a> Dnskey<'a> {
         sum += (sum >> 16) & 0xffff;
         Some(sum as u16)
     }
+
+    /// Computes the SHA-256 DS digest of the canonical owner name and this
+    /// DNSKEY RDATA (RFC 4509). This does not establish trust in the key.
+    #[cfg(feature = "dnssec-sha2")]
+    pub fn ds_digest_sha256(&self, owner: &Name) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for label in owner.labels() {
+            hasher.update([label.len() as u8]);
+            for byte in label {
+                hasher.update([byte.to_ascii_lowercase()]);
+            }
+        }
+        hasher.update([0]);
+        hasher.update(self.wire);
+        hasher.finalize().into()
+    }
 }
 
 /// A delegation signer (DS) RDATA view (RFC 4034 section 5.1).
@@ -107,6 +129,18 @@ impl<'a> Ds<'a> {
             digest_type: *digest_type,
             digest,
         })
+    }
+
+    /// Tests whether this SHA-256 DS has the key tag, algorithm and digest
+    /// of `key` under `owner`. A match alone does not authenticate the DS,
+    /// validate key flags/protocol, or validate any DNSSEC signatures.
+    /// Unsupported digest types and malformed digest lengths return `false`.
+    #[cfg(feature = "dnssec-sha2")]
+    pub fn matches_dnskey_sha256(&self, owner: &Name, key: &Dnskey<'_>) -> bool {
+        self.digest_type == 2
+            && key.key_tag() == Some(self.key_tag)
+            && key.algorithm() == self.algorithm
+            && self.digest == key.ds_digest_sha256(owner)
     }
 }
 
@@ -141,6 +175,41 @@ mod tests {
             27, 208, 204, 6, 96, 3, 140, 80, 220, 219, 15, 235, 150, 60, 47, 23,
         ]);
         assert_eq!(Dnskey::parse(&wire).unwrap().key_tag(), Some(60485));
+        #[cfg(feature = "dnssec-sha2")]
+        {
+            let key = Dnskey::parse(&wire).unwrap();
+            let expected = [
+                0xd4, 0xb7, 0xd5, 0x20, 0xe7, 0xbb, 0x5f, 0x0f, 0x67, 0x67, 0x4a, 0x0c, 0xce, 0xb1,
+                0xe3, 0xe0, 0x61, 0x4b, 0x93, 0xc4, 0xf9, 0xe9, 0x9b, 0x83, 0x83, 0xf6, 0xa1, 0xe4,
+                0x46, 0x9d, 0xa5, 0x0a,
+            ];
+            let owner = Name::from_ascii("DsKey.Example.COM").unwrap();
+            assert_eq!(key.ds_digest_sha256(&owner), expected);
+            let ds = Ds {
+                key_tag: 60485,
+                algorithm: 5,
+                digest_type: 2,
+                digest: &expected,
+            };
+            assert!(ds.matches_dnskey_sha256(&owner, &key));
+            assert!(!ds.matches_dnskey_sha256(&Name::root(), &key));
+            assert!(!Ds { key_tag: 1, ..ds }.matches_dnskey_sha256(&owner, &key));
+            assert!(!Ds { algorithm: 8, ..ds }.matches_dnskey_sha256(&owner, &key));
+            assert!(
+                !Ds {
+                    digest_type: 1,
+                    ..ds
+                }
+                .matches_dnskey_sha256(&owner, &key)
+            );
+            assert!(
+                !Ds {
+                    digest: &expected[..31],
+                    ..ds
+                }
+                .matches_dnskey_sha256(&owner, &key)
+            );
+        }
     }
 
     #[test]

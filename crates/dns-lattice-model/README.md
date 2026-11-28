@@ -36,8 +36,10 @@ operating-system dependency.
   `RData`). DNSSEC-specific record types currently remain raw unknown records;
   this crate does not perform DNSSEC validation.
 - **Unreleased `main`:** `dnssec::Dnskey` and `dnssec::Ds` provide borrowed
-  views of DNSKEY and DS RDATA, including DNSKEY key-tag calculation. They do
-  not verify signatures, digests, or a chain of trust.
+  views of DNSKEY and DS RDATA, including DNSKEY key-tag calculation. The
+  optional `dnssec-sha2` feature adds SHA-256 DS digest computation and
+  matching. These helpers do not authenticate a DS or verify signatures or
+  a chain of trust.
 - ✅ **`edns`**: EDNS(0) parameters (`Edns`, `EdnsOption`) read and written
   through `Message::edns` / `Message::set_edns`. The OPT pseudo-record stays
   an ordinary additional record, and options are kept as raw code/data pairs.
@@ -48,8 +50,9 @@ operating-system dependency.
 - ✅ **`policy`**: split-DNS policy types (`UpstreamGroupId`,
   `SplitDnsPolicy`) built on the matcher.
 
-No Cargo features. Its only dependency is
-[`dns-lattice-core`](https://crates.io/crates/dns-lattice-core).
+The default build depends only on
+[`dns-lattice-core`](https://crates.io/crates/dns-lattice-core); the
+unreleased `dnssec-sha2` feature also enables `sha2`.
 
 ## 📦 Installation
 
